@@ -1,0 +1,135 @@
+# SPDX-FileCopyrightText: 2026 Standard Voice Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "std-mlx-audio"
+version = "0.1.0"
+description = "Standard ASR engine plugin for MLX (Apple Silicon) ASR models, headlined by Qwen3-ASR — one engine, many models via mlx-audio"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "LICENSE-THIRD-PARTY.md"]
+authors = [{ name = "Standard Voice Contributors" }]
+keywords = [
+    "asr",
+    "speech-to-text",
+    "mlx",
+    "apple-silicon",
+    "qwen3-asr",
+    "whisper",
+    "parakeet",
+    "standard-asr",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+    # MLX is Apple-Silicon-only; the wheel installs anywhere but inference
+    # requires a Metal-capable Mac (arm64).
+    "Operating System :: MacOS",
+    "Environment :: GPU",
+]
+dependencies = [
+    # mlx-audio is the upstream MLX inference backend we adapt (MIT). It unifies
+    # Qwen3-ASR, Whisper, Parakeet and ~20 other STT architectures behind one
+    # load()/model.generate() API, which is exactly what lets a single engine
+    # expose many models. The [stt] extra pulls sentencepiece (Qwen tokenizer).
+    # mlx-audio depends on mlx/mlx-lm (Apple-Silicon-only) + transformers.
+    # See docs/STANDARD_ASR_FINDINGS.md and docs/DESIGN.md for the
+    # adapter-vs-vendor rationale.
+    "mlx-audio[stt]>=0.4.4,<0.5",
+    # NumPy is the zero-copy waveform interchange type with the standard layer.
+    "numpy>=1.26.4",
+    # The protocol this plugin implements. Pinned to the v0.1.0 redesign branch
+    # until standard-asr cuts its first PyPI release; swap to a version
+    # specifier (>=0.1.0) at that point.
+    "standard-asr @ git+https://github.com/standard-voice/standard_asr.git@refactor/v0.1.0-redesign",
+]
+
+[project.urls]
+Homepage = "https://github.com/standard-voice/std-mlx-audio"
+"Standard ASR" = "https://github.com/standard-voice/standard_asr"
+"mlx-audio (upstream)" = "https://github.com/Blaizzy/mlx-audio"
+
+# One entry point per model preset (spec IC.7: model selection = entry-point
+# preset, never an init `model` field). A single engine (engine_id "mlx-audio")
+# exposes MULTIPLE models across MULTIPLE backend families — Qwen3-ASR (the
+# headliner), Parakeet (word-timestamp specialist), and Whisper — so
+# `standard-asr models list` enumerates every available model and discovery can
+# read each one's class-level metadata WITHOUT instantiating (the factory return
+# annotation is the CONCRETE engine class; adapting_engine.md "Publish").
+[project.entry-points."standard_asr.models"]
+"mlx-audio/qwen3-asr-0.6b" = "std_mlx_audio.entrypoint:create_qwen3_asr_0_6b"
+"mlx-audio/qwen3-asr-1.7b" = "std_mlx_audio.entrypoint:create_qwen3_asr_1_7b"
+"mlx-audio/parakeet-tdt-0.6b-v3" = "std_mlx_audio.entrypoint:create_parakeet_tdt_0_6b_v3"
+"mlx-audio/whisper-large-v3-turbo" = "std_mlx_audio.entrypoint:create_whisper_large_v3_turbo"
+"mlx-audio/whisper-tiny" = "std_mlx_audio.entrypoint:create_whisper_tiny"
+
+[build-system]
+requires = ["uv-build>=0.9,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = "src"
+module-name = "std_mlx_audio"
+
+# Test/lint tooling. The unit suite injects a fake mlx_audio.stt loader via
+# monkeypatch and NEVER downloads weights or runs MLX; the real-inference
+# verification is a separate, opt-in script (scripts/verify_inference.py) gated
+# on a downloaded model + Apple Silicon. See VERIFICATION.md.
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "pytest-cov>=7.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+    "pyright>=1.1.390",
+]
+
+[tool.pytest.ini_options]
+addopts = [
+    "-q",
+    "--cov=std_mlx_audio",
+    "--cov-branch",
+    "--cov-report=term-missing:skip-covered",
+]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Warnings-as-errors mirrors the core suite: our own deprecations/bugs fail.
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["std_mlx_audio"]
+
+[tool.coverage.report]
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "NPY", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# RUF012 flags mutable class-attribute defaults, but `_metadata.py` / `_config.py`
+# declare *pydantic model fields* (BaseProperties / BaseConfig / ProviderParams
+# subclasses), where `list[...] = [...]` is the correct pydantic idiom — pydantic
+# deep-copies field defaults per instance, so there is no shared-mutable footgun.
+# Ruff does not auto-detect these base classes as pydantic, hence the scoped ignore.
+"src/std_mlx_audio/_metadata.py" = ["RUF012"]
+"src/std_mlx_audio/_config.py" = ["RUF012"]
+# Test fakes use class-level recording slots reset by the fixture (not pydantic);
+# ClassVar annotations would only add noise to throwaway stubs.
+"tests/conftest.py" = ["RUF012"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.10"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false

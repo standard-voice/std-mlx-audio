@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+
+# uv
+# (uv.lock IS committed for reproducible installs)
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.ruff_cache/
+.pyright/
+
+# Local model cache / scratch outputs
+.models/
+.probe/
+*.scratch
+verification_output/
+
+# OS
+.DS_Store
