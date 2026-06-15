@@ -27,10 +27,10 @@ uv python pin 3.12
 uv sync                      # resolves standard-asr from the branch + mlx-audio[stt]
 ```
 
-## 1. Discovery — five models under one engine (`standard-asr models list`)
+## 1. Discovery — five models under one engine (`standard-asr list`)
 
 ```bash
-uv run standard-asr models list
+uv run standard-asr list
 ```
 
 ```
@@ -41,7 +41,7 @@ uv run standard-asr models list
  - mlx-audio/whisper-tiny            engine=mlx-audio  model=whisper-tiny
 ```
 
-`standard-asr models show mlx-audio/qwen3-asr-0.6b` prints the capabilities and
+`standard-asr show mlx-audio/qwen3-asr-0.6b` prints the capabilities and
 params schema **without instantiating** the engine (instantiation-free discovery).
 
 ## 2. Compliance — all five models pass (`standard-asr compliance run`)

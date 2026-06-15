@@ -4,7 +4,7 @@
 """Static Properties and declared Capabilities for the MLX ASR models.
 
 Everything here is read at the *class* level without instantiating the engine
-(``standard-asr models show``, the registry, REST ``GET /v1/capabilities``), so
+(``standard-asr show``, the registry, REST ``GET /v1/capabilities``), so
 it MUST be honest and self-contained. Capabilities are declared **fail-closed**:
 we declare only what each MLX backend genuinely delivers.
 
@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from typing import Literal
 
-from standard_asr import BaseProperties, InputKind, SampleRateRange
 from standard_asr.capabilities import (
     BatchCapabilities,
     DeclaredCapabilities,
@@ -36,6 +35,7 @@ from standard_asr.capabilities import (
     StreamTimestampsCap,
     WordTimestampsCap,
 )
+from standard_asr.engine import BaseProperties, InputKind, SampleRateRange
 
 from .languages import (
     PARAKEET_V3_LANGUAGES,

@@ -33,7 +33,7 @@ entry-point key:
 Each model declares its **own** honest capabilities (e.g. Qwen3-ASR offers
 segment timestamps; Parakeet/Whisper offer word timestamps; Parakeet is
 fixed-language with no runtime language override). Query them with
-`standard-asr models show <key>` — no instantiation, no download.
+`standard-asr show <key>` — no instantiation, no download.
 
 ## Install
 
@@ -52,8 +52,8 @@ This pulls `mlx-audio[stt]` (which pulls `mlx`, `mlx-lm`, `transformers`) and
 ### CLI (no code)
 
 ```bash
-standard-asr models list                          # see all five models
-standard-asr models show mlx-audio/qwen3-asr-0.6b # capabilities + params schema
+standard-asr list                                 # see all five models
+standard-asr show mlx-audio/qwen3-asr-0.6b        # capabilities + params schema
 standard-asr transcribe mlx-audio/qwen3-asr-0.6b path/to/audio.wav
 ```
 

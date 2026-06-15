@@ -68,6 +68,14 @@ Homepage = "https://github.com/standard-voice/std-mlx-audio"
 "mlx-audio/whisper-large-v3-turbo" = "std_mlx_audio.entrypoint:create_whisper_large_v3_turbo"
 "mlx-audio/whisper-tiny" = "std_mlx_audio.entrypoint:create_whisper_tiny"
 
+# Local development override: resolve `standard-asr` from the co-located monorepo
+# checkout instead of the public git branch, so edits to the protocol are picked
+# up immediately and the plugin shares one `standard-asr` install with the demo
+# app and sibling plugins. The `[project]` dependency stays pinned to git for a
+# publish-ready manifest; this block only affects local `uv` resolution.
+[tool.uv.sources]
+standard-asr = { path = "../standard_asr", editable = true }
+
 [build-system]
 requires = ["uv-build>=0.9,<0.12"]
 build-backend = "uv_build"

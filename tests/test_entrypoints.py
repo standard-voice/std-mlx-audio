@@ -11,9 +11,13 @@ application (and CI) sees it — they exercise the *installed* entry points via
 
 from __future__ import annotations
 
-from standard_asr import check_entrypoints, discover_models
+from standard_asr import discover_models
 from standard_asr.audio_format import AudioFormat
-from standard_asr.compliance import check_streaming_param_gating, check_sync_bridge
+from standard_asr.compliance import (
+    check_entrypoints,
+    check_streaming_param_gating,
+    check_sync_bridge,
+)
 
 from std_mlx_audio import (
     ParakeetTdt06BV3,
@@ -44,7 +48,7 @@ def test_all_presets_discovered() -> None:
 
 def test_by_engine_lists_all_presets_under_one_engine() -> None:
     # The whole point of this plugin: one engine_id, many models.
-    assert set(discover_models().by_engine("mlx-audio")) == _EXPECTED_KEYS
+    assert set(discover_models().keys_by_engine("mlx-audio")) == _EXPECTED_KEYS
 
 
 def test_registry_resolves_engine_class_without_instantiation() -> None:

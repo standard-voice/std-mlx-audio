@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import Field, SecretStr
-from standard_asr import (
+from standard_asr.engine import (
     BaseConfig,
     DownloadConfigMixin,
     LanguageConfigMixin,

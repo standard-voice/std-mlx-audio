@@ -31,16 +31,18 @@ from typing import Any, ClassVar, cast
 import numpy as np
 from numpy.typing import NDArray
 from standard_asr import (
-    BaseConfig,
-    BaseProperties,
-    EngineBase,
-    PreparedAudio,
     RuntimeParams,
     TranscriptionResult,
     TranscriptionSession,
 )
 from standard_asr.audio_format import AudioFormat
 from standard_asr.capabilities import DeclaredCapabilities
+from standard_asr.engine import (
+    BaseConfig,
+    BaseProperties,
+    EngineBase,
+    PreparedAudio,
+)
 from standard_asr.exceptions import DiscoveryError, TranscriptionError
 from standard_asr.language import effective_language
 from standard_asr.runtime import allow_downloads, resolve_download_root
