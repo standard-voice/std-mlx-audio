@@ -224,3 +224,78 @@ async def test_streaming_whole_input_path(fake_loader: Callable[..., FakeLoader]
             events.append(event)
     assert events[-1].type == "done"
     assert "whole input." in session.result().text
+
+
+# --------------------------------------------------------------------------- #
+# Sliding window: knobs wire through; the window stays bounded; finalized
+# timestamps stay absolute (not reset on each trim).
+# --------------------------------------------------------------------------- #
+def test_streaming_config_knobs_default_and_override() -> None:
+    from std_mlx_audio._config import MlxAudioConfig
+
+    cfg = MlxAudioConfig(engine="mlx-audio")
+    # Defaults are the snappier (lower-latency) values.
+    assert (cfg.redecode_interval_s, cfg.settle_margin_s, cfg.max_window_s) == (1.5, 2.0, 30.0)
+
+    # --set overrides (constructor kwargs) reach the constructed session.
+    session = WhisperTiny(
+        redecode_interval_s=0.7, settle_margin_s=1.0, max_window_s=4.0
+    ).start_transcription(audio_format=_FMT)
+    assert session._redecode_interval_s == 0.7  # type: ignore[attr-defined]
+    assert session._settle_margin_s == 1.0  # type: ignore[attr-defined]
+    assert session._max_window_s == 4.0  # type: ignore[attr-defined]
+
+
+async def test_streaming_sliding_window_bounds_and_keeps_absolute_time(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    """A decoder that tiles its (relative-timed) window into 1s segments.
+
+    With a sliding window the session must (a) keep the decode input BOUNDED by
+    ``max_window_s`` (the old whole-buffer strategy would re-decode the entire
+    ~16s feed), and (b) re-base each decode's window-relative timestamps to
+    absolute session time, so finalized ids are contiguous/monotonic and their
+    ends climb far past the window size.
+    """
+
+    def output_fn(audio: Any, _kwargs: dict[str, Any]) -> FakeSTTOutput:
+        secs = _window_seconds(audio)
+        n = max(1, int(secs))
+        segs = [{"text": f"w{i} ", "start": float(i), "end": float(i + 1)} for i in range(n)]
+        segs[-1]["end"] = max(segs[-1]["end"], secs)  # tail runs to the frontier
+        return FakeSTTOutput(text="".join(s["text"] for s in segs), segments=segs)
+
+    loader = fake_loader(output_fn=output_fn)
+    events: list[TranscriptionEvent] = []
+    async with WhisperTiny(
+        redecode_interval_s=1.0, settle_margin_s=1.0, max_window_s=4.0
+    ).start_transcription(audio_format=_FMT) as session:
+        session.feed([silent_pcm(1.0)] * 16)
+        async for event in session:
+            events.append(event)
+
+    finals = [e for e in events if e.type == "final"]
+    partials = [e for e in events if e.type == "partial"]
+
+    # (a) Window BOUNDED: no decode ever sees more than ~max_window + one interval
+    #     of audio (vs ~16s for the old grow-forever buffer).
+    max_audio_s = max(len(c["audio"]) for c in loader.model.generate_calls) / 16000.0
+    assert max_audio_s <= 6.0, f"window not bounded: {max_audio_s:.1f}s"
+
+    # (b) Absolute, monotonic timestamps + contiguous ids (proves the origin re-base
+    #     across trims; without it, ends would never exceed the ~4s window).
+    assert finals, "expected finals"
+    ids = [int(e.segment_id.split("-")[1]) for e in finals]
+    assert ids == list(range(len(ids))), ids
+    ends = [e.end for e in finals]
+    assert ends == sorted(ends)
+    assert max(ends) > 6.0, f"timestamps look window-relative, not absolute: {max(ends)}"
+
+    # The audio cursor stays monotonic and reaches ~the fed duration.
+    cursors = [e.audio_processed_until for e in events if e.audio_processed_until is not None]
+    assert cursors == sorted(cursors)
+    assert cursors[-1] >= 15.0
+
+    # Not 5s-batched: many partials over the 16s feed.
+    assert len(partials) >= 8
+    assert events[-1].type == "done"

@@ -436,7 +436,14 @@ class MlxAudioASR(EngineBase):
         # this class does not cycle at import time.
         from ._streaming import MlxAudioStreamingSession
 
-        session = MlxAudioStreamingSession(self, gated_params)
+        config = cast(MlxAudioConfig, self.config)
+        session = MlxAudioStreamingSession(
+            self,
+            gated_params,
+            redecode_interval_s=config.redecode_interval_s,
+            settle_margin_s=config.settle_margin_s,
+            max_window_s=config.max_window_s,
+        )
         if prepared_audio is not None:
             session.feed(_prepared_to_pcm(prepared_audio))
         return session

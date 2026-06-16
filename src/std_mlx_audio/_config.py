@@ -108,6 +108,38 @@ class MlxAudioConfig(
         description="Hugging Face access token for gated/private model repos (secret)."
     )
 
+    # --- Windowed-streaming knobs (see ``_streaming.py``) --------------------- #
+    # These tune the re-decode-the-window streaming strategy. The MLX backends are
+    # batch decoders, so "streaming" is synthesized by re-running the model over a
+    # sliding window; these control its latency / compute / stability trade-off.
+    redecode_interval_s: float = Field(
+        default=1.5,
+        gt=0.0,
+        description=(
+            "Streaming: seconds of new audio to accumulate before each re-decode. "
+            "Smaller = snappier partials but more compute (the window is re-decoded "
+            "more often)."
+        ),
+    )
+    settle_margin_s: float = Field(
+        default=2.0,
+        ge=0.0,
+        description=(
+            "Streaming: a segment is finalized (and its audio dropped from the "
+            "window) only once it ends at least this many seconds behind the decode "
+            "frontier. Smaller = text settles sooner but is likelier to still change."
+        ),
+    )
+    max_window_s: float | None = Field(
+        default=30.0,
+        gt=0.0,
+        description=(
+            "Streaming: hard cap on the sliding window length in seconds. Bounds "
+            "per-decode cost under long, sparsely-segmented speech by force-"
+            "finalizing leading segments. None disables the cap."
+        ),
+    )
+
 
 class MlxAudioParams(ProviderParams):
     """Engine-specific decoding knobs for the MLX backends (non-portable).
