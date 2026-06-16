@@ -16,8 +16,8 @@ below is reproducible with the exact commands shown.
 | `transformers` | 5.12.0 |
 | `numpy` | 2.4.6 |
 | `pydantic` | 2.13.4 |
-| `standard-asr` | 0.1.0 (git `refactor/v0.1.0-redesign`) |
-| Test audio | `standard_asr/reference/standard_asr_test_audio_english.m4a` (~57 s, English) |
+| `standard-asr` | 0.1.0 (git `main`) |
+| Test audio | `standard_asr/reference/standard_asr_test_audio_english.m4a` (~57 s, English); `standard_asr_user/harvard.wav` (Harvard sentences) for the generic-family runs in §4b |
 
 Setup:
 
@@ -27,36 +27,29 @@ uv python pin 3.12
 uv sync                      # resolves standard-asr from the branch + mlx-audio[stt]
 ```
 
-## 1. Discovery — five models under one engine (`standard-asr list`)
+## 1. Discovery — 20 models under one engine (`standard-asr list`)
 
 ```bash
 uv run standard-asr list
 ```
 
-```
- - mlx-audio/parakeet-tdt-0.6b-v3    engine=mlx-audio  model=parakeet-tdt-0.6b-v3
- - mlx-audio/qwen3-asr-0.6b          engine=mlx-audio  model=qwen3-asr-0.6b
- - mlx-audio/qwen3-asr-1.7b          engine=mlx-audio  model=qwen3-asr-1.7b
- - mlx-audio/whisper-large-v3-turbo  engine=mlx-audio  model=whisper-large-v3-turbo
- - mlx-audio/whisper-tiny            engine=mlx-audio  model=whisper-tiny
-```
+All 20 mlx-audio STT families resolve under the single `engine_id = "mlx-audio"`:
+the original five (`qwen3-asr-0.6b`, `qwen3-asr-1.7b`, `parakeet-tdt-0.6b-v3`,
+`whisper-large-v3-turbo`, `whisper-tiny`) plus `nemotron-asr-streaming-0.6b`,
+`sensevoice-small`, `cohere-asr`, `fun-asr-nano`, `voxtral-mini-3b`,
+`canary-1b-v2`, `qwen2-audio-7b`, `glm-asr-nano`, `granite-speech-1b`,
+`granite-speech-nar-2b`, `vibevoice-asr`, `moonshine-tiny`, `mms-1b-all`,
+`fireredasr2-aed`, `voxtral-realtime-4b`. `standard-asr show <key>` prints each
+model's capabilities and params schema **without instantiating** the engine.
 
-`standard-asr show mlx-audio/qwen3-asr-0.6b` prints the capabilities and
-params schema **without instantiating** the engine (instantiation-free discovery).
+## 2. Compliance — all 20 models pass
 
-## 2. Compliance — all five models pass (`standard-asr compliance run`)
-
-```bash
-for m in qwen3-asr-0.6b qwen3-asr-1.7b parakeet-tdt-0.6b-v3 \
-         whisper-large-v3-turbo whisper-tiny; do
-  uv run standard-asr compliance run "mlx-audio/$m"
-done
-```
-
-Each prints `[OK] Compliance run passed.` (entry-point metadata, capability
-declarations, `model_id` match, and streaming param-gating). The streaming
-event-sequence contract is covered in the test suite via
-`standard_asr.compliance.check_event_sequence` (see §5).
+`standard.compliance.check_entrypoints()` validates **every** discovered model
+(entry-point metadata, capability declarations, `model_id == key`) and is asserted
+green for all 20 in the test suite (`tests/test_entrypoints.py`). The original
+five also pass the CLI `standard-asr compliance run mlx-audio/<key>` end to end
+(`[OK] Compliance run passed.`); the streaming event-sequence contract is covered
+via `standard_asr.compliance.check_event_sequence` (see §5).
 
 ## 3. Real transcript — Qwen3-ASR (the headliner)
 
@@ -113,21 +106,74 @@ STANDARD_ASR_ALLOW_DOWNLOAD=1 uv run python scripts/verify_inference.py \
 > the same constant result schema — only the entry-point key differs. This is the
 > "one engine, many models" target.
 
+## 4b. Generic-family coverage — the new presets run on real weights
+
+The 15 additional families normalize onto two output shapes (`STTOutput` and
+`AlignedResult`), so they are served by one data-driven `GenericSttBackend`
+(parameterized by an `SttFamilySpec`) plus the shared `AlignedResultBackend`.
+Three representative models — one per distinct adapter behavior — were run end to
+end on real weights against `standard_asr_user/harvard.wav` (Harvard sentences):
+
+```bash
+STANDARD_ASR_ALLOW_DOWNLOAD=1 uv run python scripts/verify_inference.py \
+  ../standard_asr_user/harvard.wav mlx-audio/<key>
+```
+
+- **`moonshine-tiny`** (generic, text-only, no language axis) — correct transcript
+  ("The stale smell of old beer lingers. …"); `detected_language=None`,
+  `segments=None`, `words=None` (honest: placeholder timing not surfaced). ~6 s.
+- **`sensevoice-small`** (generic, ISO language + language detection) — correct
+  transcript with `language="en"` forwarded and **`detected_language="en"`
+  reported** back. ~16 s.
+- **`nemotron-asr-streaming-0.6b`** (`AlignedResult`, word timing) — correct
+  transcript, **5 segments / 112 words** with real per-token timestamps. ~18 s.
+
+These exercise every new code path: ISO language pass-through, detected-language
+mapping, the text-only (no-fabricated-timing) path, and the aligned token→word
+mapping. The remaining families share these exact paths and are wired with the
+verified repos below; each is runnable via the same `verify_inference.py` command.
+
+### Verified model repos (and caveats)
+
+Each preset's `hf_repo` was confirmed to exist on the Hugging Face Hub with a
+`config.json` whose `model_type` matches the mlx-audio family. Caveats worth
+knowing before first use:
+
+| Preset | HF repo | Caveat |
+| --- | --- | --- |
+| `sensevoice-small` | `mlx-community/SenseVoiceSmall` | — |
+| `nemotron-asr-streaming-0.6b` | `mlx-community/nemotron-3.5-asr-streaming-0.6b` | — |
+| `fun-asr-nano` | `mlx-community/Fun-ASR-Nano-2512` | — |
+| `glm-asr-nano` | `mlx-community/GLM-ASR-Nano-2512-4bit` | — |
+| `granite-speech-1b` | `mlx-community/granite-4.0-1b-speech-5bit` | — |
+| `granite-speech-nar-2b` | `mlx-community/granite-speech-4.1-2b-nar-mlx` | `custom_code`; bf16 (~4.5 GB) |
+| `voxtral-mini-3b` | `mlx-community/Voxtral-Mini-3B-2507-bf16` | bf16 only (~9 GB); array input only |
+| `voxtral-realtime-4b` | `mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit` | batch only (native streaming not wired) |
+| `qwen2-audio-7b` | `mlx-community/Qwen2-Audio-7B-Instruct-4bit` | 4-bit (~6.6 GB) |
+| `vibevoice-asr` | `mlx-community/VibeVoice-ASR-4bit` | 8 B model |
+| `fireredasr2-aed` | `mlx-community/FireRedASR2-AED-mlx` | — |
+| `canary-1b-v2` | `TechHara/canary-1b-v2-mlx-q4` | third-party org (no mlx-community port) |
+| `moonshine-tiny` | `UsefulSensors/moonshine-tiny` | upstream PyTorch repo (no mlx-community port; sanitized at load) |
+| `cohere-asr` | `appautomaton/cohere-asr-mlx` | **weights in a `mlx-int8/` subfolder, not repo root** — a plain `load()` may not resolve it; point `model_path` at a local copy of the subfolder |
+| `mms-1b-all` | `facebook/mms-1b-all` | **~29 GB** (base + ~1100 adapters); config says `wav2vec2`, so the preset pins `load_model_type="mms"` |
+
 ## 5. Test suite — passes at 100 % coverage
 
 ```bash
-uv run pytest          # 69 tests, 100% line+branch coverage
+uv run pytest          # 102 tests, 100% line+branch coverage
 uv run ruff check src/ tests/
 uv run ruff format --check src/ tests/
 uv run pyright src/    # strict: 0 errors
 ```
 
 The unit suite **mocks the MLX model** (a fake `mlx_audio.stt.load`) and never
-downloads weights or requires MLX at test time; it covers all three backend
-adapters, the batch/streaming engine paths, config/env, the download policy,
-language mapping, and the streaming event-sequence contract
-(`check_event_sequence`). Real inference is the separate, opt-in
-`scripts/verify_inference.py` above.
+downloads weights or requires MLX at test time; it covers all backend adapters
+(Qwen3-ASR, Whisper, the aligned-output backend, and the generic `STTOutput`
+backend across its language/timing/translation/list-input variants), the
+batch/streaming engine paths, the loaded-model family check, the `model_type`
+load override, config/env, the download policy, language mapping, and the
+streaming event-sequence contract (`check_event_sequence`). Real inference is the
+separate, opt-in `scripts/verify_inference.py` above.
 
 ## Notes / honest caveats
 
@@ -142,6 +188,18 @@ language mapping, and the streaming event-sequence contract
 - **Whisper presets point at the `openai/*` repos**, not `mlx-community/whisper-*`,
   because the mlx-community Whisper repos omit the `WhisperProcessor` files that
   mlx-audio needs at runtime. Documented in the findings.
+- **Backend is verified against the loaded model's family.** mlx-audio's `load`
+  auto-detects the family from `config.json`; each preset binds one backend, so
+  after loading, the engine asserts the loaded family is one the backend handles
+  and raises a `DiscoveryError` otherwise. A `model_path` override pointing at a
+  different family fails loudly instead of being run through the wrong adapter
+  (which would silently produce a wrong transcript).
+- **Text-only families are batch only.** The windowed streaming strategy settles
+  on real segment/token timing; families that emit no real timing (SenseVoice,
+  Voxtral, Canary, Qwen2-Audio, Granite Speech, Moonshine, MMS, FireRedASR2,
+  VibeVoice, Voxtral-Realtime) declare `streaming` unsupported rather than emit a
+  degenerate stream. The timing-bearing families (Cohere, Fun-ASR, GLM-ASR) and
+  the aligned families (Parakeet, Nemotron) stream via re-decode like Qwen3-ASR.
 - Larger models download on first run: `Qwen3-ASR-1.7B-8bit` (~3.4 GB) and
   `whisper-large-v3-turbo` (OpenAI repo) are heavier; the 0.6B Qwen, Parakeet
   v3, and whisper-tiny are the fast paths used above.

@@ -21,7 +21,7 @@ keywords = [
     "standard-asr",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -43,10 +43,10 @@ dependencies = [
     "mlx-audio[stt]>=0.4.4,<0.5",
     # NumPy is the zero-copy waveform interchange type with the standard layer.
     "numpy>=1.26.4",
-    # The protocol this plugin implements. Pinned to the v0.1.0 redesign branch
-    # until standard-asr cuts its first PyPI release; swap to a version
-    # specifier (>=0.1.0) at that point.
-    "standard-asr @ git+https://github.com/standard-voice/standard_asr.git@refactor/v0.1.0-redesign",
+    # The protocol this plugin implements. Pinned to the main branch until
+    # standard-asr cuts its first PyPI release; swap to a version specifier
+    # (>=0.1.0) at that point.
+    "standard-asr @ git+https://github.com/standard-voice/standard_asr.git@main",
 ]
 
 [project.urls]
@@ -67,6 +67,21 @@ Homepage = "https://github.com/standard-voice/std-mlx-audio"
 "mlx-audio/parakeet-tdt-0.6b-v3" = "std_mlx_audio.entrypoint:create_parakeet_tdt_0_6b_v3"
 "mlx-audio/whisper-large-v3-turbo" = "std_mlx_audio.entrypoint:create_whisper_large_v3_turbo"
 "mlx-audio/whisper-tiny" = "std_mlx_audio.entrypoint:create_whisper_tiny"
+"mlx-audio/nemotron-asr-streaming-0.6b" = "std_mlx_audio.entrypoint:create_nemotron_asr_streaming_0_6b"
+"mlx-audio/sensevoice-small" = "std_mlx_audio.entrypoint:create_sensevoice_small"
+"mlx-audio/cohere-asr" = "std_mlx_audio.entrypoint:create_cohere_asr"
+"mlx-audio/fun-asr-nano" = "std_mlx_audio.entrypoint:create_fun_asr_nano"
+"mlx-audio/voxtral-mini-3b" = "std_mlx_audio.entrypoint:create_voxtral_mini_3b"
+"mlx-audio/canary-1b-v2" = "std_mlx_audio.entrypoint:create_canary_1b_v2"
+"mlx-audio/qwen2-audio-7b" = "std_mlx_audio.entrypoint:create_qwen2_audio_7b"
+"mlx-audio/glm-asr-nano" = "std_mlx_audio.entrypoint:create_glm_asr_nano"
+"mlx-audio/granite-speech-1b" = "std_mlx_audio.entrypoint:create_granite_speech_1b"
+"mlx-audio/granite-speech-nar-2b" = "std_mlx_audio.entrypoint:create_granite_speech_nar_2b"
+"mlx-audio/vibevoice-asr" = "std_mlx_audio.entrypoint:create_vibevoice_asr"
+"mlx-audio/moonshine-tiny" = "std_mlx_audio.entrypoint:create_moonshine_tiny"
+"mlx-audio/mms-1b-all" = "std_mlx_audio.entrypoint:create_mms_1b_all"
+"mlx-audio/fireredasr2-aed" = "std_mlx_audio.entrypoint:create_fireredasr2_aed"
+"mlx-audio/voxtral-realtime-4b" = "std_mlx_audio.entrypoint:create_voxtral_realtime_4b"
 
 # Local development override: resolve `standard-asr` from the co-located monorepo
 # checkout instead of the public git branch, so edits to the protocol are picked

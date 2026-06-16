@@ -133,7 +133,13 @@ def main() -> int:
         return 2
     run_batch(model_key, audio_path)
     run_batch_words(model_key, audio_path)
-    asyncio.run(run_streaming(model_key, audio_path))
+    # Only the families that emit real segment/token timing declare streaming; the
+    # text-only families are batch only, so skip the windowed run for them rather
+    # than driving an unsupported session.
+    if discover_models().create(model_key).declared_capabilities.supports("streaming_input"):
+        asyncio.run(run_streaming(model_key, audio_path))
+    else:
+        print(f"\n(streaming not supported by {model_key}; batch-only model — skipped)")
     return 0
 
 

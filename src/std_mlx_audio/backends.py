@@ -33,6 +33,7 @@ unit-testable against tiny fakes without MLX or downloads.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from standard_asr.results import Segment, TranscriptionResult, Word
@@ -40,6 +41,7 @@ from standard_asr.runtime_params import WordTimestampGranularity
 
 from . import languages
 from ._config import MlxAudioParams
+from .languages import from_backend_language
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import numpy as np
@@ -80,9 +82,17 @@ class ModelBackend(Protocol):
     return value onto a constant-schema :class:`TranscriptionResult`.
     """
 
-    #: mlx-audio ``model_type`` values this backend handles (for routing /
-    #: sanity assertions). Informational; routing is by entry-point preset.
+    #: mlx-audio ``model_type`` values this backend handles. The engine asserts
+    #: the *actually loaded* model's family is one of these before transcribing
+    #: (see ``MlxAudioASR._verify_model_family``), so a ``model_path`` override
+    #: pointing at a different family fails loudly instead of being run through
+    #: the wrong adapter (which would silently produce a wrong transcript).
     model_types: tuple[str, ...]
+
+    #: Whether this family's ``generate`` requires the audio as a ``list`` of
+    #: arrays rather than a bare ``mx.array`` (only Voxtral does). The engine and
+    #: the streaming session wrap the negotiated array accordingly.
+    audio_as_list: bool
 
     def generate_kwargs(
         self,
@@ -137,6 +147,7 @@ class Qwen3AsrBackend:
     """
 
     model_types: tuple[str, ...] = ("qwen3_asr", "mega_asr")
+    audio_as_list: bool = False
 
     def generate_kwargs(
         self,
@@ -207,7 +218,7 @@ class Qwen3AsrBackend:
             duration=duration,
             segments=segments or None,
             words=None,
-            extra=_qwen_extra(native),
+            extra=_sttoutput_extra(native),
         )
 
 
@@ -223,6 +234,7 @@ class WhisperBackend:
     """
 
     model_types: tuple[str, ...] = ("whisper",)
+    audio_as_list: bool = False
 
     def generate_kwargs(
         self,
@@ -293,17 +305,38 @@ class WhisperBackend:
 # --------------------------------------------------------------------------- #
 # Parakeet
 # --------------------------------------------------------------------------- #
-class ParakeetBackend:
-    """Backend for the Parakeet family (NVIDIA TDT/CTC; token-aligned output).
+class AlignedResultBackend:
+    """Backend for the NeMo-style aligned-output families (Parakeet, Nemotron).
 
-    Parakeet takes no language argument (fixed-language model) and returns an
+    NVIDIA Parakeet (TDT/CTC) and Nemotron ASR (RNN-T) return an
     ``AlignedResult`` (``.text`` + ``.sentences[].tokens[]`` with token-level
-    timing) — not an ``STTOutput``. We map its sentences to segments and its
-    tokens to words; because it *always* produces token timing, it can serve both
-    ``"word"`` and ``"segment"`` granularities at no extra cost.
+    timing) — not an ``STTOutput``, a wholly different shape from the generative
+    backends. We map sentences to segments and tokens to words; because these
+    models *always* produce token timing, they serve both ``"word"`` and
+    ``"segment"`` granularities at no extra cost.
+
+    Neither family exposes a language axis we can safely drive: Parakeet is
+    fixed-language, and Nemotron selects language via *model-specific prompt
+    keys* (not a portable BCP-47 surface — passing an unmatched key silently
+    falls back to auto), so this backend passes no language and lets the model
+    auto-handle it. The honest capability for both is therefore
+    ``language.runtime_override=False`` (declared in ``_metadata.py``).
+
+    Args:
+        model_types: The mlx-audio ``model_type`` value(s) this instance adapts
+            (e.g. ``("parakeet",)`` or ``("nemotron_asr",)``).
     """
 
-    model_types: tuple[str, ...] = ("parakeet", "nemo")
+    audio_as_list: bool = False
+
+    def __init__(self, *, model_types: tuple[str, ...]) -> None:
+        """Bind the aligned-output adapter to one family's ``model_type``(s).
+
+        Args:
+            model_types: The mlx-audio ``model_type`` value(s) this instance
+                adapts (used by the engine's load-time family check).
+        """
+        self.model_types = model_types
 
     def generate_kwargs(
         self,
@@ -313,15 +346,14 @@ class ParakeetBackend:
         params: MlxAudioParams,
         config: MlxAudioConfig,
     ) -> dict[str, Any]:
-        """Build Parakeet ``generate`` kwargs (no language arg).
+        """Build the aligned-output ``generate`` kwargs (none).
 
-        Parakeet has no language selection and no sampler; only ``chunk_duration``
-        is meaningful for very long files, but mlx-audio defaults to whole-file
-        decoding (``chunk_duration=None``), which is best for accuracy on our
-        target clips, so we pass nothing and let the model decide.
+        These models take no language argument we drive and no sampler; mlx-audio
+        defaults to whole-file decoding (best for accuracy on our target clips),
+        so we pass nothing and let the model decide.
 
         Args:
-            resolved_language: Ignored (fixed-language model).
+            resolved_language: Ignored (no driveable language axis).
             want_words: Ignored (always produces token timing).
             params: Ignored (no exposed knobs).
             config: Ignored.
@@ -335,15 +367,15 @@ class ParakeetBackend:
     def to_result(
         self, native: Any, *, duration: float | None, want_words: bool
     ) -> TranscriptionResult:
-        """Map a Parakeet ``AlignedResult`` onto a Standard result.
+        """Map an ``AlignedResult`` onto a Standard result.
 
         Each ``AlignedSentence`` becomes a :class:`Segment`; each
-        ``AlignedToken`` becomes a :class:`Word` (with no probability — TDT does
-        not emit per-token confidence in the mlx-audio path). Word data is
+        ``AlignedToken`` becomes a :class:`Word` (with no probability — the TDT /
+        RNN-T paths do not emit per-token confidence in mlx-audio). Word data is
         attached only when ``want_words`` (spec TR.3).
 
         Args:
-            native: The ``AlignedResult`` from ``Parakeet.generate``.
+            native: The ``AlignedResult`` from the model's ``generate``.
             duration: Audio duration in seconds, if known.
             want_words: Whether word timestamps were requested.
 
@@ -351,11 +383,11 @@ class ParakeetBackend:
             A constant-schema :class:`TranscriptionResult`.
 
         Note:
-            Parakeet does not report a detected language; ``detected_language``
-            is left ``None`` (the model is fixed-language; honesty over guessing).
+            These models do not report a detected language; ``detected_language``
+            is left ``None`` (honesty over guessing).
         """
         text: str = (getattr(native, "text", "") or "").strip()
-        segments, words = _segments_from_parakeet(
+        segments, words = _segments_from_aligned(
             _as_list(getattr(native, "sentences", None)), want_words=want_words
         )
         return TranscriptionResult(
@@ -364,6 +396,171 @@ class ParakeetBackend:
             duration=duration,
             segments=segments or None,
             words=words if want_words else None,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Generic STTOutput families (one parameterized adapter, many models)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class SttFamilySpec:
+    """Declarative adapter spec for an ``STTOutput``-returning model family.
+
+    The ~14 non-Whisper / non-Qwen mlx-audio STT families all return the same
+    ``STTOutput`` shape (``.text`` + optional ``.segments`` dicts + optional
+    ``.language``); they differ only in (a) how the language axis maps onto
+    ``generate`` kwargs, (b) whether their segments carry *real* timing, (c)
+    whether they report a detected language, (d) one input quirk (Voxtral wants a
+    list), and (e) a few per-family decode knobs. Capturing those differences as
+    data lets a single :class:`GenericSttBackend` serve all of them, so the risky
+    kwargs/normalization logic lives (and is tested) in exactly one place.
+
+    Attributes:
+        model_types: mlx-audio ``model_type`` value(s) this spec adapts (the
+            engine's load-time family check uses these).
+        language_kwarg: The ``generate`` keyword that selects the *spoken*
+            language (``"language"`` or Canary's ``"source_lang"``), or ``None``
+            for a family with no driveable spoken-language axis. The resolved
+            BCP-47 tag is passed through as its ISO primary subtag.
+        translate_target_kwarg: The ``generate`` keyword that selects a
+            *translation target* (Canary ``"target_lang"`` / Granite
+            ``"language"``), or ``None`` if the family cannot translate. Driven by
+            the ``target_language`` provider param.
+        segment_timing: Whether ``STTOutput.segments`` carry real per-chunk
+            start/end times (Cohere/Fun-ASR/GLM) — only then do we emit segments
+            and declare the ``"segment"`` granularity. Families with placeholder
+            (``0/0``), wall-clock, or absent timing set this ``False`` and return
+            text only (honesty over fabricated spans).
+        reports_detected_language: Whether ``STTOutput.language`` is a genuinely
+            *detected* language to surface as ``detected_language`` (SenseVoice);
+            families that merely echo the requested language set this ``False``.
+        audio_as_list: Whether ``generate`` needs the audio as ``list[mx.array]``
+            (Voxtral) rather than a bare array.
+        forward: ``(generate_kwarg, provider_field)`` pairs to forward from
+            :class:`MlxAudioParams` when the provider value is not ``None`` (e.g.
+            ``("hotwords", "hotwords")``). Only knobs the family's ``generate``
+            actually accepts are listed (Voxtral has no ``**kwargs``, so passing
+            an unknown one would raise — the allow-list prevents that).
+    """
+
+    model_types: tuple[str, ...]
+    language_kwarg: str | None = None
+    translate_target_kwarg: str | None = None
+    segment_timing: bool = False
+    reports_detected_language: bool = False
+    audio_as_list: bool = False
+    forward: tuple[tuple[str, str], ...] = ()
+
+
+class GenericSttBackend:
+    """Adapter for any ``STTOutput`` family, parameterized by a :class:`SttFamilySpec`.
+
+    One implementation covers every generative / encoder-decoder / CTC STT family
+    mlx-audio exposes besides Whisper and Qwen3-ASR (which keep bespoke backends
+    for word timestamps and English-name language respectively). The behavior is
+    entirely data-driven by ``spec`` so each family's quirks are declared once,
+    in one auditable table, rather than duplicated across a dozen classes.
+
+    Args:
+        spec: The family's declarative adapter spec.
+    """
+
+    def __init__(self, spec: SttFamilySpec) -> None:
+        """Bind the generic adapter to one family's spec.
+
+        Args:
+            spec: The family's declarative adapter spec.
+        """
+        self.spec = spec
+        # Mirror the spec's routing/input flags as plain attributes (not
+        # properties) so the instance satisfies the ModelBackend protocol's
+        # mutable-attribute members under pyright strict.
+        self.model_types: tuple[str, ...] = spec.model_types
+        self.audio_as_list: bool = spec.audio_as_list
+
+    def generate_kwargs(
+        self,
+        *,
+        resolved_language: str | None,
+        want_words: bool,
+        params: MlxAudioParams,
+        config: MlxAudioConfig,
+    ) -> dict[str, Any]:
+        """Build the family's ``generate`` kwargs from the spec + provider params.
+
+        Maps the resolved spoken language onto the spec's ``language_kwarg`` (as
+        an ISO subtag), wires up speech-translation when a ``target_language`` is
+        set, and forwards only the per-family decode knobs the family accepts.
+
+        Args:
+            resolved_language: Effective BCP-47 language, or ``None`` for auto.
+            want_words: Ignored (no STTOutput family emits word timing).
+            params: Engine-specific decoding knobs.
+            config: Engine init config (unused; kept for protocol symmetry).
+
+        Returns:
+            Keyword arguments for the family's ``model.generate``.
+        """
+        del want_words, config
+        spec = self.spec
+        kwargs: dict[str, Any] = {}
+        if spec.language_kwarg is not None and resolved_language is not None:
+            kwargs[spec.language_kwarg] = languages.to_iso_subtag(resolved_language)
+        if spec.translate_target_kwarg is not None:
+            if params.target_language is not None:
+                kwargs[spec.translate_target_kwarg] = languages.to_iso_subtag(
+                    params.target_language
+                )
+            elif spec.translate_target_kwarg == "target_lang" and "source_lang" in kwargs:
+                # Canary defaults target_lang="en"; without an explicit target we
+                # must pin it to the source so a non-English source TRANSCRIBES
+                # rather than silently translating to English.
+                kwargs["target_lang"] = kwargs["source_lang"]
+        for gen_kwarg, field in spec.forward:
+            value = getattr(params, field, None)
+            if value is not None:
+                kwargs[gen_kwarg] = value
+        return kwargs
+
+    def to_result(
+        self, native: Any, *, duration: float | None, want_words: bool
+    ) -> TranscriptionResult:
+        """Map the family's ``STTOutput`` onto a Standard result.
+
+        Emits segments only when the family produces real per-chunk timing
+        (``spec.segment_timing``); otherwise returns text only — never a
+        fabricated span. Surfaces a detected language only when the family truly
+        detects one (``spec.reports_detected_language``). No STTOutput family
+        emits word timing, so ``words`` is always ``None``.
+
+        Args:
+            native: The ``STTOutput`` from the family's ``generate``.
+            duration: Audio duration in seconds, if known.
+            want_words: Ignored (no word timing available).
+
+        Returns:
+            A constant-schema :class:`TranscriptionResult`.
+        """
+        del want_words
+        spec = self.spec
+        text: str = (getattr(native, "text", "") or "").strip()
+        segments = (
+            _segments_from_dicts(_as_list(getattr(native, "segments", None)))
+            if spec.segment_timing
+            else None
+        )
+        detected = (
+            from_backend_language(getattr(native, "language", None))
+            if spec.reports_detected_language
+            else None
+        )
+        return TranscriptionResult(
+            text=text,
+            detected_language=detected,
+            duration=duration,
+            segments=segments or None,
+            words=None,
+            extra=_sttoutput_extra(native),
         )
 
 
@@ -402,6 +599,25 @@ def to_mlx_array(audio: NDArray[np.float32]) -> Any:
     import mlx.core as mx  # local import: MLX is Apple-Silicon-only
 
     return mx.array(audio)
+
+
+def adapt_audio_source(backend: ModelBackend, source: Any) -> Any:
+    """Adapt the negotiated audio source to the backend's ``generate`` call shape.
+
+    Most mlx-audio families take the audio as-is (a bare ``mx.array`` or a file
+    path); Voxtral's ``generate`` requires a ``list[mx.array]``
+    (``backend.audio_as_list``), so a single source is wrapped in a one-element
+    list for it. Centralized so the batch path and the streaming session adapt
+    identically.
+
+    Args:
+        backend: The active backend (its ``audio_as_list`` flag decides).
+        source: The negotiated audio source (an ``mx.array`` or a path).
+
+    Returns:
+        The source, wrapped in a one-element list iff the backend requires it.
+    """
+    return [source] if backend.audio_as_list else source
 
 
 def _clamp_span(start: Any, end: Any) -> tuple[float, float]:
@@ -501,10 +717,10 @@ def _words_from_whisper(raw: list[dict[str, Any]]) -> list[Word]:
     return words
 
 
-def _segments_from_parakeet(
+def _segments_from_aligned(
     sentences: list[Any], *, want_words: bool
 ) -> tuple[list[Segment], list[Word]]:
-    """Convert Parakeet ``AlignedSentence`` objects to ``Segment`` / ``Word``.
+    """Convert ``AlignedSentence`` objects (Parakeet/Nemotron) to ``Segment`` / ``Word``.
 
     Args:
         sentences: A list of ``AlignedSentence`` (each with ``.text``, ``.start``,
@@ -519,7 +735,7 @@ def _segments_from_parakeet(
     for sent in sentences:
         seg_words: list[Word] | None = None
         if want_words:
-            seg_words = _words_from_parakeet(getattr(sent, "tokens", None) or [])
+            seg_words = _words_from_aligned(getattr(sent, "tokens", None) or [])
             flat_words.extend(seg_words)
         start, end = _clamp_span(getattr(sent, "start", 0.0), getattr(sent, "end", 0.0))
         segments.append(
@@ -533,8 +749,8 @@ def _segments_from_parakeet(
     return segments, flat_words
 
 
-def _words_from_parakeet(tokens: list[Any]) -> list[Word]:
-    """Convert Parakeet ``AlignedToken`` objects to ``Word`` (no probability).
+def _words_from_aligned(tokens: list[Any]) -> list[Word]:
+    """Convert ``AlignedToken`` objects (Parakeet/Nemotron) to ``Word`` (no probability).
 
     Args:
         tokens: A list of ``AlignedToken`` (each with ``.text``, ``.start``,
@@ -602,11 +818,13 @@ def _opt_unit(value: Any) -> float | None:
     return min(1.0, max(0.0, f))
 
 
-def _qwen_extra(native: Any) -> dict[str, Any]:
-    """Build the engine-specific ``extra`` from a Qwen3-ASR ``STTOutput``.
+def _sttoutput_extra(native: Any) -> dict[str, Any]:
+    """Build the engine-specific ``extra`` from any mlx-audio ``STTOutput``.
 
-    Surfaces the token-accounting / throughput stats mlx-audio reports (spec
-    TR.1: engine-specific values belong in ``result.extra``, never ``metadata``).
+    Surfaces the token-accounting / throughput stats mlx-audio reports on its
+    ``STTOutput`` (shared across Qwen3-ASR and the generic generative families;
+    spec TR.1: engine-specific values belong in ``result.extra``, never
+    ``metadata``). Fields a given family does not populate are simply absent.
 
     Args:
         native: The ``STTOutput``.
@@ -643,10 +861,13 @@ def map_word_timestamps(granularity: WordTimestampGranularity | None) -> bool:
 
 __all__ = [
     "SAMPLE_RATE",
+    "AlignedResultBackend",
+    "GenericSttBackend",
     "ModelBackend",
-    "ParakeetBackend",
     "Qwen3AsrBackend",
+    "SttFamilySpec",
     "WhisperBackend",
+    "adapt_audio_source",
     "map_word_timestamps",
     "to_mlx_array",
     "waveform_duration",

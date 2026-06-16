@@ -9,11 +9,15 @@ it MUST be honest and self-contained. Capabilities are declared **fail-closed**:
 we declare only what each MLX backend genuinely delivers.
 
 This is the "one engine, many models" surface: a single engine_id
-(``mlx-audio``) carries several model families with *different* capabilities —
-Qwen3-ASR (segment timing only, no per-word; full LLM sampler), Whisper (word +
-segment timing, prompt guidance), and Parakeet (word + segment timing, but
-NO runtime language selection). Each family is its own ``Properties`` +
-``DeclaredCapabilities`` pair; the engine class binds one pair per preset.
+(``mlx-audio``) carries ~20 models with *different* capabilities — e.g. Qwen3-ASR
+(segment timing only; full LLM sampler), Whisper (word + segment timing, prompt
+guidance), Parakeet/Nemotron (word + segment timing; no runtime language
+selection), SenseVoice (language detection; batch only), Canary (speech
+translation), and the long tail of text-only families. The original three
+families keep bespoke ``Properties`` subclasses + ``DeclaredCapabilities``
+constants; the rest are built from the :func:`stt_properties` /
+:func:`stt_capabilities` factories below (same honest, fail-closed shape). The
+engine class binds one Properties + Capabilities pair per preset.
 """
 
 from __future__ import annotations
@@ -258,14 +262,118 @@ class ParakeetTdt06BV3Properties(MlxAudioProperties):
     )
 
 
+# --------------------------------------------------------------------------- #
+# Generic STTOutput + aligned families (the "many models" tail)
+# --------------------------------------------------------------------------- #
+# The ~16 remaining mlx-audio STT families share Properties/Capabilities
+# *shapes*, so we build them from two small factories instead of a class per
+# model. Capabilities stay fail-closed and honest:
+#   * word/segment timestamps ONLY where the model produces REAL timing,
+#   * language.runtime_override ONLY where the model accepts a per-request
+#     language,
+#   * streaming ONLY where the windowed re-decode strategy can settle on real
+#     segment/token timing — a text-only family is batch-only (declaring
+#     streaming it cannot deliver would be dishonest; see ``_streaming.py``).
+
+#: Word-timestamp capability templates reused across the generic families.
+_WORD_TS_NONE = WordTimestampsCap(supported=False)
+_WORD_TS_SEGMENT = WordTimestampsCap(supported=True, granularities=["segment"])
+_WORD_TS_WORD = WordTimestampsCap(supported=True, granularities=["word", "segment"])
+
+
+def stt_capabilities(
+    *, word_timestamps: WordTimestampsCap, runtime_override: bool, streaming: bool
+) -> DeclaredCapabilities:
+    """Build a family's :class:`DeclaredCapabilities` from three honest axes.
+
+    Args:
+        word_timestamps: The timestamp capability the family genuinely delivers
+            (use :data:`_WORD_TS_NONE` for text-only models).
+        runtime_override: Whether the family accepts a per-request language.
+        streaming: Whether the windowed streaming strategy applies — only ``True``
+            for families that emit real segment/token timing for the session to
+            settle on. A ``False`` here yields a batch-only declaration
+            (``streaming=None``; streaming flags left unsupported).
+
+    Returns:
+        A fail-closed :class:`DeclaredCapabilities`.
+    """
+    language = LanguageCaps(runtime_override=FlagCap(supported=runtime_override))
+    batch = BatchCapabilities(language=language, word_timestamps=word_timestamps)
+    if not streaming:
+        return DeclaredCapabilities(batch=batch, self_resamples=FlagCap(supported=False))
+    return DeclaredCapabilities(
+        batch=batch,
+        streaming=StreamingCapabilities(
+            language=language,
+            word_timestamps=word_timestamps,
+            emits_partials=FlagCap(supported=True),
+            re_segments=FlagCap(supported=False),
+            word_stability=FlagCap(supported=False),
+            reconnect=ReconnectCap(mode="unsupported"),
+            finality_level=FinalityCap(mode="final"),
+            timestamps=StreamTimestampsCap(mode="post_align"),
+        ),
+        streaming_input=FlagCap(supported=True),
+        streaming_output=FlagCap(supported=True),
+        self_resamples=FlagCap(supported=False),
+    )
+
+
+def stt_properties(
+    *,
+    model_name: str,
+    description: str,
+    selectable: list[str],
+    detectable: list[str],
+    array_only: bool = False,
+) -> MlxAudioProperties:
+    """Build a generic family's :class:`MlxAudioProperties` instance.
+
+    Args:
+        model_name: Entry-point model component (``properties.model_id`` MUST
+            match the entry-point key — compliance enforced).
+        description: Human-readable, display-only description.
+        selectable: BCP-47 languages the app may select (``["auto"]`` for a model
+            with no manual selection).
+        detectable: BCP-47 languages the model detects and reports (often empty).
+        array_only: Restrict ``accepted_input`` to a decoded array (Voxtral,
+            whose ``generate`` requires ``list[mx.array]`` and cannot take a path
+            or bytes), forcing the standard layer to decode before us.
+
+    Returns:
+        A :class:`MlxAudioProperties` instance.
+    """
+    if array_only:
+        return MlxAudioProperties(
+            model_name=model_name,
+            selectable_languages=selectable,
+            detectable_languages=detectable,
+            description=description,
+            accepted_input={InputKind.ARRAY},
+            wire_encodings=None,
+        )
+    return MlxAudioProperties(
+        model_name=model_name,
+        selectable_languages=selectable,
+        detectable_languages=detectable,
+        description=description,
+    )
+
+
 __all__ = [
     "_PARAKEET_CAPABILITIES",
     "_QWEN_CAPABILITIES",
     "_WHISPER_CAPABILITIES",
+    "_WORD_TS_NONE",
+    "_WORD_TS_SEGMENT",
+    "_WORD_TS_WORD",
     "MlxAudioProperties",
     "ParakeetTdt06BV3Properties",
     "Qwen3Asr06BProperties",
     "Qwen3Asr17BProperties",
     "WhisperLargeV3TurboProperties",
     "WhisperTinyProperties",
+    "stt_capabilities",
+    "stt_properties",
 ]

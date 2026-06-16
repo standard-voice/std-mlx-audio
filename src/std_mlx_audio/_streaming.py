@@ -174,7 +174,7 @@ class MlxAudioStreamingSession(TranscriptionSession):
         )
         model = cast(Any, engine.model)
         source = backends.to_mlx_array(np.ascontiguousarray(audio, dtype=np.float32))
-        native = model.generate(source, **gen_kwargs)
+        native = model.generate(backends.adapt_audio_source(backend, source), **gen_kwargs)
         result = backend.to_result(
             native, duration=backends.waveform_duration(audio), want_words=want_words
         )

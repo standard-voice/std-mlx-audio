@@ -144,6 +144,25 @@ class MlxAudioParams(ProviderParams):
         chunk_duration: Max seconds of audio per decode chunk for the chunking
             backends (Qwen3-ASR default 1200s = 20 min; Whisper/Parakeet have
             their own internal windowing). Long files are split and concatenated.
+        hotwords: Domain/biasing terms to favor during decoding. Honored by the
+            Fun-ASR backend (its ``hotwords`` argument); ignored by backends
+            without a hotword channel. ``None`` leaves the model's default.
+        use_itn: Toggle inverse text normalization (spelling out vs. rendering
+            numerals/dates/punctuation as digits/symbols). Honored by the
+            SenseVoice and Fun-ASR backends; ``None`` keeps each model's default.
+        target_language: Translation target as a BCP-47 tag. When set, the
+            speech-translation backends (Canary, Granite Speech) emit the
+            transcript in this language instead of the spoken one; ``None``
+            transcribes in the spoken language. Ignored by transcription-only
+            backends. The detected/source language is still reported in
+            ``result.detected_language``.
+        beam_size: Beam width for the beam-search backends (FireRedASR2).
+            ``None`` keeps the model default; ignored by greedy/sampling
+            backends.
+        context: Free-text context/biasing prompt for the VibeVoice backend
+            (domain hints, expected vocabulary). ``None`` leaves it unset;
+            ignored by backends without a context channel. Distinct from the
+            Qwen-specific ``system_prompt`` and the portable Whisper ``prompt``.
     """
 
     temperature: float = Field(default=0.0, ge=0.0)
@@ -154,6 +173,11 @@ class MlxAudioParams(ProviderParams):
     max_tokens: int = Field(default=8192, ge=1)
     system_prompt: str | None = None
     chunk_duration: float = Field(default=1200.0, gt=0.0)
+    hotwords: list[str] | None = None
+    use_itn: bool | None = None
+    target_language: str | None = None
+    beam_size: int | None = Field(default=None, ge=1)
+    context: str | None = None
 
 
 __all__ = ["MlxAudioConfig", "MlxAudioParams", "MlxDtype"]

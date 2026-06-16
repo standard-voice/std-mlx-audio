@@ -34,6 +34,16 @@ def test_unsupported_tag_maps_to_none() -> None:
     assert languages.to_whisper_code("sw") is None
 
 
+def test_to_iso_subtag_strips_region_and_script() -> None:
+    # ISO-taking families get the bare primary subtag (no Qwen/Whisper table).
+    assert languages.to_iso_subtag("en-US") == "en"
+    assert languages.to_iso_subtag("zh-Hans-CN") == "zh"
+    assert languages.to_iso_subtag("DE") == "de"
+    # Unlike the Whisper/Qwen mappers, an out-of-table tag is still returned (the
+    # standard layer has already gated it against the family's selectable set).
+    assert languages.to_iso_subtag("sw") == "sw"
+
+
 def test_from_backend_language_code_and_name() -> None:
     assert languages.from_backend_language("en") == "en"  # ISO code path
     assert languages.from_backend_language("German") == "de"  # English-name path

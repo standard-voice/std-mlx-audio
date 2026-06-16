@@ -103,6 +103,58 @@ PARAKEET_V3_LANGUAGES: list[str] = [
     "sl", "es", "sv", "ru", "uk",
 ]  # fmt: skip
 
+# --------------------------------------------------------------------------- #
+# Per-family language inventories for the generic STTOutput backends.
+#
+# Each family below takes an ISO-639 code directly in its ``generate`` call (the
+# model maps the code to whatever internal surface it needs), so the adapter
+# passes the BCP-47 *primary subtag* through unchanged (see ``to_iso_subtag``).
+# The inventories are verified against each model's source/config in
+# mlx-audio 0.4.4; declaring a language the model does not accept would let the
+# standard layer green-light a selection the engine cannot honor, so these lists
+# are the honest, source-checked supported sets (subsets where noted).
+# --------------------------------------------------------------------------- #
+
+#: SenseVoice's selectable languages: ``"auto"`` + the five it accepts and can
+#: also *detect* and report back (``config`` language-id map). Verified against
+#: ``sensevoice.py`` (lid map: zh/en/yue/ja/ko).
+SENSEVOICE_LANGUAGES: list[str] = ["auto", "zh", "en", "yue", "ja", "ko"]
+#: SenseVoice reports a detected language (argmax over the language-id logits);
+#: these are the codes it can emit (everything but ``"auto"``).
+SENSEVOICE_DETECTABLE_LANGUAGES: list[str] = ["zh", "en", "yue", "ja", "ko"]
+
+#: Cohere ASR validates ``language`` against this fixed set (no auto-detect
+#: directive — you MUST pick one). Verified against ``cohere_asr/config.py``.
+COHERE_LANGUAGES: list[str] = [
+    "en", "fr", "de", "es", "it", "pt", "nl", "pl", "el", "ar", "ja", "zh", "vi", "ko",
+]  # fmt: skip
+
+#: Fun-ASR-Nano accepts these ISO codes (mapped to Chinese prompt names
+#: internally) and also auto-detects when language is omitted. A representative
+#: subset of its supported set (the source also lists Chinese topolect codes
+#: gan/hak/hsn/nan/wuu/cjy that we omit from the discovery surface).
+FUN_ASR_LANGUAGES: list[str] = ["auto", "zh", "en", "ja", "yue"]
+#: Languages Fun-ASR-Nano recognizes in auto mode (its set minus the ``"auto"``
+#: directive) — required as ``detectable_languages`` because ``"auto"`` is
+#: selectable. (Fun-ASR does not *report* which it picked, so the result's
+#: ``detected_language`` stays ``None``; this is the candidate-validation set.)
+FUN_ASR_DETECTABLE_LANGUAGES: list[str] = ["zh", "en", "ja", "yue"]
+
+#: Voxtral's supported transcription languages (Mistral Voxtral model card). It
+#: takes an ISO code with default ``"en"`` and has no ``"auto"`` directive in its
+#: ``generate`` surface, so a concrete default is required.
+VOXTRAL_LANGUAGES: list[str] = ["en", "es", "fr", "pt", "hi", "de", "nl", "it"]
+
+#: Canary covers these 25 European languages (its ``config.supported_languages``)
+#: as both transcription source and translation target. No ``"auto"`` directive
+#: (you specify the source language; default ``"en"``).
+CANARY_LANGUAGES: list[str] = list(PARAKEET_V3_LANGUAGES)
+
+#: Granite Speech can translate the transcript into one of these targets via the
+#: ``target_language`` provider param (its ``LANGUAGE_CODES`` map). The spoken
+#: language itself is not selectable (the model auto-handles the input).
+GRANITE_TRANSLATE_LANGUAGES: list[str] = ["en", "fr", "de", "es", "pt", "ja"]
+
 
 def _primary_subtag(bcp47_tag: str) -> str:
     """Return the lower-cased primary subtag of a BCP-47 tag.
@@ -146,6 +198,27 @@ def to_whisper_code(bcp47_tag: str) -> str | None:
     return entry[0] if entry is not None else None
 
 
+def to_iso_subtag(bcp47_tag: str) -> str:
+    """Return the ISO-639 primary subtag of a resolved BCP-47 tag.
+
+    Used by the generic STTOutput backends whose ``generate`` takes an ISO code
+    directly (SenseVoice, Cohere, Voxtral, Fun-ASR, Canary). Unlike
+    :func:`to_whisper_code` / :func:`to_qwen_name`, this does not consult the
+    Qwen/Whisper translation table — it simply strips region/script subtags
+    (``"en-US"`` -> ``"en"``), because these models accept the bare ISO code and
+    the standard layer has already gated the value against the family's declared
+    ``selectable_languages`` (so it is a code the model supports).
+
+    Args:
+        bcp47_tag: A resolved BCP-47 tag (never ``"auto"``; callers resolve
+            auto-detection to ``None`` before reaching the backend).
+
+    Returns:
+        The lower-cased ISO-639 primary subtag (e.g. ``"en"``).
+    """
+    return _primary_subtag(bcp47_tag)
+
+
 def from_backend_language(value: str | None) -> str | None:
     """Translate a backend-reported language into a BCP-47 tag.
 
@@ -174,12 +247,21 @@ def from_backend_language(value: str | None) -> str | None:
 
 
 __all__ = [
+    "CANARY_LANGUAGES",
+    "COHERE_LANGUAGES",
+    "FUN_ASR_DETECTABLE_LANGUAGES",
+    "FUN_ASR_LANGUAGES",
+    "GRANITE_TRANSLATE_LANGUAGES",
     "PARAKEET_V3_LANGUAGES",
     "QWEN_DETECTABLE_LANGUAGES",
     "QWEN_SELECTABLE_LANGUAGES",
+    "SENSEVOICE_DETECTABLE_LANGUAGES",
+    "SENSEVOICE_LANGUAGES",
+    "VOXTRAL_LANGUAGES",
     "WHISPER_DETECTABLE_LANGUAGES",
     "WHISPER_SELECTABLE_LANGUAGES",
     "from_backend_language",
+    "to_iso_subtag",
     "to_qwen_name",
     "to_whisper_code",
 ]

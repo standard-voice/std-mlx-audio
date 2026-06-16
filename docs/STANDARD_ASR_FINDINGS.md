@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # Standard ASR v0.1.0 — plugin-author findings (MLX, one-engine-many-models)
 
 Findings from building `std-mlx-audio` as a fully independent plugin against
-`standard-asr @ refactor/v0.1.0-redesign`. This plugin's deliberate stress test
+`standard-asr @ main`. This plugin's deliberate stress test
 was **"one engine, many models"**: a single `engine_id` (`mlx-audio`) exposing
 three genuinely heterogeneous model families (Qwen3-ASR, Parakeet, Whisper) with
 different native APIs, return types, languages, and capabilities. The headline

@@ -18,11 +18,14 @@ from standard_asr.runtime_params import WordTimestampGranularity
 
 from std_mlx_audio import MlxAudioConfig, MlxAudioParams
 from std_mlx_audio.backends import (  # pyright: ignore[reportPrivateUsage]
-    ParakeetBackend,
+    AlignedResultBackend,
+    GenericSttBackend,
     Qwen3AsrBackend,
+    SttFamilySpec,
     WhisperBackend,
     _opt_float,
     _opt_unit,
+    adapt_audio_source,
     map_word_timestamps,
     waveform_duration,
 )
@@ -170,13 +173,19 @@ class TestWhisperBackend:
 
 
 # --------------------------------------------------------------------------- #
-# Parakeet backend (different return type: AlignedResult)
+# Aligned-output backend (different return type: AlignedResult) — Parakeet/Nemotron
 # --------------------------------------------------------------------------- #
-class TestParakeetBackend:
-    backend = ParakeetBackend()
+class TestAlignedResultBackend:
+    backend = AlignedResultBackend(model_types=("parakeet",))
+
+    def test_model_types_bound_per_instance(self) -> None:
+        # One class, two families: the instance carries the family it adapts.
+        assert AlignedResultBackend(model_types=("parakeet",)).model_types == ("parakeet",)
+        assert AlignedResultBackend(model_types=("nemotron_asr",)).model_types == ("nemotron_asr",)
+        assert self.backend.audio_as_list is False
 
     def test_generate_kwargs_is_empty(self) -> None:
-        # Parakeet takes no language / sampler args.
+        # Aligned-output models take no language / sampler args we drive.
         kw = self.backend.generate_kwargs(
             resolved_language="en", want_words=True, params=_PARAMS, config=_CONFIG
         )
@@ -275,3 +284,162 @@ def test_opt_unit_clamps_to_zero_one() -> None:
     assert _opt_unit(-0.2) == 0.0
     assert _opt_unit(0.5) == 0.5
     assert _opt_unit(None) is None
+
+
+# --------------------------------------------------------------------------- #
+# Generic STTOutput backend (one data-driven adapter, many families)
+# --------------------------------------------------------------------------- #
+class TestGenericSttBackend:
+    def test_model_types_and_audio_as_list_from_spec(self) -> None:
+        backend = GenericSttBackend(SttFamilySpec(model_types=("voxtral",), audio_as_list=True))
+        assert backend.model_types == ("voxtral",)
+        assert backend.audio_as_list is True
+        # Default spec: no list wrapping.
+        assert GenericSttBackend(SttFamilySpec(model_types=("mms",))).audio_as_list is False
+
+    def test_no_language_axis_passes_nothing(self) -> None:
+        # A family with no language_kwarg (e.g. Moonshine) gets an empty surface.
+        backend = GenericSttBackend(SttFamilySpec(model_types=("moonshine",)))
+        kw = backend.generate_kwargs(
+            resolved_language="en", want_words=False, params=_PARAMS, config=_CONFIG
+        )
+        assert kw == {}
+
+    def test_iso_language_passed_through_as_subtag(self) -> None:
+        # SenseVoice-style: language=<iso subtag> (region stripped).
+        backend = GenericSttBackend(
+            SttFamilySpec(model_types=("sensevoice",), language_kwarg="language")
+        )
+        kw = backend.generate_kwargs(
+            resolved_language="zh-Hans-CN", want_words=False, params=_PARAMS, config=_CONFIG
+        )
+        assert kw == {"language": "zh"}
+
+    def test_language_omitted_when_auto(self) -> None:
+        backend = GenericSttBackend(
+            SttFamilySpec(model_types=("sensevoice",), language_kwarg="language")
+        )
+        kw = backend.generate_kwargs(
+            resolved_language=None, want_words=False, params=_PARAMS, config=_CONFIG
+        )
+        assert "language" not in kw
+
+    def test_canary_source_and_default_target(self) -> None:
+        # Canary: source_lang from the language axis; target defaults to source so a
+        # non-English source TRANSCRIBES (not silently translates to English).
+        backend = GenericSttBackend(
+            SttFamilySpec(
+                model_types=("canary",),
+                language_kwarg="source_lang",
+                translate_target_kwarg="target_lang",
+            )
+        )
+        kw = backend.generate_kwargs(
+            resolved_language="de-DE", want_words=False, params=_PARAMS, config=_CONFIG
+        )
+        assert kw == {"source_lang": "de", "target_lang": "de"}
+
+    def test_canary_translation_target_override(self) -> None:
+        backend = GenericSttBackend(
+            SttFamilySpec(
+                model_types=("canary",),
+                language_kwarg="source_lang",
+                translate_target_kwarg="target_lang",
+            )
+        )
+        params = MlxAudioParams(target_language="en")
+        kw = backend.generate_kwargs(
+            resolved_language="de", want_words=False, params=params, config=_CONFIG
+        )
+        assert kw == {"source_lang": "de", "target_lang": "en"}
+
+    def test_granite_translation_via_language_kwarg(self) -> None:
+        # Granite: no spoken-language axis; target_language drives its `language` arg.
+        backend = GenericSttBackend(
+            SttFamilySpec(model_types=("granite_speech",), translate_target_kwarg="language")
+        )
+        no_target = backend.generate_kwargs(
+            resolved_language=None, want_words=False, params=_PARAMS, config=_CONFIG
+        )
+        assert no_target == {}  # transcribe (no translation requested)
+        with_target = backend.generate_kwargs(
+            resolved_language=None,
+            want_words=False,
+            params=MlxAudioParams(target_language="fr-FR"),
+            config=_CONFIG,
+        )
+        assert with_target == {"language": "fr"}
+
+    def test_niche_knobs_forwarded_only_when_set(self) -> None:
+        backend = GenericSttBackend(
+            SttFamilySpec(
+                model_types=("fun_asr_nano",),
+                language_kwarg="language",
+                forward=(("hotwords", "hotwords"), ("itn", "use_itn")),
+            )
+        )
+        # Unset -> omitted (model defaults).
+        assert (
+            backend.generate_kwargs(
+                resolved_language=None, want_words=False, params=_PARAMS, config=_CONFIG
+            )
+            == {}
+        )
+        # Set -> forwarded under the family's kwarg name (note itn<-use_itn rename).
+        params = MlxAudioParams(hotwords=["MLX", "Qwen"], use_itn=False)
+        kw = backend.generate_kwargs(
+            resolved_language=None, want_words=False, params=params, config=_CONFIG
+        )
+        assert kw == {"hotwords": ["MLX", "Qwen"], "itn": False}
+
+    def test_to_result_text_only_when_no_segment_timing(self) -> None:
+        backend = GenericSttBackend(SttFamilySpec(model_types=("moonshine",)))
+        native = FakeSTTOutput(
+            text="hello.",
+            segments=[{"text": "hello.", "start": 0.0, "end": 0.0}],  # placeholder timing
+            generation_tokens=5,
+        )
+        result = backend.to_result(native, duration=1.0, want_words=False)
+        assert result.text == "hello."
+        assert result.segments is None  # honest: placeholder timing not surfaced
+        assert result.words is None
+        assert result.detected_language is None
+        assert result.extra["generation_tokens"] == 5  # throughput stats still surfaced
+
+    def test_to_result_segments_when_real_timing(self) -> None:
+        backend = GenericSttBackend(
+            SttFamilySpec(
+                model_types=("cohere_asr",), language_kwarg="language", segment_timing=True
+            )
+        )
+        native = FakeSTTOutput(
+            text="a b",
+            segments=[
+                {"text": "a", "start": 0.0, "end": 0.5},
+                {"text": " b", "start": 0.5, "end": 1.0},
+            ],
+        )
+        result = backend.to_result(native, duration=1.0, want_words=False)
+        assert result.segments is not None and len(result.segments) == 2
+        assert result.segments[1].start == 0.5 and result.segments[1].end == 1.0
+        assert result.segments[0].words is None  # never word timing on STTOutput families
+
+    def test_to_result_detected_language_when_reported(self) -> None:
+        backend = GenericSttBackend(
+            SttFamilySpec(
+                model_types=("sensevoice",),
+                language_kwarg="language",
+                reports_detected_language=True,
+            )
+        )
+        native = FakeSTTOutput(text="你好", language="zh")
+        result = backend.to_result(native, duration=1.0, want_words=False)
+        assert result.detected_language == "zh"  # ISO reported -> BCP-47
+
+
+def test_adapt_audio_source_wraps_only_for_list_families() -> None:
+    list_backend = GenericSttBackend(SttFamilySpec(model_types=("voxtral",), audio_as_list=True))
+    plain_backend = GenericSttBackend(SttFamilySpec(model_types=("mms",)))
+    sentinel = object()
+    assert adapt_audio_source(list_backend, sentinel) == [sentinel]
+    assert adapt_audio_source(plain_backend, sentinel) is sentinel

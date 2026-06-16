@@ -25,12 +25,52 @@ from std_mlx_audio import (
     Qwen3Asr17B,
     WhisperLargeV3Turbo,
     WhisperTiny,
+    create_canary_1b_v2,
+    create_cohere_asr,
+    create_fireredasr2_aed,
+    create_fun_asr_nano,
+    create_glm_asr_nano,
+    create_granite_speech_1b,
+    create_granite_speech_nar_2b,
+    create_mms_1b_all,
+    create_moonshine_tiny,
+    create_nemotron_asr_streaming_0_6b,
     create_parakeet_tdt_0_6b_v3,
+    create_qwen2_audio_7b,
     create_qwen3_asr_0_6b,
     create_qwen3_asr_1_7b,
+    create_sensevoice_small,
+    create_vibevoice_asr,
+    create_voxtral_mini_3b,
+    create_voxtral_realtime_4b,
     create_whisper_large_v3_turbo,
     create_whisper_tiny,
 )
+
+#: Every entry-point factory paired with the model key it must build. Calling each
+#: covers all factory bodies and pins the factory<->entry-point-key wiring.
+_FACTORY_KEYS = {
+    create_qwen3_asr_0_6b: "mlx-audio/qwen3-asr-0.6b",
+    create_qwen3_asr_1_7b: "mlx-audio/qwen3-asr-1.7b",
+    create_parakeet_tdt_0_6b_v3: "mlx-audio/parakeet-tdt-0.6b-v3",
+    create_whisper_large_v3_turbo: "mlx-audio/whisper-large-v3-turbo",
+    create_whisper_tiny: "mlx-audio/whisper-tiny",
+    create_nemotron_asr_streaming_0_6b: "mlx-audio/nemotron-asr-streaming-0.6b",
+    create_sensevoice_small: "mlx-audio/sensevoice-small",
+    create_cohere_asr: "mlx-audio/cohere-asr",
+    create_fun_asr_nano: "mlx-audio/fun-asr-nano",
+    create_voxtral_mini_3b: "mlx-audio/voxtral-mini-3b",
+    create_canary_1b_v2: "mlx-audio/canary-1b-v2",
+    create_qwen2_audio_7b: "mlx-audio/qwen2-audio-7b",
+    create_glm_asr_nano: "mlx-audio/glm-asr-nano",
+    create_granite_speech_1b: "mlx-audio/granite-speech-1b",
+    create_granite_speech_nar_2b: "mlx-audio/granite-speech-nar-2b",
+    create_vibevoice_asr: "mlx-audio/vibevoice-asr",
+    create_moonshine_tiny: "mlx-audio/moonshine-tiny",
+    create_mms_1b_all: "mlx-audio/mms-1b-all",
+    create_fireredasr2_aed: "mlx-audio/fireredasr2-aed",
+    create_voxtral_realtime_4b: "mlx-audio/voxtral-realtime-4b",
+}
 
 _EXPECTED_KEYS = {
     "mlx-audio/qwen3-asr-0.6b",
@@ -38,6 +78,21 @@ _EXPECTED_KEYS = {
     "mlx-audio/parakeet-tdt-0.6b-v3",
     "mlx-audio/whisper-large-v3-turbo",
     "mlx-audio/whisper-tiny",
+    "mlx-audio/nemotron-asr-streaming-0.6b",
+    "mlx-audio/sensevoice-small",
+    "mlx-audio/cohere-asr",
+    "mlx-audio/fun-asr-nano",
+    "mlx-audio/voxtral-mini-3b",
+    "mlx-audio/canary-1b-v2",
+    "mlx-audio/qwen2-audio-7b",
+    "mlx-audio/glm-asr-nano",
+    "mlx-audio/granite-speech-1b",
+    "mlx-audio/granite-speech-nar-2b",
+    "mlx-audio/vibevoice-asr",
+    "mlx-audio/moonshine-tiny",
+    "mlx-audio/mms-1b-all",
+    "mlx-audio/fireredasr2-aed",
+    "mlx-audio/voxtral-realtime-4b",
 }
 
 
@@ -81,6 +136,15 @@ def test_preset_factories_return_their_concrete_classes() -> None:
     assert type(create_parakeet_tdt_0_6b_v3()) is ParakeetTdt06BV3
     assert type(create_whisper_large_v3_turbo()) is WhisperLargeV3Turbo
     assert type(create_whisper_tiny()) is WhisperTiny
+
+
+def test_every_factory_builds_its_keyed_preset() -> None:
+    # Calls every entry-point factory (covering each body) and checks each builds a
+    # preset whose model_id equals its registered key — the factory/key contract.
+    keys = {factory(): key for factory, key in _FACTORY_KEYS.items()}
+    assert {inst.properties.model_id for inst in keys} == set(_FACTORY_KEYS.values())
+    for inst, key in keys.items():
+        assert inst.properties.model_id == key
 
 
 def test_streaming_param_gating_compliant_each_model() -> None:

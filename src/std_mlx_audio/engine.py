@@ -4,17 +4,22 @@
 """The Standard ASR engine class for the MLX ASR backend.
 
 A thin, typed adapter over the upstream ``mlx-audio`` package (``mlx_audio.stt``)
-that makes several MLX STT model families usable by any Standard ASR application.
-A single engine (engine_id ``mlx-audio``) exposes MULTIPLE models — Qwen3-ASR
-(the headliner), Parakeet, and Whisper — by binding each entry-point preset to a
+that makes EVERY MLX STT model family usable by any Standard ASR application. A
+single engine (engine_id ``mlx-audio``) exposes ~20 models — Qwen3-ASR (the
+headliner), Whisper, Parakeet, Nemotron, SenseVoice, Voxtral, Canary, GLM-ASR,
+Granite Speech, Fun-ASR, VibeVoice, Moonshine, MMS, FireRedASR2, Qwen2-Audio —
+by binding each entry-point preset to a
 ``(hf_repo, ModelBackend, properties, capabilities)`` tuple.
 
 It subclasses :class:`EngineBase` and:
 
-* declares a per-family :class:`~std_mlx_audio._metadata.MlxAudioProperties`
-  subclass and a per-family fail-closed ``DeclaredCapabilities``;
+* binds each preset's per-family :class:`~std_mlx_audio._metadata.MlxAudioProperties`
+  and fail-closed ``DeclaredCapabilities`` (built via the ``stt_properties`` /
+  ``stt_capabilities`` factories, or the original per-family subclasses);
 * keeps ``__init__`` pure and loads weights lazily in
-  :meth:`_ensure_model_loaded` (spec IC.9);
+  :meth:`_ensure_model_loaded` (spec IC.9), then verifies the loaded model's
+  family matches the bound backend (:meth:`_verify_model_family`) so a stray
+  ``model_path`` fails loudly instead of mis-transcribing;
 * implements :meth:`_transcribe` (batch) by dispatching to the bound
   :class:`~std_mlx_audio.backends.ModelBackend`, and :meth:`_start_transcription`
   (windowed streaming, see :mod:`std_mlx_audio._streaming`).
@@ -54,19 +59,35 @@ from ._metadata import (
     _PARAKEET_CAPABILITIES,
     _QWEN_CAPABILITIES,
     _WHISPER_CAPABILITIES,
+    _WORD_TS_NONE,
+    _WORD_TS_SEGMENT,
+    _WORD_TS_WORD,
     ParakeetTdt06BV3Properties,
     Qwen3Asr06BProperties,
     Qwen3Asr17BProperties,
     WhisperLargeV3TurboProperties,
     WhisperTinyProperties,
+    stt_capabilities,
+    stt_properties,
 )
 from .backends import (
+    AlignedResultBackend,
+    GenericSttBackend,
     ModelBackend,
-    ParakeetBackend,
     Qwen3AsrBackend,
+    SttFamilySpec,
     WhisperBackend,
     map_word_timestamps,
     waveform_duration,
+)
+from .languages import (
+    CANARY_LANGUAGES,
+    COHERE_LANGUAGES,
+    FUN_ASR_DETECTABLE_LANGUAGES,
+    FUN_ASR_LANGUAGES,
+    SENSEVOICE_DETECTABLE_LANGUAGES,
+    SENSEVOICE_LANGUAGES,
+    VOXTRAL_LANGUAGES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -103,6 +124,12 @@ class MlxAudioASR(EngineBase):
     #: to a concrete member of its set, not the engine-wide ``"auto"`` default —
     #: otherwise LANG R1 fails. Explicit ``kwargs`` always win over these.
     default_config_overrides: ClassVar[dict[str, Any]] = {}
+    #: Optional ``model_type`` to force on the loader (spec IC.7). A few HF repos
+    #: ship a ``config.json`` whose ``model_type`` does not match the mlx-audio
+    #: family that can actually run them — e.g. MMS reports ``"wav2vec2"`` but is
+    #: served by the ``mms`` family — so the preset pins the correct family rather
+    #: than letting auto-detection mis-route. ``None`` (default) auto-detects.
+    load_model_type: ClassVar[str | None] = None
 
     provider_params_type: ClassVar[type[ProviderParams] | None] = MlxAudioParams
     config_type: ClassVar[type[BaseConfig[str]] | None] = MlxAudioConfig
@@ -190,6 +217,10 @@ class MlxAudioASR(EngineBase):
         load_kwargs: dict[str, Any] = {"local_files_only": local_only}
         if config.revision is not None:
             load_kwargs["revision"] = config.revision
+        # A few repos mislabel their config.json model_type (e.g. MMS says
+        # "wav2vec2"); the preset pins the family so the loader does not mis-route.
+        if type(self).load_model_type is not None:
+            load_kwargs["model_type"] = type(self).load_model_type
         try:
             self._model = load(model_source, **load_kwargs)
         except Exception as exc:
@@ -198,6 +229,36 @@ class MlxAudioASR(EngineBase):
                 "disabled, set STANDARD_ASR_ALLOW_DOWNLOAD=1 or pre-download the "
                 "model; ensure you are on Apple Silicon with Metal."
             ) from exc
+        self._verify_model_family()
+
+    def _verify_model_family(self) -> None:
+        """Assert the loaded model's family matches this preset's backend (spec IC.7).
+
+        mlx-audio's ``load`` auto-detects the model family from the checkpoint's
+        ``config.json``; this preset, however, binds ONE backend that knows
+        exactly one family's ``generate`` call-shape and output schema. If a
+        ``model_path`` (or ``revision``) override resolves to a DIFFERENT family,
+        running it through the wrong adapter would silently produce a wrong
+        transcript or crash — the cardinal sin — so we fail loudly here instead.
+
+        Raises:
+            DiscoveryError: If the loaded model's family is not one this preset's
+                backend declares in ``model_types``.
+        """
+        family = _model_family(self._model)
+        if family is None:
+            # Could not introspect the model's module path (unexpected layout);
+            # do not block a possibly-valid load on a check we cannot make.
+            return
+        allowed = type(self).backend.model_types
+        if family not in allowed:
+            raise DiscoveryError(
+                f"The loaded MLX model is a {family!r} model, which the "
+                f"{type(self).properties.model_id!r} preset cannot run (its "
+                f"backend handles {allowed}). This usually means a 'model_path' "
+                "override points at a different model family; use the matching "
+                "preset, or point 'model_path' at a compatible checkpoint."
+            )
 
     def prepare(self) -> None:
         """Preload model weights without transcribing (spec IC.11).
@@ -262,7 +323,7 @@ class MlxAudioASR(EngineBase):
         )
         model = cast(Any, self._model)
         try:
-            native = model.generate(source, **gen_kwargs)
+            native = model.generate(backends.adapt_audio_source(backend, source), **gen_kwargs)
         except Exception as exc:
             raise TranscriptionError(f"MLX transcription failed: {type(exc).__name__}.") from exc
         return backend.to_result(native, duration=duration, want_words=want_words)
@@ -381,6 +442,33 @@ class MlxAudioASR(EngineBase):
         return session
 
 
+def _model_family(model: object | None) -> str | None:
+    """Return the mlx-audio family name of a loaded model, or ``None``.
+
+    mlx-audio instantiates each family's ``Model`` class from
+    ``mlx_audio.stt.models.<family>.<module>``, so the family is the path segment
+    immediately after ``models`` in the model class's ``__module__`` (e.g.
+    ``mlx_audio.stt.models.whisper.whisper`` -> ``"whisper"``;
+    ``...models.mega_asr.mega_asr`` -> ``"mega_asr"``). Used by
+    :meth:`MlxAudioASR._verify_model_family` to fail loudly on a family/backend
+    mismatch.
+
+    Args:
+        model: A loaded mlx-audio model instance, or ``None``.
+
+    Returns:
+        The family name, or ``None`` if it cannot be determined.
+    """
+    if model is None:
+        return None
+    parts = (type(model).__module__ or "").split(".")
+    try:
+        index = parts.index("models")
+    except ValueError:
+        return None
+    return parts[index + 1] if index + 1 < len(parts) else None
+
+
 def _disable_tqdm_monitor_thread() -> None:
     """Disable tqdm's auto-spawned monitor daemon thread (idempotent, best-effort).
 
@@ -465,7 +553,7 @@ class ParakeetTdt06BV3(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "mlx-community/parakeet-tdt-0.6b-v3"
-    backend: ClassVar[ModelBackend] = ParakeetBackend()
+    backend: ClassVar[ModelBackend] = AlignedResultBackend(model_types=("parakeet",))
     properties: ClassVar[BaseProperties] = ParakeetTdt06BV3Properties()
     declared_capabilities: ClassVar[DeclaredCapabilities] = _PARAKEET_CAPABILITIES
     default_config_overrides: ClassVar[dict[str, Any]] = {"default_language": "en"}
@@ -503,11 +591,394 @@ class WhisperTiny(MlxAudioASR):
     declared_capabilities: ClassVar[DeclaredCapabilities] = _WHISPER_CAPABILITIES
 
 
+# --------------------------------------------------------------------------- #
+# Aligned-output preset (token timing): NVIDIA Nemotron ASR.
+# Shares the AlignedResult shape with Parakeet, so it reuses AlignedResultBackend
+# and declares word+segment timestamps; its language keys are model-specific, so
+# language.runtime_override stays False (honest) — see backends.AlignedResultBackend.
+# --------------------------------------------------------------------------- #
+class NemotronAsrStreaming06B(MlxAudioASR):
+    """``mlx-audio/nemotron-asr-streaming-0.6b`` — NVIDIA Nemotron ASR (word timing)."""
+
+    hf_repo: ClassVar[str] = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
+    backend: ClassVar[ModelBackend] = AlignedResultBackend(model_types=("nemotron_asr",))
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="nemotron-asr-streaming-0.6b",
+        description=(
+            "NVIDIA Nemotron 3.5 ASR streaming 0.6B (MLX); English ASR with "
+            "precise word/segment timestamps."
+        ),
+        selectable=[],
+        detectable=[],
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_WORD, runtime_override=False, streaming=True
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Generic STTOutput presets. Each binds a GenericSttBackend(SttFamilySpec(...))
+# that declares the family's language axis, timing honesty, input quirks, and
+# decode knobs. Capabilities mirror the spec: segment timestamps + streaming ONLY
+# where the model emits real per-chunk timing; language.runtime_override ONLY
+# where it accepts a language; otherwise text-only + batch-only (honest).
+# --------------------------------------------------------------------------- #
+class SenseVoiceSmall(MlxAudioASR):
+    """``mlx-audio/sensevoice-small`` — FunAudioLLM SenseVoice (language ID + ITN)."""
+
+    hf_repo: ClassVar[str] = "mlx-community/SenseVoiceSmall"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(
+        SttFamilySpec(
+            model_types=("sensevoice",),
+            language_kwarg="language",
+            reports_detected_language=True,
+            forward=(("use_itn", "use_itn"),),
+        )
+    )
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="sensevoice-small",
+        description=(
+            "FunAudioLLM SenseVoice-Small (MLX); multilingual (zh/en/yue/ja/ko) "
+            "ASR with language detection and optional ITN. Batch only."
+        ),
+        selectable=SENSEVOICE_LANGUAGES,
+        detectable=SENSEVOICE_DETECTABLE_LANGUAGES,
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_NONE, runtime_override=True, streaming=False
+    )
+
+
+class CohereAsr(MlxAudioASR):
+    """``mlx-audio/cohere-asr`` — Cohere ASR (14 languages, VAD segment timing).
+
+    Caveat: the only public MLX checkpoint stores its weights in a repo
+    *subfolder* (``mlx-int8/``), which ``mlx_audio.stt.load`` may not resolve from
+    the repo root — point ``model_path`` at a local copy of that subfolder if a
+    plain load fails. See VERIFICATION.md.
+    """
+
+    hf_repo: ClassVar[str] = "appautomaton/cohere-asr-mlx"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(
+        SttFamilySpec(
+            model_types=("cohere_asr",),
+            language_kwarg="language",
+            segment_timing=True,
+        )
+    )
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="cohere-asr",
+        description=(
+            "Cohere ASR (MLX, int8); 14-language ASR with VAD-based segment "
+            "timing. Public checkpoint stores weights in a subfolder (see docs)."
+        ),
+        selectable=COHERE_LANGUAGES,
+        detectable=[],
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_SEGMENT, runtime_override=True, streaming=True
+    )
+    default_config_overrides: ClassVar[dict[str, Any]] = {"default_language": "en"}
+
+
+class FunAsrNano(MlxAudioASR):
+    """``mlx-audio/fun-asr-nano`` — Fun-ASR-Nano (hotwords + ITN, per-chunk timing)."""
+
+    hf_repo: ClassVar[str] = "mlx-community/Fun-ASR-Nano-2512"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(
+        SttFamilySpec(
+            model_types=("fun_asr_nano",),
+            language_kwarg="language",
+            segment_timing=True,
+            forward=(("hotwords", "hotwords"), ("itn", "use_itn")),
+        )
+    )
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="fun-asr-nano",
+        description=(
+            "Fun-ASR-Nano (MLX); Qwen3-based ASR for Chinese/English/Japanese "
+            "with hotword biasing, ITN, and per-chunk segment timing."
+        ),
+        selectable=FUN_ASR_LANGUAGES,
+        detectable=FUN_ASR_DETECTABLE_LANGUAGES,
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_SEGMENT, runtime_override=True, streaming=True
+    )
+
+
+class VoxtralMini3B(MlxAudioASR):
+    """``mlx-audio/voxtral-mini-3b`` — Mistral Voxtral-Mini 3B (multilingual).
+
+    Voxtral's ``generate`` requires a decoded ``list[mx.array]``, so this preset
+    accepts an array only (the standard layer decodes a file/bytes first) and the
+    engine wraps it in a list (``audio_as_list``).
+    """
+
+    hf_repo: ClassVar[str] = "mlx-community/Voxtral-Mini-3B-2507-bf16"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(
+        SttFamilySpec(
+            model_types=("voxtral",),
+            language_kwarg="language",
+            audio_as_list=True,
+        )
+    )
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="voxtral-mini-3b",
+        description=(
+            "Mistral Voxtral-Mini 3B (MLX, bf16); multilingual ASR. Large "
+            "(~9 GB); decoded-array input only; batch only."
+        ),
+        selectable=VOXTRAL_LANGUAGES,
+        detectable=[],
+        array_only=True,
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_NONE, runtime_override=True, streaming=False
+    )
+    default_config_overrides: ClassVar[dict[str, Any]] = {"default_language": "en"}
+
+
+class Canary1BV2(MlxAudioASR):
+    """``mlx-audio/canary-1b-v2`` — NVIDIA Canary (25 EU languages + translation).
+
+    Set the ``target_language`` provider param to translate the transcript into a
+    different language (Canary's source/target axes); otherwise it transcribes in
+    the selected source language.
+    """
+
+    hf_repo: ClassVar[str] = "TechHara/canary-1b-v2-mlx-q4"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(
+        SttFamilySpec(
+            model_types=("canary",),
+            language_kwarg="source_lang",
+            translate_target_kwarg="target_lang",
+        )
+    )
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="canary-1b-v2",
+        description=(
+            "NVIDIA Canary 1B v2 (MLX, q4); 25-language European ASR with "
+            "speech translation (set target_language). Batch only."
+        ),
+        selectable=CANARY_LANGUAGES,
+        detectable=[],
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_NONE, runtime_override=True, streaming=False
+    )
+    default_config_overrides: ClassVar[dict[str, Any]] = {"default_language": "en"}
+
+
+class Qwen2Audio7B(MlxAudioASR):
+    """``mlx-audio/qwen2-audio-7b`` — Qwen2-Audio 7B Instruct (audio-LLM ASR)."""
+
+    hf_repo: ClassVar[str] = "mlx-community/Qwen2-Audio-7B-Instruct-4bit"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(SttFamilySpec(model_types=("qwen2_audio",)))
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="qwen2-audio-7b",
+        description="Qwen2-Audio 7B Instruct (MLX, 4-bit); audio-LLM transcription. Batch only.",
+        selectable=[],
+        detectable=[],
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
+    )
+
+
+class GlmAsrNano(MlxAudioASR):
+    """``mlx-audio/glm-asr-nano`` — GLM-ASR-Nano (per-chunk segment timing)."""
+
+    hf_repo: ClassVar[str] = "mlx-community/GLM-ASR-Nano-2512-4bit"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(
+        SttFamilySpec(model_types=("glmasr",), segment_timing=True)
+    )
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="glm-asr-nano",
+        description="GLM-ASR-Nano (MLX, 4-bit); compact ASR with per-chunk segment timing.",
+        selectable=[],
+        detectable=[],
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_SEGMENT, runtime_override=False, streaming=True
+    )
+
+
+class GraniteSpeech1B(MlxAudioASR):
+    """``mlx-audio/granite-speech-1b`` — IBM Granite Speech (ASR + translation).
+
+    Set the ``target_language`` provider param to translate the transcript
+    (Granite's prompt-driven ``Translate the speech to <lang>`` mode); otherwise
+    it transcribes in the spoken language.
+    """
+
+    hf_repo: ClassVar[str] = "mlx-community/granite-4.0-1b-speech-5bit"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(
+        SttFamilySpec(model_types=("granite_speech",), translate_target_kwarg="language")
+    )
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="granite-speech-1b",
+        description=(
+            "IBM Granite 4.0 1B Speech (MLX, 5-bit); ASR with prompt-driven "
+            "speech translation (set target_language). Batch only."
+        ),
+        selectable=[],
+        detectable=[],
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
+    )
+
+
+class GraniteSpeechNar2B(MlxAudioASR):
+    """``mlx-audio/granite-speech-nar-2b`` — IBM Granite Speech NAR (fast, non-AR)."""
+
+    hf_repo: ClassVar[str] = "mlx-community/granite-speech-4.1-2b-nar-mlx"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(
+        SttFamilySpec(model_types=("granite_speech_nar",))
+    )
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="granite-speech-nar-2b",
+        description=(
+            "IBM Granite 4.1 2B Speech NAR (MLX); fast non-autoregressive ASR. Batch only."
+        ),
+        selectable=[],
+        detectable=[],
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
+    )
+
+
+class VibeVoiceAsr(MlxAudioASR):
+    """``mlx-audio/vibevoice-asr`` — Microsoft VibeVoice-ASR (context-biased)."""
+
+    hf_repo: ClassVar[str] = "mlx-community/VibeVoice-ASR-4bit"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(
+        SttFamilySpec(model_types=("vibevoice_asr",), forward=(("context", "context"),))
+    )
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="vibevoice-asr",
+        description=(
+            "Microsoft VibeVoice-ASR 8B (MLX, 4-bit); context-biased ASR "
+            "(set the context provider param). Batch only."
+        ),
+        selectable=[],
+        detectable=[],
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
+    )
+
+
+class MoonshineTiny(MlxAudioASR):
+    """``mlx-audio/moonshine-tiny`` — UsefulSensors Moonshine tiny (English, ~27M)."""
+
+    hf_repo: ClassVar[str] = "UsefulSensors/moonshine-tiny"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(SttFamilySpec(model_types=("moonshine",)))
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="moonshine-tiny",
+        description="UsefulSensors Moonshine tiny (MLX); tiny fast English ASR. Batch only.",
+        selectable=[],
+        detectable=[],
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
+    )
+
+
+class Mms1BAll(MlxAudioASR):
+    """``mlx-audio/mms-1b-all`` — Meta MMS-1B-all (multilingual CTC ASR).
+
+    The upstream repo's ``config.json`` reports ``model_type="wav2vec2"`` even
+    though the ``mms`` family runs it, so the preset pins ``load_model_type`` to
+    ``"mms"`` to route it correctly. Heavy (~29 GB: base + language adapters).
+    """
+
+    hf_repo: ClassVar[str] = "facebook/mms-1b-all"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(SttFamilySpec(model_types=("mms",)))
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="mms-1b-all",
+        description=(
+            "Meta MMS-1B-all (MLX); multilingual CTC ASR. Large download "
+            "(~29 GB); config model_type pinned to 'mms'. Batch only."
+        ),
+        selectable=[],
+        detectable=[],
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
+    )
+    load_model_type: ClassVar[str | None] = "mms"
+
+
+class FireRedAsr2Aed(MlxAudioASR):
+    """``mlx-audio/fireredasr2-aed`` — FireRedASR2-AED (Chinese/English, beam search)."""
+
+    hf_repo: ClassVar[str] = "mlx-community/FireRedASR2-AED-mlx"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(
+        SttFamilySpec(model_types=("fireredasr2",), forward=(("beam_size", "beam_size"),))
+    )
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="fireredasr2-aed",
+        description=(
+            "FireRedASR2-AED (MLX); Chinese/English ASR with beam search "
+            "(set beam_size). Batch only."
+        ),
+        selectable=[],
+        detectable=[],
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
+    )
+
+
+class VoxtralRealtime4B(MlxAudioASR):
+    """``mlx-audio/voxtral-realtime-4b`` — Mistral Voxtral-Mini 4B Realtime (English).
+
+    Exposed through the windowed batch re-decode path; mlx-audio's native
+    low-latency streaming session for this model is not yet wired in, so this
+    preset declares batch only (honest) rather than incremental streaming.
+    """
+
+    hf_repo: ClassVar[str] = "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit"
+    backend: ClassVar[ModelBackend] = GenericSttBackend(
+        SttFamilySpec(model_types=("voxtral_realtime",))
+    )
+    properties: ClassVar[BaseProperties] = stt_properties(
+        model_name="voxtral-realtime-4b",
+        description=(
+            "Mistral Voxtral-Mini 4B Realtime (MLX, 4-bit); English ASR. Batch "
+            "only (native streaming not yet wired)."
+        ),
+        selectable=[],
+        detectable=[],
+    )
+    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+        word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
+    )
+
+
 __all__ = [
+    "Canary1BV2",
+    "CohereAsr",
+    "FireRedAsr2Aed",
+    "FunAsrNano",
+    "GlmAsrNano",
+    "GraniteSpeech1B",
+    "GraniteSpeechNar2B",
     "MlxAudioASR",
+    "Mms1BAll",
+    "MoonshineTiny",
+    "NemotronAsrStreaming06B",
     "ParakeetTdt06BV3",
+    "Qwen2Audio7B",
     "Qwen3Asr06B",
     "Qwen3Asr17B",
+    "SenseVoiceSmall",
+    "VibeVoiceAsr",
+    "VoxtralMini3B",
+    "VoxtralRealtime4B",
     "WhisperLargeV3Turbo",
     "WhisperTiny",
 ]
