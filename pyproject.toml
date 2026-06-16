@@ -83,13 +83,11 @@ Homepage = "https://github.com/standard-voice/std-mlx-audio"
 "mlx-audio/fireredasr2-aed" = "std_mlx_audio.entrypoint:create_fireredasr2_aed"
 "mlx-audio/voxtral-realtime-4b" = "std_mlx_audio.entrypoint:create_voxtral_realtime_4b"
 
-# Local development override: resolve `standard-asr` from the co-located monorepo
-# checkout instead of the public git branch, so edits to the protocol are picked
-# up immediately and the plugin shares one `standard-asr` install with the demo
-# app and sibling plugins. The `[project]` dependency stays pinned to git for a
-# publish-ready manifest; this block only affects local `uv` resolution.
-[tool.uv.sources]
-standard-asr = { path = "../standard_asr", editable = true }
+# No `[tool.uv.sources]` override: `standard-asr` resolves straight from the
+# `[project]` dependency above (GitHub `main`), so `uv pip install
+# git+https://github.com/standard-voice/std-mlx-audio` works standalone — a local
+# path override here would make uv try to resolve it from a non-existent
+# subdirectory of the installed package.
 
 [build-system]
 requires = ["uv-build>=0.9,<0.12"]

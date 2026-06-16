@@ -67,15 +67,17 @@ language axis declares an empty `selectable_languages`. Query any model with
 
 ## Install
 
+> **Not yet published to PyPI** — install from GitHub. Apple Silicon (arm64 +
+> Metal) is required for inference.
+
 ```bash
-pip install std-mlx-audio          # on an Apple-Silicon Mac
-# or, in a uv project:
-uv add std-mlx-audio
+uv pip install git+https://github.com/standard-voice/std-mlx-audio
 ```
 
 This pulls `mlx-audio[stt]` (which pulls `mlx`, `mlx-lm`, `transformers`) and
-`standard-asr`. Model weights download from the Hugging Face Hub on first use
-(set `STANDARD_ASR_ALLOW_DOWNLOAD=1` if your environment disables downloads).
+`standard-asr` (from GitHub `main`). Model weights download from the Hugging Face
+Hub on first use (set `STANDARD_ASR_ALLOW_DOWNLOAD=1` if your environment disables
+downloads). Once published to PyPI this becomes `uv pip install std-mlx-audio`.
 
 ## Use
 
