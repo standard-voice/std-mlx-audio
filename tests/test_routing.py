@@ -13,6 +13,8 @@ All against the injected fake loader — never a real model or download.
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -22,6 +24,7 @@ from standard_asr.exceptions import DiscoveryError
 
 from std_mlx_audio import (
     Canary1BV2,
+    CohereAsr,
     FireRedAsr2Aed,
     FunAsrNano,
     GraniteSpeech1B,
@@ -29,6 +32,7 @@ from std_mlx_audio import (
     Mms1BAll,
     MoonshineTiny,
     NemotronAsrStreaming06B,
+    Qwen2Audio7B,
     SenseVoiceSmall,
     VibeVoiceAsr,
     VoxtralMini3B,
@@ -123,16 +127,16 @@ def test_default_preset_does_not_pin_model_type(fake_loader: Callable[..., FakeL
 
 
 # --------------------------------------------------------------------------- #
-# Voxtral list-audio adaptation
+# Voxtral path adaptation (wants_path)
 # --------------------------------------------------------------------------- #
-def test_voxtral_wraps_audio_in_list(fake_loader: Callable[..., FakeLoader]) -> None:
-    import mlx.core as mx
-
+def test_voxtral_receives_path_for_array_input(fake_loader: Callable[..., FakeLoader]) -> None:
+    # Voxtral's generate only works via its file-path branch (the array path needs
+    # a `format` arg mlx-audio never passes); the engine materializes a temp WAV
+    # from the negotiated array and hands generate the path string.
     loader = fake_loader(output=FakeSTTOutput(text="hi"))
     VoxtralMini3B().transcribe(_array_input(), RuntimeParams(language="en"))
     audio = loader.model.generate_calls[0]["audio"]
-    assert isinstance(audio, list) and len(audio) == 1
-    assert isinstance(audio[0], mx.array)
+    assert isinstance(audio, str) and audio.endswith(".wav")
     assert loader.model.generate_calls[0]["language"] == "en"
 
 
@@ -241,3 +245,84 @@ def test_nemotron_aligned_output_with_words(fake_loader: Callable[..., FakeLoade
     assert result.text == "hi there"
     assert result.words is not None and len(result.words) == 2
     assert result.detected_language is None  # aligned families don't report language
+
+
+# --------------------------------------------------------------------------- #
+# Qwen2-Audio decode prompt (audio-LLM -> bare transcript)
+# --------------------------------------------------------------------------- #
+def test_qwen2_audio_passes_default_transcription_prompt(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # The audio-LLM's own default ("Please transcribe the speech.") yields
+    # conversational output; the preset injects a strict transcription prompt so
+    # generate returns a bare transcript.
+    loader = fake_loader(output=FakeSTTOutput(text="hi"))
+    Qwen2Audio7B().transcribe(_array_input(), RuntimeParams())
+    assert "only the transcript" in loader.model.generate_calls[0]["prompt"].lower()
+
+
+def test_qwen2_audio_system_prompt_overrides_default(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # A caller-supplied system_prompt takes precedence over the preset default.
+    loader = fake_loader(output=FakeSTTOutput(text="hi"))
+    Qwen2Audio7B().transcribe(
+        _array_input(),
+        RuntimeParams(provider_params=MlxAudioParams(system_prompt="Just the words.")),
+    )
+    assert loader.model.generate_calls[0]["prompt"] == "Just the words."
+
+
+# --------------------------------------------------------------------------- #
+# VibeVoice transcript rebuilt from parsed diarization segments (not raw JSON)
+# --------------------------------------------------------------------------- #
+def test_vibevoice_text_rebuilt_from_segments(fake_loader: Callable[..., FakeLoader]) -> None:
+    # VibeVoice returns its transcript inside STTOutput.segments (parsed from a
+    # diarization JSON) while STTOutput.text is the raw JSON string; the result
+    # text must be the joined segment text, with no (undeclared) segments emitted.
+    raw_json = '[{"start":0.0,"end":1.0,"text":"hello"},{"start":1.0,"end":2.0,"text":"world"}]'
+    fake_loader(
+        output=FakeSTTOutput(
+            text=raw_json,
+            segments=[
+                {"start": 0.0, "end": 1.0, "speaker_id": 0, "text": "hello"},
+                {"start": 1.0, "end": 2.0, "speaker_id": 1, "text": "world"},
+            ],
+        )
+    )
+    result = VibeVoiceAsr().transcribe(_array_input(), RuntimeParams())
+    assert result.text == "hello world"  # rebuilt from segments, not the raw JSON
+    assert result.segments is None  # declared text-only: segments are not emitted
+
+
+# --------------------------------------------------------------------------- #
+# Cohere-ASR loads from the repo's mlx-int8/ subfolder
+# --------------------------------------------------------------------------- #
+def test_cohere_loads_from_subfolder(
+    fake_loader: Callable[..., FakeLoader], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The repo stores its checkpoint under mlx-int8/; the loader snapshot-downloads
+    # the repo and points load() at the subfolder (not the root, where there is no
+    # config.json), dropping the now-meaningless revision for the local path.
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *_a, **_k: str(tmp_path))
+    loader = fake_loader(output=FakeSTTOutput(text="hi"))
+    CohereAsr().prepare()
+    assert loader.load_calls[0]["model_path"] == str(tmp_path / "mlx-int8")
+    assert "revision" not in loader.load_calls[0]
+
+
+def test_cohere_subfolder_download_failure_raises(
+    fake_loader: Callable[..., FakeLoader], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A snapshot-download failure surfaces as a clean DiscoveryError, not a raw OSError.
+    import huggingface_hub
+
+    def _boom(*_a: Any, **_k: Any) -> str:
+        raise OSError("offline")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _boom)
+    fake_loader(output=FakeSTTOutput(text="hi"))
+    with pytest.raises(DiscoveryError, match="cohere-asr-mlx"):
+        CohereAsr().prepare()

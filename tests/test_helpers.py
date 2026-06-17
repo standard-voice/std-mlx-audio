@@ -139,6 +139,71 @@ def test_source_for_rejects_empty_prepared() -> None:
         Qwen3Asr06B()._source_for(empty)  # pyright: ignore[reportPrivateUsage]
 
 
+def test_source_for_wants_path_returns_path_unchanged() -> None:
+    # A wants_path family (Voxtral-Mini) is handed a file path directly.
+    from standard_asr.audio_conversion import PreparedAudio
+    from standard_asr.audio_input import InputKind
+
+    from std_mlx_audio import VoxtralMini3B
+
+    src, dur = VoxtralMini3B()._source_for(  # pyright: ignore[reportPrivateUsage]
+        PreparedAudio(kind=InputKind.ENCODED_FILE, path="/tmp/x.wav")
+    )
+    assert src == "/tmp/x.wav" and dur is None
+
+
+def test_source_for_wants_path_materializes_bytes() -> None:
+    import os
+
+    from standard_asr.audio_conversion import PreparedAudio
+    from standard_asr.audio_input import InputKind
+
+    from std_mlx_audio import VoxtralMini3B
+
+    src, dur = VoxtralMini3B()._source_for(  # pyright: ignore[reportPrivateUsage]
+        PreparedAudio(kind=InputKind.ENCODED_BYTES, data=b"RIFFfake")
+    )
+    assert isinstance(src, str) and os.path.exists(src) and dur is None
+    os.unlink(src)
+
+
+def test_source_for_wants_path_materializes_array_to_wav() -> None:
+    # An array negotiated for a wants_path family becomes a 16 kHz mono temp WAV.
+    import os
+    import wave
+
+    import numpy as np
+    from standard_asr.audio_conversion import PreparedAudio
+    from standard_asr.audio_input import InputKind
+
+    from std_mlx_audio import VoxtralMini3B
+
+    arr = np.zeros(16000, dtype=np.float32)
+    src, dur = VoxtralMini3B()._source_for(  # pyright: ignore[reportPrivateUsage]
+        PreparedAudio(kind=InputKind.ARRAY, array=arr, sample_rate=16000)
+    )
+    assert isinstance(src, str) and src.endswith(".wav")
+    with wave.open(src, "rb") as w:
+        assert w.getframerate() == 16000
+        assert w.getnchannels() == 1
+        assert w.getnframes() == 16000
+    os.unlink(src)
+    assert dur == 1.0
+
+
+def test_source_for_wants_path_rejects_empty_prepared() -> None:
+    from standard_asr.audio_conversion import PreparedAudio
+    from standard_asr.audio_input import InputKind
+    from standard_asr.exceptions import TranscriptionError
+
+    from std_mlx_audio import VoxtralMini3B
+
+    with pytest.raises(TranscriptionError, match="no array, path, or bytes"):
+        VoxtralMini3B()._source_for(  # pyright: ignore[reportPrivateUsage]
+            PreparedAudio(kind=InputKind.ARRAY)
+        )
+
+
 def test_prepared_to_pcm_requires_array() -> None:
     from standard_asr.audio_conversion import PreparedAudio
     from standard_asr.audio_input import InputKind

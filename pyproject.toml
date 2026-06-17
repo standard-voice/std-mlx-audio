@@ -43,6 +43,11 @@ dependencies = [
     "mlx-audio[stt]>=0.4.4,<0.5",
     # NumPy is the zero-copy waveform interchange type with the standard layer.
     "numpy>=1.26.4",
+    # NOTE: voxtral-mini-3b additionally needs the Mistral inference stack
+    # (transformers' VoxtralProcessor pulls in librosa + mistral_common[audio] +
+    # more) which mlx-audio does not declare and which does not converge cleanly;
+    # we deliberately do NOT add those heavyweight deps for one batch-only model.
+    # See VoxtralMini3B and VERIFICATION.md; use voxtral-realtime-4b instead.
     # The protocol this plugin implements. Pinned to the main branch until
     # standard-asr cuts its first PyPI release; swap to a version specifier
     # (>=0.1.0) at that point.

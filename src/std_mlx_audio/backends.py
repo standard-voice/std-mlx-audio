@@ -434,8 +434,23 @@ class SttFamilySpec:
         reports_detected_language: Whether ``STTOutput.language`` is a genuinely
             *detected* language to surface as ``detected_language`` (SenseVoice);
             families that merely echo the requested language set this ``False``.
-        audio_as_list: Whether ``generate`` needs the audio as ``list[mx.array]``
-            (Voxtral) rather than a bare array.
+        audio_as_list: Whether ``generate`` needs the audio wrapped in a one-element
+            ``list`` rather than a bare array.
+        wants_path: Whether ``generate`` must be handed a **file path** rather than
+            a decoded array. Voxtral-Mini's ``generate`` routes an array through a
+            transformers processor whose ``apply_transcription_request`` then needs
+            a ``format`` argument mlx-audio never passes (``len(None)`` ->
+            ``TypeError``); only its string-path branch (``load_audio_as``) avoids
+            that. The engine materializes a temp WAV from a negotiated array/bytes
+            so such a family always receives a path.
+        default_prompt: A decode prompt passed as the ``prompt`` generate kwarg
+            when the family's ``generate`` accepts one and no provider prompt is
+            set. Used to steer an audio-LLM (Qwen2-Audio) to emit a bare transcript
+            instead of conversational commentary.
+        text_from_segments: Whether the family returns its transcript only inside
+            ``STTOutput.segments`` (parsed structured/diarization JSON) while
+            ``STTOutput.text`` carries the raw JSON. When set, the result text is
+            rebuilt by joining the segments' text (VibeVoice-ASR).
         forward: ``(generate_kwarg, provider_field)`` pairs to forward from
             :class:`MlxAudioParams` when the provider value is not ``None`` (e.g.
             ``("hotwords", "hotwords")``). Only knobs the family's ``generate``
@@ -449,6 +464,9 @@ class SttFamilySpec:
     segment_timing: bool = False
     reports_detected_language: bool = False
     audio_as_list: bool = False
+    wants_path: bool = False
+    default_prompt: str | None = None
+    text_from_segments: bool = False
     forward: tuple[tuple[str, str], ...] = ()
 
 
@@ -477,6 +495,7 @@ class GenericSttBackend:
         # mutable-attribute members under pyright strict.
         self.model_types: tuple[str, ...] = spec.model_types
         self.audio_as_list: bool = spec.audio_as_list
+        self.wants_path: bool = spec.wants_path
 
     def generate_kwargs(
         self,
@@ -520,6 +539,11 @@ class GenericSttBackend:
             value = getattr(params, field, None)
             if value is not None:
                 kwargs[gen_kwarg] = value
+        # Steer an audio-LLM family toward a bare transcript. Only set when the
+        # spec declares it (the family's generate accepts `prompt`); a provider
+        # `system_prompt`, when given, takes precedence so users can override.
+        if spec.default_prompt is not None and "prompt" not in kwargs:
+            kwargs["prompt"] = params.system_prompt or spec.default_prompt
         return kwargs
 
     def to_result(
@@ -543,12 +567,25 @@ class GenericSttBackend:
         """
         del want_words
         spec = self.spec
-        text: str = (getattr(native, "text", "") or "").strip()
-        segments = (
-            _segments_from_dicts(_as_list(getattr(native, "segments", None)))
-            if spec.segment_timing
-            else None
-        )
+        raw_segments = _as_list(getattr(native, "segments", None))
+        if spec.text_from_segments:
+            # The family emits its transcript only inside structured segments
+            # (VibeVoice: ``STTOutput.text`` is the raw diarization JSON, while
+            # ``segments`` are the parsed {start,end,text} dicts). Rebuild a clean
+            # transcript by joining the segment texts; fall back to the raw text
+            # only if parsing yielded nothing.
+            joined = " ".join(
+                str(d.get("text", "")).strip()
+                for d in raw_segments
+                if str(d.get("text", "")).strip()
+            ).strip()
+            text: str = joined or (getattr(native, "text", "") or "").strip()
+        else:
+            text = (getattr(native, "text", "") or "").strip()
+        # Emitting segments is governed independently by ``segment_timing`` (only
+        # families with real per-chunk timing declare it); a text-only family that
+        # merely parses its transcript out of JSON does not gain segment spans.
+        segments = _segments_from_dicts(raw_segments) if spec.segment_timing else None
         detected = (
             from_backend_language(getattr(native, "language", None))
             if spec.reports_detected_language

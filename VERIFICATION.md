@@ -147,20 +147,20 @@ knowing before first use:
 | `glm-asr-nano` | `mlx-community/GLM-ASR-Nano-2512-4bit` | — |
 | `granite-speech-1b` | `mlx-community/granite-4.0-1b-speech-5bit` | — |
 | `granite-speech-nar-2b` | `mlx-community/granite-speech-4.1-2b-nar-mlx` | `custom_code`; bf16 (~4.5 GB) |
-| `voxtral-mini-3b` | `mlx-community/Voxtral-Mini-3B-2507-bf16` | bf16 only (~9 GB); array input only |
-| `voxtral-realtime-4b` | `mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit` | batch only (native streaming not wired) |
-| `qwen2-audio-7b` | `mlx-community/Qwen2-Audio-7B-Instruct-4bit` | 4-bit (~6.6 GB) |
-| `vibevoice-asr` | `mlx-community/VibeVoice-ASR-4bit` | 8 B model |
+| `voxtral-mini-3b` | `mlx-community/Voxtral-Mini-3B-2507-bf16` | bf16 only (~9 GB); **upstream-blocked** — transformers' VoxtralProcessor needs the Mistral stack (librosa + mistral_common[audio] + more) that does not converge; use `voxtral-realtime-4b` (see §6) |
+| `voxtral-realtime-4b` | `mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit` | batch only (native streaming not wired); runs out of the box |
+| `qwen2-audio-7b` | `mlx-community/Qwen2-Audio-7B-Instruct-4bit` | 4-bit (~6.6 GB); preset injects a strict transcription prompt (§6) |
+| `vibevoice-asr` | `mlx-community/VibeVoice-ASR-4bit` | 8 B model; preset rebuilds text from its diarization-JSON segments (§6) |
 | `fireredasr2-aed` | `mlx-community/FireRedASR2-AED-mlx` | — |
-| `canary-1b-v2` | `TechHara/canary-1b-v2-mlx-q4` | third-party org (no mlx-community port) |
+| `canary-1b-v2` | `CogniSoftOrg/canary-1b-v2-mlx-bf16` | bf16 (~3.2 GB); **switched from `TechHara/...q4`**, which ships only `tokens.json` (no SentencePiece) and fails with `Tokenizer not loaded` (§6) |
 | `moonshine-tiny` | `UsefulSensors/moonshine-tiny` | upstream PyTorch repo (no mlx-community port; sanitized at load) |
-| `cohere-asr` | `appautomaton/cohere-asr-mlx` | **weights in a `mlx-int8/` subfolder, not repo root** — a plain `load()` may not resolve it; point `model_path` at a local copy of the subfolder |
+| `cohere-asr` | `appautomaton/cohere-asr-mlx` | weights in a `mlx-int8/` subfolder — the preset now loads from it via `hf_subfolder` (§6); **but this int8 checkpoint decodes poorly** (the only public cohere MLX repo) |
 | `mms-1b-all` | `facebook/mms-1b-all` | **~29 GB** (base + ~1100 adapters); config says `wav2vec2`, so the preset pins `load_model_type="mms"` |
 
-## 5. Test suite — passes at 100 % coverage
+## 5. Test suite
 
 ```bash
-uv run pytest          # 102 tests, 100% line+branch coverage
+uv run pytest          # 113 tests, 99% (only pre-existing _streaming.py lines)
 uv run ruff check src/ tests/
 uv run ruff format --check src/ tests/
 uv run pyright src/    # strict: 0 errors
@@ -174,6 +174,30 @@ batch/streaming engine paths, the loaded-model family check, the `model_type`
 load override, config/env, the download policy, language mapping, and the
 streaming event-sequence contract (`check_event_sequence`). Real inference is the
 separate, opt-in `scripts/verify_inference.py` above.
+
+## 6. Full functional audit + fixes (2026-06-16)
+
+A download → test → delete sweep ran **every** model end to end (real weights,
+`jfk.flac`), beyond the representative subset in §3–§4b. It surfaced six models
+that had never been run before; each is now fixed or documented honestly:
+
+| model | symptom | fix |
+| --- | --- | --- |
+| `vibevoice-asr` | `text` was raw diarization JSON | `SttFamilySpec.text_from_segments` rebuilds the transcript from the parsed `STTOutput.segments` (stays text-only; segments not emitted) — ✅ clean |
+| `qwen2-audio-7b` | `text` was a chatty LLM wrapper ("The speech is in English, with the transcription being: …") | `SttFamilySpec.default_prompt` injects a strict transcription prompt; a provider `system_prompt` overrides — ✅ clean |
+| `canary-1b-v2` | `RuntimeError: Tokenizer not loaded` | `CanaryTokenizer` is SentencePiece-based; the old `TechHara/...q4` repo ships only `tokens.json`. Switched to `CogniSoftOrg/canary-1b-v2-mlx-bf16` (ships `tokenizer.model`) — ✅ clean |
+| `granite-speech-nar-2b` | `ModuleNotFoundError: soundfile`, then `ValueError: audio must be 16000 Hz` | its `_load_waveform` accepts an `mx.array` directly but refuses to resample a path; `array_only=True` feeds it a decoded 16 kHz array — ✅ clean |
+| `cohere-asr` | `FileNotFoundError: Config not found` | weights live in `mlx-int8/`; new `MlxAudioASR.hf_subfolder` snapshot-downloads + loads the subfolder. Loads + runs now, **but the only public (int8) checkpoint decodes garbage** — ⚠️ upstream checkpoint quality |
+| `voxtral-mini-3b` | `ValueError` → `TypeError` → `ImportError` → `NameError` → `ImportError` | input-shape bug fixed via `SttFamilySpec.wants_path` (engine materializes a temp WAV → path), but transformers' VoxtralProcessor then pulls in an unconverging Mistral dep stack (librosa, mistral_common[audio], …). **Left as-is; use `voxtral-realtime-4b`** — ❌ upstream-blocked |
+
+New engine mechanisms (all unit-tested): `SttFamilySpec.wants_path` /
+`.default_prompt` / `.text_from_segments`; `MlxAudioASR.hf_subfolder` +
+`_resolve_subfolder`; `_array_to_wav_tempfile`.
+
+**Net real-inference status of all 20 models:** 17 clean, 1 loads-but-poor
+(`cohere-asr`, int8 checkpoint), 1 upstream-blocked (`voxtral-mini-3b`); the 20th,
+`voxtral-realtime-4b`, runs (batch). For live mic specifically, 8 of the 9
+streaming-capable models work (all but `cohere-asr`).
 
 ## Notes / honest caveats
 

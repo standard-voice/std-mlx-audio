@@ -330,9 +330,11 @@ class MlxAudioStreamingSession(TranscriptionSession):
             # leading segments so the next decode (and memory) stays bounded under
             # long, sparsely-segmented speech.
             if self._max_window_s is not None:
-                while settled < len(segments) and (
-                    (window_len - segments[settled - 1].end) if settled else window_len
-                ) > self._max_window_s:
+                while (
+                    settled < len(segments)
+                    and ((window_len - segments[settled - 1].end) if settled else window_len)
+                    > self._max_window_s
+                ):
                     settled += 1
 
         events: list[TranscriptionEvent] = []

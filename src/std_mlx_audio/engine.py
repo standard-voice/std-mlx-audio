@@ -130,6 +130,13 @@ class MlxAudioASR(EngineBase):
     #: served by the ``mms`` family — so the preset pins the correct family rather
     #: than letting auto-detection mis-route. ``None`` (default) auto-detects.
     load_model_type: ClassVar[str | None] = None
+    #: Optional repo SUBFOLDER holding the actual checkpoint when a repo stores its
+    #: weights + config below the root rather than at it. mlx-audio's ``load``
+    #: resolves ``config.json`` at the repo root and fails (``Config not found``)
+    #: when the files live in a subfolder (e.g. Cohere-ASR ships everything under
+    #: ``mlx-int8/``). When set, the loader snapshot-downloads the repo and points
+    #: ``load`` at ``<snapshot>/<subfolder>``. ``None`` (default) loads from root.
+    hf_subfolder: ClassVar[str | None] = None
 
     provider_params_type: ClassVar[type[ProviderParams] | None] = MlxAudioParams
     config_type: ClassVar[type[BaseConfig[str]] | None] = MlxAudioConfig
@@ -221,6 +228,17 @@ class MlxAudioASR(EngineBase):
         # "wav2vec2"); the preset pins the family so the loader does not mis-route.
         if type(self).load_model_type is not None:
             load_kwargs["model_type"] = type(self).load_model_type
+        # Some repos keep the checkpoint in a subfolder (e.g. Cohere-ASR under
+        # ``mlx-int8/``); mlx-audio's ``load`` only resolves config.json at the
+        # repo root, so snapshot-download the repo and load from the subfolder.
+        # A caller-supplied local ``model_path`` is assumed to already point at the
+        # checkpoint, so the subfolder rewrite applies only to the repo default.
+        subfolder = type(self).hf_subfolder
+        if subfolder and config.model_path is None:
+            model_source = self._resolve_subfolder(model_source, subfolder, config, local_only)
+            # ``revision`` was consumed by snapshot_download; load() now gets a
+            # local path, for which passing a revision is meaningless.
+            load_kwargs.pop("revision", None)
         try:
             self._model = load(model_source, **load_kwargs)
         except Exception as exc:
@@ -230,6 +248,48 @@ class MlxAudioASR(EngineBase):
                 "model; ensure you are on Apple Silicon with Metal."
             ) from exc
         self._verify_model_family()
+
+    @staticmethod
+    def _resolve_subfolder(
+        repo: str, subfolder: str, config: MlxAudioConfig, local_only: bool
+    ) -> str:
+        """Snapshot-download ``repo`` and return its local ``<snapshot>/<subfolder>``.
+
+        mlx-audio's ``load`` resolves ``config.json`` at the path root, so a repo
+        whose checkpoint lives in a subfolder must be pointed at the subfolder
+        directly. We materialize the full snapshot (so the tokenizer/processor
+        files alongside the weights come down too) and return the subfolder path.
+
+        Args:
+            repo: The Hugging Face repo id.
+            subfolder: The subfolder holding ``config.json`` + weights.
+            config: The engine config (supplies the optional ``revision``).
+            local_only: Whether downloads are disabled (cache-only resolution).
+
+        Returns:
+            The local filesystem path to the checkpoint subfolder.
+
+        Raises:
+            DiscoveryError: If the snapshot cannot be resolved.
+        """
+        import os
+
+        # snapshot_download's huggingface_hub overloads carry Unknown generics
+        # (user_agent/tqdm_class), so pyright strict flags the imported symbol as
+        # partially unknown; the return is a str (dry_run defaults False), annotated below.
+        from huggingface_hub import snapshot_download  # pyright: ignore[reportUnknownVariableType]
+
+        try:
+            local_root: str = snapshot_download(
+                repo, revision=config.revision, local_files_only=local_only
+            )
+        except Exception as exc:
+            raise DiscoveryError(
+                f"Failed to resolve MLX model {repo!r} (subfolder {subfolder!r}). "
+                "If downloads are disabled, set STANDARD_ASR_ALLOW_DOWNLOAD=1 or "
+                "pre-download the model; ensure you are on Apple Silicon with Metal."
+            ) from exc
+        return os.path.join(local_root, subfolder)
 
     def _verify_model_family(self) -> None:
         """Assert the loaded model's family matches this preset's backend (spec IC.7).
@@ -345,6 +405,18 @@ class MlxAudioASR(EngineBase):
             for the array path (from the sample count); for path/bytes the
             backend leaves duration ``None`` (mlx-audio does not return it).
         """
+        # A few families' generate only works via their file-path branch (their
+        # array path is broken upstream — e.g. Voxtral-Mini); hand them a path,
+        # materializing a temp WAV from a negotiated array when needed.
+        if getattr(type(self).backend, "wants_path", False):
+            if prepared.path is not None:
+                return prepared.path, None
+            if prepared.data is not None:
+                return self._bytes_to_tempfile(prepared.data), None
+            if prepared.array is not None:
+                arr_p: NDArray[np.float32] = np.ascontiguousarray(prepared.array, dtype=np.float32)
+                return self._array_to_wav_tempfile(arr_p), waveform_duration(arr_p)
+            raise TranscriptionError("Negotiated audio carried no array, path, or bytes payload.")
         if prepared.array is not None:
             # We declare accepted_sample_rates=[16000]; the standard layer
             # negotiates to it. Assert defensively — an off-rate array silently
@@ -361,6 +433,37 @@ class MlxAudioASR(EngineBase):
             return self._bytes_to_tempfile(prepared.data), None
         # Defensive: negotiation always delivers one of our accepted shapes.
         raise TranscriptionError("Negotiated audio carried no array, path, or bytes payload.")
+
+    @staticmethod
+    def _array_to_wav_tempfile(audio: NDArray[np.float32]) -> str:
+        """Write a 16 kHz mono float32 waveform to a temp WAV and return its path.
+
+        For ``wants_path`` families whose ``generate`` only accepts a file path;
+        the array is already at the negotiated 16 kHz (accepted_sample_rates).
+
+        Args:
+            audio: A contiguous float32 mono waveform at :data:`_SAMPLE_RATE`.
+
+        Returns:
+            The temp ``.wav`` path (left on disk for the loader; the OS temp dir
+            is reclaimed by the platform — we do not hold a handle).
+        """
+        import tempfile
+        import wave
+
+        # numpy's stubs leave the dtype of arithmetic results partially unknown
+        # under pyright strict, so do the int16 PCM math through an Any buffer and
+        # assert the final wire type as bytes for the wave writer.
+        buf: Any = audio
+        pcm16: Any = (buf.clip(-1.0, 1.0) * 32767.0).round().astype(np.int16)
+        frames: bytes = pcm16.tobytes()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+            with wave.open(handle, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(_SAMPLE_RATE)
+                wav.writeframes(frames)
+            return handle.name
 
     @staticmethod
     def _bytes_to_tempfile(data: bytes) -> str:
@@ -666,6 +769,9 @@ class CohereAsr(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "appautomaton/cohere-asr-mlx"
+    # The repo stores its checkpoint (config.json, weights, tokenizer) under the
+    # ``mlx-int8/`` subfolder, not the repo root, so point the loader there.
+    hf_subfolder: ClassVar[str | None] = "mlx-int8"
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(
             model_types=("cohere_asr",),
@@ -717,9 +823,23 @@ class FunAsrNano(MlxAudioASR):
 class VoxtralMini3B(MlxAudioASR):
     """``mlx-audio/voxtral-mini-3b`` — Mistral Voxtral-Mini 3B (multilingual).
 
-    Voxtral's ``generate`` requires a decoded ``list[mx.array]``, so this preset
-    accepts an array only (the standard layer decodes a file/bytes first) and the
-    engine wraps it in a list (``audio_as_list``).
+    Voxtral's ``generate`` only works via its file-path branch: handed a decoded
+    array it routes through a transformers processor whose
+    ``apply_transcription_request`` needs a ``format`` argument mlx-audio never
+    passes (``len(None)`` -> ``TypeError``). So this preset declares ``wants_path``
+    and the engine hands it a path (materializing a temp WAV from a negotiated
+    array/bytes when needed).
+
+    KNOWN LIMITATION (upstream): even on the path branch, transformers'
+    ``VoxtralProcessor.apply_transcription_request`` pulls in the full Mistral
+    inference stack — ``librosa`` (``load_audio_as``), then ``mistral_common``
+    (``TranscriptionRequest``), then ``mistral_common[audio]``, and further missing
+    pieces — which mlx-audio does not declare and which does not converge cleanly.
+    We deliberately do NOT add those heavyweight deps for one batch-only model, so
+    this preset currently raises a dependency ``ImportError`` at transcription on a
+    base install. **Use ``voxtral-realtime-4b`` for Voxtral on this stack** (it runs
+    out of the box). ``wants_path`` is kept as the correct input shape so that, if
+    the Mistral stack is installed, the path branch is the one that can work.
     """
 
     hf_repo: ClassVar[str] = "mlx-community/Voxtral-Mini-3B-2507-bf16"
@@ -727,18 +847,16 @@ class VoxtralMini3B(MlxAudioASR):
         SttFamilySpec(
             model_types=("voxtral",),
             language_kwarg="language",
-            audio_as_list=True,
+            wants_path=True,
         )
     )
     properties: ClassVar[BaseProperties] = stt_properties(
         model_name="voxtral-mini-3b",
         description=(
-            "Mistral Voxtral-Mini 3B (MLX, bf16); multilingual ASR. Large "
-            "(~9 GB); decoded-array input only; batch only."
+            "Mistral Voxtral-Mini 3B (MLX, bf16); multilingual ASR. Large (~9 GB); batch only."
         ),
         selectable=VOXTRAL_LANGUAGES,
         detectable=[],
-        array_only=True,
     )
     declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=True, streaming=False
@@ -752,9 +870,18 @@ class Canary1BV2(MlxAudioASR):
     Set the ``target_language`` provider param to translate the transcript into a
     different language (Canary's source/target axes); otherwise it transcribes in
     the selected source language.
+
+    Repo note: points at the ``CogniSoftOrg`` bf16 conversion, NOT the smaller
+    ``TechHara`` q4/q8 repos. mlx-audio's Canary backend needs a SentencePiece
+    tokenizer (a ``tokenizer.model`` file, an embedded base64 in config.json, or a
+    ``tokens.txt`` paired with one) to ``decode()``; the TechHara repos ship only a
+    ``tokens.json`` vocab list (no SentencePiece source), so loading them yields a
+    tokenizer-less model that raises ``RuntimeError: Tokenizer not loaded`` at
+    generate(). The CogniSoftOrg repo ships ``tokenizer.model`` and declares
+    ``model_type=canary``, so it loads and decodes correctly.
     """
 
-    hf_repo: ClassVar[str] = "TechHara/canary-1b-v2-mlx-q4"
+    hf_repo: ClassVar[str] = "CogniSoftOrg/canary-1b-v2-mlx-bf16"
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(
             model_types=("canary",),
@@ -765,8 +892,8 @@ class Canary1BV2(MlxAudioASR):
     properties: ClassVar[BaseProperties] = stt_properties(
         model_name="canary-1b-v2",
         description=(
-            "NVIDIA Canary 1B v2 (MLX, q4); 25-language European ASR with "
-            "speech translation (set target_language). Batch only."
+            "NVIDIA Canary 1B v2 (MLX, bf16); 25-language European ASR with "
+            "speech translation (set target_language). ~3.2 GB. Batch only."
         ),
         selectable=CANARY_LANGUAGES,
         detectable=[],
@@ -781,7 +908,19 @@ class Qwen2Audio7B(MlxAudioASR):
     """``mlx-audio/qwen2-audio-7b`` — Qwen2-Audio 7B Instruct (audio-LLM ASR)."""
 
     hf_repo: ClassVar[str] = "mlx-community/Qwen2-Audio-7B-Instruct-4bit"
-    backend: ClassVar[ModelBackend] = GenericSttBackend(SttFamilySpec(model_types=("qwen2_audio",)))
+    backend: ClassVar[ModelBackend] = GenericSttBackend(
+        SttFamilySpec(
+            model_types=("qwen2_audio",),
+            # Qwen2-Audio is an instruction audio-LLM; its default prompt
+            # ("Please transcribe the speech.") yields conversational output like
+            # "The speech is in English, with the transcription being: '…'". A
+            # strict prompt steers it to emit the bare transcript.
+            default_prompt=(
+                "Transcribe the spoken audio into text verbatim. "
+                "Output only the transcript, with no preamble, labels, or quotation marks."
+            ),
+        )
+    )
     properties: ClassVar[BaseProperties] = stt_properties(
         model_name="qwen2-audio-7b",
         description="Qwen2-Audio 7B Instruct (MLX, 4-bit); audio-LLM transcription. Batch only.",
@@ -838,7 +977,14 @@ class GraniteSpeech1B(MlxAudioASR):
 
 
 class GraniteSpeechNar2B(MlxAudioASR):
-    """``mlx-audio/granite-speech-nar-2b`` — IBM Granite Speech NAR (fast, non-AR)."""
+    """``mlx-audio/granite-speech-nar-2b`` — IBM Granite Speech NAR (fast, non-AR).
+
+    Its ``generate`` -> ``_load_waveform`` accepts an ``mx.array`` directly (assumed
+    16 kHz) but, given a file path, reads it with ``soundfile`` and REFUSES to
+    resample (``ValueError: audio must be 16000 Hz``). So this preset takes a
+    decoded array only (``array_only``): the standard layer resamples to 16 kHz and
+    the engine passes the array straight through — no path, no soundfile.
+    """
 
     hf_repo: ClassVar[str] = "mlx-community/granite-speech-4.1-2b-nar-mlx"
     backend: ClassVar[ModelBackend] = GenericSttBackend(
@@ -851,6 +997,7 @@ class GraniteSpeechNar2B(MlxAudioASR):
         ),
         selectable=[],
         detectable=[],
+        array_only=True,
     )
     declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
@@ -862,7 +1009,16 @@ class VibeVoiceAsr(MlxAudioASR):
 
     hf_repo: ClassVar[str] = "mlx-community/VibeVoice-ASR-4bit"
     backend: ClassVar[ModelBackend] = GenericSttBackend(
-        SttFamilySpec(model_types=("vibevoice_asr",), forward=(("context", "context"),))
+        SttFamilySpec(
+            model_types=("vibevoice_asr",),
+            # VibeVoice returns a diarization JSON: STTOutput.text is the raw JSON
+            # string while STTOutput.segments are the parsed {start,end,text} dicts.
+            # Rebuild the transcript from the parsed segments rather than surfacing
+            # raw JSON. We do NOT declare segment timing (the model stays honestly
+            # text-only/batch-only), so segments are used for text only, not emitted.
+            text_from_segments=True,
+            forward=(("context", "context"),),
+        )
     )
     properties: ClassVar[BaseProperties] = stt_properties(
         model_name="vibevoice-asr",
