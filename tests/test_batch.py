@@ -221,6 +221,21 @@ def test_generate_failure_wrapped_as_transcription_error(
     assert isinstance(exc.value.__cause__, ValueError)  # native exception preserved
 
 
+def test_priming_failure_downgrades_to_warning(
+    fake_loader: Callable[..., FakeLoader], caplog: pytest.LogCaptureFixture
+) -> None:
+    # A family that rejects the 0.1 s priming silence must still load and
+    # transcribe real audio; the engine downgrades the priming failure to a
+    # warning instead of failing the load.
+    loader = fake_loader(output=FakeSTTOutput(text="hi", language=["English"]))
+    loader.model.raise_on_prime = RuntimeError("prime rejected")
+    with caplog.at_level("WARNING", logger="std_mlx_audio.engine"):
+        result = Qwen3Asr06B().transcribe(_array_input(), RuntimeParams(language="en"))
+    assert result.text == "hi"
+    assert loader.model.priming_call is not None
+    assert any("Priming generate failed" in r.message for r in caplog.records)
+
+
 def test_provider_params_accepted(fake_loader: Callable[..., FakeLoader]) -> None:
     loader = fake_loader(output=FakeSTTOutput(text="hi", language=["English"]))
     params = RuntimeParams(

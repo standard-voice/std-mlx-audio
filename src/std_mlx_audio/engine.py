@@ -248,6 +248,54 @@ class MlxAudioASR(EngineBase):
                 "model; ensure you are on Apple Silicon with Metal."
             ) from exc
         self._verify_model_family()
+        self._prime_generation_thread()
+
+    def _prime_generation_thread(self) -> None:
+        """Run one tiny generate on the loading thread (MLX thread affinity).
+
+        mlx-audio's generate path materializes its Metal stream state lazily,
+        the first time ``model.generate`` runs. If that first run happens on a
+        different thread than the load, MLX aborts the whole process with an
+        uncaught C++ ``std::runtime_error`` ("There is no Stream(gpu, N) in
+        current thread") — exactly the shape of a host app that warms the
+        engine on its main thread (``ensure_loaded`` / the ``model`` property)
+        and then streams from a session pump thread. Priming with 0.1 s of
+        silence ON THIS THREAD pins the stream state here; afterwards,
+        generates from any thread are stable (both orders verified
+        empirically; present on at least mlx 0.31–0.32 / mlx-audio 0.4.4–0.4.5,
+        so this is not version-gated). It also pre-compiles the Metal kernels,
+        making the load a real warmup.
+
+        A priming failure downgrades to a log warning: a family that rejects
+        near-empty audio but works on real input must still load; the warning
+        preserves the trace for the (rare) cross-thread crash window that
+        remains.
+        """
+        backend = type(self).backend
+        config = cast(MlxAudioConfig, self.config)
+        gen_kwargs = backend.generate_kwargs(
+            resolved_language=None,
+            want_words=False,
+            params=MlxAudioParams(),
+            config=config,
+        )
+        silence: NDArray[np.float32] = np.zeros(_SAMPLE_RATE // 10, dtype=np.float32)
+        source: Any
+        if getattr(backend, "wants_path", False):
+            source = self._array_to_wav_tempfile(silence)
+        else:
+            source = backends.to_mlx_array(silence)
+        model = cast(Any, self._model)
+        try:
+            model.generate(backends.adapt_audio_source(backend, source), **gen_kwargs)
+        except Exception:
+            _LOGGER.warning(
+                "Priming generate failed for %s; the first real generate should "
+                "run on the thread that loaded the model, or MLX may abort the "
+                "process (stream thread affinity).",
+                type(self).__name__,
+                exc_info=True,
+            )
 
     @staticmethod
     def _resolve_subfolder(

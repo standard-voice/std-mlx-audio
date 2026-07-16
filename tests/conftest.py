@@ -83,9 +83,22 @@ class FakeMlxModel:
         self.output = output
         self.output_fn = output_fn
         self.generate_calls: list[dict[str, Any]] = []
+        self.priming_call: dict[str, Any] | None = None
         self.raise_on_generate: BaseException | None = None
+        self.raise_on_prime: BaseException | None = None
 
     def generate(self, audio: Any, **kwargs: Any) -> Any:
+        # The engine primes the generation thread with one silence generate
+        # right after load (MlxAudioASR._prime_generation_thread, MLX stream
+        # thread affinity), so the FIRST call on a freshly loaded model is
+        # always the prime. Keep it out of generate_calls — tests assert on
+        # real transcribe/streaming calls — and keep it fully inert (no
+        # output_fn, no raise): the engine discards its result either way.
+        if self.priming_call is None:
+            self.priming_call = {"audio": audio, **kwargs}
+            if self.raise_on_prime is not None:
+                raise self.raise_on_prime
+            return self.output
         self.generate_calls.append({"audio": audio, **kwargs})
         if self.raise_on_generate is not None:
             raise self.raise_on_generate
