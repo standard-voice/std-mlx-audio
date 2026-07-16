@@ -56,13 +56,13 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 from numpy.typing import NDArray
 from standard_asr import RuntimeParams, TranscriptionEvent, TranscriptionSession
-from standard_asr.language import effective_language
+from standard_asr.contract.language import effective_language
 
 from . import backends
 from ._config import MlxAudioConfig, MlxAudioParams
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from standard_asr.results import Segment
+    from standard_asr.contract.results import Segment
 
     from .engine import MlxAudioASR
 
@@ -408,7 +408,7 @@ class MlxAudioStreamingSession(TranscriptionSession):
         zero origin), so the non-sliding path stays allocation-free and identical.
 
         Args:
-            words: The window-relative :class:`~standard_asr.results.Word` list, or
+            words: The window-relative :class:`~standard_asr.contract.results.Word` list, or
                 ``None``.
             offset: Seconds to add (the sliding-window origin).
 

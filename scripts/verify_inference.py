@@ -28,8 +28,8 @@ from pathlib import Path
 
 import numpy as np
 from standard_asr import RuntimeParams, discover_models
-from standard_asr.audio_format import AudioFormat
-from standard_asr.utils.audio_loader import load_audio
+from standard_asr.audio.format import AudioFormat
+from standard_asr.audio.loader import load_audio
 
 _RATE = 16000
 

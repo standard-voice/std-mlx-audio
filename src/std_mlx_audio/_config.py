@@ -31,7 +31,7 @@ from standard_asr.engine import (
     LanguageConfigMixin,
     secret_field,
 )
-from standard_asr.runtime_params import ProviderParams
+from standard_asr.contract.params import ProviderParams
 
 #: MLX compute dtypes we let the loader request. ``"auto"`` keeps the dtype
 #: baked into the (often pre-quantized) checkpoint — the right default, since the

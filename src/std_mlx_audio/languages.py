@@ -26,7 +26,7 @@ Runtime §6).
 
 from __future__ import annotations
 
-from standard_asr.language import normalize_bcp47
+from standard_asr.contract.language import normalize_bcp47
 
 #: BCP-47 primary subtag -> (Whisper ISO code, Qwen3-ASR English name).
 #:

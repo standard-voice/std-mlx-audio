@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 
 import pytest
-from standard_asr.runtime_params import WordTimestampGranularity
+from standard_asr.contract.params import WordTimestampGranularity
 
 from std_mlx_audio import MlxAudioConfig, MlxAudioParams
 from std_mlx_audio.backends import (  # pyright: ignore[reportPrivateUsage]

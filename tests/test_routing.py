@@ -19,8 +19,8 @@ from typing import Any
 import numpy as np
 import pytest
 from standard_asr import RuntimeParams
-from standard_asr.audio_input import AudioArray
-from standard_asr.exceptions import DiscoveryError
+from standard_asr.audio.input import AudioArray
+from standard_asr.contract.exceptions import DiscoveryError
 
 from std_mlx_audio import (
     Canary1BV2,

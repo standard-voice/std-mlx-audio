@@ -108,7 +108,7 @@ words = parakeet.transcribe("meeting.m4a", RuntimeParams(word_timestamps="word")
 ```python
 import asyncio
 from standard_asr import RuntimeParams, discover_models
-from standard_asr.audio_format import AudioFormat
+from standard_asr.audio.format import AudioFormat
 
 async def main() -> None:
     engine = discover_models().create("mlx-audio/qwen3-asr-0.6b")

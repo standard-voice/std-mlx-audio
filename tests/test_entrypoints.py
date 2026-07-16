@@ -12,7 +12,7 @@ application (and CI) sees it — they exercise the *installed* entry points via
 from __future__ import annotations
 
 from standard_asr import discover_models
-from standard_asr.audio_format import AudioFormat
+from standard_asr.audio.format import AudioFormat
 from standard_asr.compliance import (
     check_entrypoints,
     check_streaming_param_gating,

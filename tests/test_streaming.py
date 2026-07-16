@@ -16,8 +16,8 @@ from collections.abc import Callable
 from typing import Any
 
 from standard_asr import TranscriptionEvent
-from standard_asr.audio_format import AudioFormat
-from standard_asr.capabilities import FinalityCap, ReconnectCap, StreamTimestampsCap
+from standard_asr.audio.format import AudioFormat
+from standard_asr.contract.capabilities import FinalityCap, ReconnectCap, StreamTimestampsCap
 from standard_asr.compliance import check_event_sequence
 
 from std_mlx_audio import ParakeetTdt06BV3, Qwen3Asr06B, WhisperTiny
@@ -206,7 +206,7 @@ async def test_streaming_whole_input_path(fake_loader: Callable[..., FakeLoader]
     # OpenAI-style: submit a whole waveform, stream the result.
     import numpy as np
     from standard_asr import RuntimeParams
-    from standard_asr.audio_input import AudioArray
+    from standard_asr.audio.input import AudioArray
 
     fake_loader(
         output=FakeSTTOutput(

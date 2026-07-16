@@ -18,9 +18,9 @@ from typing import Any
 import numpy as np
 import pytest
 from standard_asr import RuntimeParams
-from standard_asr.audio_input import AudioArray
-from standard_asr.exceptions import DiscoveryError, InvalidProviderParamError, TranscriptionError
-from standard_asr.runtime_params import ProviderParams
+from standard_asr.audio.input import AudioArray
+from standard_asr.contract.exceptions import DiscoveryError, InvalidProviderParamError, TranscriptionError
+from standard_asr.contract.params import ProviderParams
 
 from std_mlx_audio import (
     MlxAudioConfig,

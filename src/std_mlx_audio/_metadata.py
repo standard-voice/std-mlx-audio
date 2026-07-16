@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from standard_asr.capabilities import (
+from standard_asr.contract.capabilities import (
     BatchCapabilities,
     DeclaredCapabilities,
     FinalityCap,

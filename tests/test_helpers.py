@@ -128,9 +128,9 @@ def test_revision_forwarded_to_loader(fake_loader: Callable[..., FakeLoader]) ->
 def test_source_for_rejects_empty_prepared() -> None:
     # Defensive guard: negotiation never delivers an empty shape, but the engine
     # raises a portable error rather than silently mis-transcribing if it does.
-    from standard_asr.audio_conversion import PreparedAudio
-    from standard_asr.audio_input import InputKind
-    from standard_asr.exceptions import TranscriptionError
+    from standard_asr.audio.conversion import PreparedAudio
+    from standard_asr.audio.input import InputKind
+    from standard_asr.contract.exceptions import TranscriptionError
 
     from std_mlx_audio import Qwen3Asr06B
 
@@ -141,8 +141,8 @@ def test_source_for_rejects_empty_prepared() -> None:
 
 def test_source_for_wants_path_returns_path_unchanged() -> None:
     # A wants_path family (Voxtral-Mini) is handed a file path directly.
-    from standard_asr.audio_conversion import PreparedAudio
-    from standard_asr.audio_input import InputKind
+    from standard_asr.audio.conversion import PreparedAudio
+    from standard_asr.audio.input import InputKind
 
     from std_mlx_audio import VoxtralMini3B
 
@@ -155,8 +155,8 @@ def test_source_for_wants_path_returns_path_unchanged() -> None:
 def test_source_for_wants_path_materializes_bytes() -> None:
     import os
 
-    from standard_asr.audio_conversion import PreparedAudio
-    from standard_asr.audio_input import InputKind
+    from standard_asr.audio.conversion import PreparedAudio
+    from standard_asr.audio.input import InputKind
 
     from std_mlx_audio import VoxtralMini3B
 
@@ -173,8 +173,8 @@ def test_source_for_wants_path_materializes_array_to_wav() -> None:
     import wave
 
     import numpy as np
-    from standard_asr.audio_conversion import PreparedAudio
-    from standard_asr.audio_input import InputKind
+    from standard_asr.audio.conversion import PreparedAudio
+    from standard_asr.audio.input import InputKind
 
     from std_mlx_audio import VoxtralMini3B
 
@@ -192,9 +192,9 @@ def test_source_for_wants_path_materializes_array_to_wav() -> None:
 
 
 def test_source_for_wants_path_rejects_empty_prepared() -> None:
-    from standard_asr.audio_conversion import PreparedAudio
-    from standard_asr.audio_input import InputKind
-    from standard_asr.exceptions import TranscriptionError
+    from standard_asr.audio.conversion import PreparedAudio
+    from standard_asr.audio.input import InputKind
+    from standard_asr.contract.exceptions import TranscriptionError
 
     from std_mlx_audio import VoxtralMini3B
 
@@ -205,9 +205,9 @@ def test_source_for_wants_path_rejects_empty_prepared() -> None:
 
 
 def test_prepared_to_pcm_requires_array() -> None:
-    from standard_asr.audio_conversion import PreparedAudio
-    from standard_asr.audio_input import InputKind
-    from standard_asr.exceptions import TranscriptionError
+    from standard_asr.audio.conversion import PreparedAudio
+    from standard_asr.audio.input import InputKind
+    from standard_asr.contract.exceptions import TranscriptionError
 
     from std_mlx_audio.engine import _prepared_to_pcm  # pyright: ignore[reportPrivateUsage]
 
@@ -239,7 +239,7 @@ def test_bytes_input_written_to_tempfile(fake_loader: Callable[..., FakeLoader])
     from pathlib import Path
 
     from standard_asr import RuntimeParams
-    from standard_asr.audio_input import AudioBytes
+    from standard_asr.audio.input import AudioBytes
 
     from std_mlx_audio import Qwen3Asr06B
 
