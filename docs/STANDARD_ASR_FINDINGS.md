@@ -160,6 +160,38 @@ clamping is in one small helper.
 
 ---
 
+## 8. [High] Several family loaders degrade SILENTLY when non-weight assets are missing [not std-asr]
+
+The `post_load_hook` of several families loads its tokenizer or
+normalization assets with `if path.exists()` (or `try/except: pass`) and the
+decode path then falls back without any signal: SenseVoice and MMS emit the
+numeric token ids as the transcript, FireRedASR2 returns an empty string,
+Moonshine joins per-id characters. A partial snapshot (config + weights,
+assets missing) therefore transcribes silently wrong. Verified per family in
+the installed mlx-audio; the plugin closes it by declaring each verified
+family's non-weight closure in `required_snapshot_files` (status reports
+`incomplete`, and the implicit-load recheck refuses the fragment). The
+remaining audited families raise at load (Qwen3, GLM, Granite x2, Voxtral
+x2, Fun-ASR, Qwen2-Audio, Cohere) or at the first generate (Canary), and
+Parakeet / Nemotron embed their vocabularies in `config.json`.
+
+---
+
+## 9. [Med] `DEFAULT_ALLOW_PATTERNS` omits SenseVoice's `am.mvn`; VibeVoice silently Hub-fetches its tokenizer [not std-asr]
+
+Two acquisition gaps in upstream defaults. First, SenseVoice's feature
+normalization stats live in `am.mvn`, its config carries no fallback, and no
+default allow pattern matches `.mvn` -- every default-pattern snapshot loads
+with normalization silently skipped. The plugin extends its snapshot filter
+with `*.mvn`. Second, the VibeVoice-ASR checkpoint ships no tokenizer files
+at all, and the upstream hook silently falls back to downloading the
+`Qwen/Qwen2.5-7B` tokenizer from the Hub on every cold load -- a network
+fetch that happens inside transformers, past the engine's
+`local_files_only`. Offline use requires a warm transformers cache; the
+preset docstring carries the caveat.
+
+---
+
 ## What worked well (credit where due)
 
 - **`EngineBase` template method** — implementing only `_transcribe` /

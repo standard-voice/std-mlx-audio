@@ -49,6 +49,11 @@ LOCAL_ARTIFACT_ID = "mlx-local-path"
 #: A full commit hash pins the snapshot; anything else is a mutable reference.
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 
+#: A sharded safetensors file names its own closure
+#: (``model-00002-of-00005.safetensors``): every sibling the name implies
+#: must be present before the fragment counts as weights.
+_SHARD_NAME = re.compile(r"^(?P<prefix>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.safetensors$")
+
 
 def _is_local_entry_not_found(exc: BaseException) -> bool:
     """Return whether a resolution failure is the documented cache miss.
@@ -68,24 +73,37 @@ def _is_local_entry_not_found(exc: BaseException) -> bool:
     return isinstance(exc, LocalEntryNotFoundError)
 
 
-def _looks_like_checkpoint(root: Path, required_files: tuple[str, ...] = ()) -> bool:
+def checkpoint_complete(root: Path, required_files: tuple[str, ...] = ()) -> bool:
     """Return whether a directory is a provably complete MLX checkpoint.
 
     Resolution success only proves the snapshot directory exists; upstream
     documents that it cannot verify the files inside, so completeness is this
-    plugin's own check. A sharded checkpoint is complete only when EVERY file
-    in its safetensors index is present: the upstream loader globs whatever
-    shards exist and loads them with ``strict=False``, so a missing shard
-    would silently leave parameters at random init -- fluent garbage, the
-    cardinal sin.
+    plugin's own check. A sharded checkpoint is complete only when EVERY
+    shard is present -- named by the safetensors index when it exists, or by
+    the shards' own ``-NNNNN-of-NNNNN`` names when the index has not arrived
+    yet: the upstream loader globs whatever shards exist and loads them with
+    ``strict=False``, so a missing shard would silently leave parameters at
+    random init -- fluent garbage, the cardinal sin.
+
+    The weights closure is checked structurally; non-weight inference files
+    (tokenizers, normalization stats) vary per model family, so they enter
+    through ``required_files`` as each family's loader-code fact is verified
+    -- a guessed universal list would report a complete download of another
+    family as forever incomplete. Families whose loaders swallow a missing
+    asset and degrade SILENTLY (SenseVoice, MMS, FireRed, Moonshine emit
+    numeric ids, empty text, or character soup) or fail only at the first
+    request (Whisper, Canary) declare their closures on the presets; the
+    remaining audited families raise at load, where the engine translates
+    the failure loudly.
 
     Args:
         root: Candidate checkpoint directory.
-        required_files: Extra preset-declared files that must exist (for
-            example the MMS base weights beside its per-language adapters).
+        required_files: Preset-declared files that must exist (for example
+            the MMS base weights beside its per-language adapters, or the
+            Whisper processor files).
 
     Returns:
-        ``True`` when the config, the index closure, and every required file
+        ``True`` when the config, the shard closure, and every required file
         are present.
     """
     if not (root / "config.json").is_file():
@@ -104,6 +122,20 @@ def _looks_like_checkpoint(root: Path, required_files: tuple[str, ...] = ()) -> 
             # An unreadable index cannot prove completeness.
             return False
         return bool(shards) and all((root / shard).is_file() for shard in shards)
+    # No index (yet): an interrupted download can hold shard files while the
+    # index is still absent, so honor the closure each shard name declares.
+    matches = [
+        match
+        for match in (_SHARD_NAME.fullmatch(entry.name) for entry in root.glob("*.safetensors"))
+        if match is not None
+    ]
+    groups = {(match["prefix"], int(match["total"])) for match in matches}
+    for prefix, total in groups:
+        for ordinal in range(1, total + 1):
+            if not (root / f"{prefix}-{ordinal:05d}-of-{total:05d}.safetensors").is_file():
+                return False
+    if groups:
+        return True
     # Upstream load_weights consumes safetensors and npz only.
     return any(root.glob("*.safetensors")) or any(root.glob("*.npz"))
 
@@ -152,16 +184,23 @@ def _tree_size_bytes(root: Path) -> int | None:
 
 
 def _allow_patterns() -> list[str]:
-    """Return the upstream loader's snapshot filter, imported so it never drifts.
+    """Return the snapshot filter: the upstream defaults plus known gaps.
+
+    The base list is imported so it never drifts. ``*.mvn`` is the one known
+    gap (round-8 review): SenseVoice's ``am.mvn`` carries its feature
+    normalization stats and its config has no fallback, yet the upstream
+    defaults never fetch the file -- every default-pattern snapshot loads
+    with normalization silently skipped. The extra pattern matches nothing
+    in the other preset repos.
 
     Returns:
-        The mlx-audio ``DEFAULT_ALLOW_PATTERNS`` list.
+        The mlx-audio ``DEFAULT_ALLOW_PATTERNS`` list plus ``*.mvn``.
     """
     from mlx_audio.utils import (  # pyright: ignore[reportMissingImports]
         DEFAULT_ALLOW_PATTERNS,
     )
 
-    return DEFAULT_ALLOW_PATTERNS
+    return [*DEFAULT_ALLOW_PATTERNS, "*.mvn"]
 
 
 def snapshot(config: MlxAudioConfig, hf_repo: str, *, local_files_only: bool) -> Path:
@@ -199,11 +238,20 @@ def snapshot(config: MlxAudioConfig, hf_repo: str, *, local_files_only: bool) ->
     return Path(resolved).expanduser().resolve()
 
 
-def _local_path_requirement(config: MlxAudioConfig) -> ArtifactRequirement:
+def _local_path_requirement(
+    config: MlxAudioConfig,
+    required_files: tuple[str, ...] = (),
+) -> ArtifactRequirement:
     """Build the externally provided requirement for a ``model_path`` config.
+
+    The preset's ``required_files`` apply here too: a ``model_path`` still
+    loads through the preset's model family, so a directory lacking the
+    family's declared weights (the MMS base checkpoint beside its adapters)
+    would reach the ``strict=False`` loader as a fragment.
 
     Args:
         config: Resolved engine configuration with ``model_path`` set.
+        required_files: Preset-declared files that must exist for readiness.
 
     Returns:
         The single logical requirement for the operator-provided directory.
@@ -222,7 +270,7 @@ def _local_path_requirement(config: MlxAudioConfig) -> ArtifactRequirement:
             f"The configured model_path {path} is a file; point it at the "
             "MLX checkpoint DIRECTORY containing config.json and its weights."
         )
-    elif _looks_like_checkpoint(path):
+    elif checkpoint_complete(path, required_files):
         state = ARTIFACT_READY
         message = None
     else:
@@ -286,7 +334,7 @@ def _hub_requirement(
         # An interrupted download is repairable: a later online resolution
         # fetches only the files that are absent.
         location = resolved / subfolder if subfolder is not None else resolved
-        if location.is_dir() and _looks_like_checkpoint(location, required_files):
+        if location.is_dir() and checkpoint_complete(location, required_files):
             state = ARTIFACT_READY
         else:
             state = ARTIFACT_INCOMPLETE
@@ -354,7 +402,7 @@ def status_requirement(
         The requirement for either the operator path or the Hub preset.
     """
     if config.model_path is not None:
-        return _local_path_requirement(config)
+        return _local_path_requirement(config, required_files)
     return _hub_requirement(config, hf_repo, subfolder, required_files)
 
 
@@ -421,29 +469,73 @@ def raise_for_gated_source(
         ) from exc
 
 
+def _remote_commit(config: MlxAudioConfig, hf_repo: str) -> str:
+    """Re-resolve the preset's revision against the source and return it.
+
+    The positive evidence spec AR.4 requires for a refresh: the native
+    downloader silently falls back to the local cache when the remote is
+    unreachable, so download success can never prove that the mutable
+    reference was re-resolved -- this metadata query can.
+
+    Args:
+        config: Resolved engine configuration.
+        hf_repo: The preset's Hugging Face repo id.
+
+    Returns:
+        The commit hash the source currently resolves the revision to.
+
+    Raises:
+        ArtifactAcquisitionError: If the source answered without naming a
+            commit.
+        Exception: Whatever the metadata query raises when the source is
+            unreachable or rejects the request.
+    """
+    import huggingface_hub  # pyright: ignore[reportMissingModuleSource]
+
+    token = config.hf_token.get_secret_value() if config.hf_token is not None else None
+    info = huggingface_hub.HfApi(token=token).model_info(hf_repo, revision=config.revision)
+    sha = info.sha
+    if sha is None:
+        raise ArtifactAcquisitionError(
+            f"The source metadata for {hf_repo} did not name a commit, so "
+            "the refresh cannot be verified.",
+            reason="failed",
+        )
+    return sha
+
+
 def acquire(
     config: MlxAudioConfig,
     hf_repo: str,
     progress: ArtifactProgressCallback | None,
+    *,
+    refresh: bool = False,
 ) -> None:
     """Materialize the preset's filtered snapshot without loading a model.
 
-    ``snapshot_download`` re-resolves a mutable revision on every online call,
-    so one code path serves both plain acquisition and an explicit refresh.
-    ``model.generate`` is never called here.
+    An incomplete snapshot is completed by the same online call (upstream
+    fetches only the files that are absent). A refresh cannot trust that
+    call alone: ``snapshot_download`` silently falls back to the local cache
+    when the remote is unreachable, so a refresh first re-resolves the
+    mutable revision against the source and then verifies that the resolved
+    snapshot is that resolution (spec AR.4). ``model.generate`` is never
+    called here.
 
     Args:
         config: Resolved engine configuration.
         hf_repo: The preset's Hugging Face repo id.
         progress: Optional serialized progress observer.
+        refresh: Whether the mutable revision must be re-resolved.
 
     Returns:
         None.
 
     Raises:
         ArtifactAcquisitionError: With ``reason="action_required"`` when the
-            source reports a gated repository; every other native failure
-            propagates for the template to wrap as ``reason="failed"``.
+            source reports a gated repository; with ``reason="failed"`` when
+            a refresh cannot prove the source was re-resolved; every other
+            native failure propagates for the template to wrap as
+            ``reason="failed"``.
     """
     if config.local_files_only or not allow_downloads():
         raise ArtifactAcquisitionError(
@@ -454,6 +546,20 @@ def acquire(
                 "to permit the transfer."
             ),
         )
+    expected_commit: str | None = None
+    if refresh and not _revision_is_pinned(config.revision):
+        try:
+            expected_commit = _remote_commit(config, hf_repo)
+        except ArtifactAcquisitionError:
+            raise
+        except Exception as exc:
+            raise_for_gated_source(exc, hf_repo)
+            raise ArtifactAcquisitionError(
+                f"Refresh needs to re-resolve the {hf_repo} source reference, "
+                f"and the source metadata query failed ({type(exc).__name__}).",
+                reason="failed",
+                hint="Make the Hugging Face endpoint reachable, then retry.",
+            ) from exc
     if progress is not None:
         # huggingface_hub reports per-file progress on its own terminal bars,
         # not through a callback seam; emit one honest indeterminate transfer
@@ -462,10 +568,26 @@ def acquire(
             ArtifactProgress(phase=ARTIFACT_PROGRESS_TRANSFERRING, artifact_id=HUB_ARTIFACT_ID)
         )
     try:
-        snapshot(config, hf_repo, local_files_only=False)
+        resolved = snapshot(config, hf_repo, local_files_only=False)
     except Exception as exc:
         raise_for_gated_source(exc, hf_repo)
         raise
+    # Outside the snapshots/<commit> cache layout the resolution carries no
+    # comparable commit; the layout is guaranteed here because the helper
+    # always resolves through a Hub cache root.
+    if (
+        expected_commit is not None
+        and resolved.parent.name == "snapshots"
+        and resolved.name != expected_commit
+    ):
+        raise ArtifactAcquisitionError(
+            f"Refresh resolved a {hf_repo} snapshot that is not the "
+            "source's current commit: the source reference moved during the "
+            "refresh, or the downloader fell back to the local cache without "
+            "reaching the source.",
+            reason="failed",
+            hint="Retry while the source is reachable.",
+        )
 
 
 def resolve_for_load(config: MlxAudioConfig, hf_repo: str, *, ready: bool) -> Path:

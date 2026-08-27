@@ -29,7 +29,7 @@ from standard_asr.contract.exceptions import (
 
 from std_mlx_audio import CohereAsr, Mms1BAll, WhisperTiny
 
-from .conftest import FAKE_SNAPSHOT_DIR, FakeLoader, FakeSnapshot
+from .conftest import FAKE_SNAPSHOT_DIR, FakeHfApi, FakeLoader, FakeSnapshot
 
 PINNED = "0123456789abcdef0123456789abcdef01234567"
 
@@ -47,6 +47,9 @@ def _snapshot_dir(tmp_path: Path, sha: str = PINNED) -> Path:
     snapshot.mkdir(parents=True)
     (snapshot / "config.json").write_text("{}")
     (snapshot / "model.safetensors").write_bytes(b"\x00" * 64)
+    # The Whisper presets declare the processor files as inference closure.
+    (snapshot / "tokenizer.json").write_text("{}")
+    (snapshot / "preprocessor_config.json").write_text("{}")
     return snapshot
 
 
@@ -55,6 +58,8 @@ def _mlx_dir(tmp_path: Path) -> Path:
     root.mkdir()
     (root / "config.json").write_text("{}")
     (root / "model.safetensors").write_bytes(b"\x00" * 16)
+    (root / "tokenizer.json").write_text("{}")
+    (root / "preprocessor_config.json").write_text("{}")
     return root
 
 
@@ -114,7 +119,7 @@ def test_hub_ready_cache_reports_location_size_and_commit(
     (requirement,) = report.requirements
     assert requirement.state == ARTIFACT_READY
     assert requirement.location == snapshot
-    assert requirement.size_bytes == 66
+    assert requirement.size_bytes == 70
     # The commit is read off the Hugging Face snapshots/<sha> layout.
     assert requirement.artifact_version == PINNED
 
@@ -189,7 +194,7 @@ def test_model_path_ready_directory(fake_loader: Callable[..., FakeLoader], tmp_
     (requirement,) = WhisperTiny(model_path=str(local)).artifact_status().requirements
     assert requirement.state == ARTIFACT_READY
     assert requirement.location == local
-    assert requirement.size_bytes == 18
+    assert requirement.size_bytes == 22
 
 
 def test_model_path_without_checkpoint_shape_is_incomplete_with_guidance(
@@ -241,6 +246,8 @@ def test_sharded_checkpoint_missing_a_shard_is_incomplete(
     snapshot = tmp_path / "snapshots" / PINNED
     snapshot.mkdir(parents=True)
     (snapshot / "config.json").write_text("{}")
+    (snapshot / "tokenizer.json").write_text("{}")
+    (snapshot / "preprocessor_config.json").write_text("{}")
     index = {
         "weight_map": {
             "a.weight": "model-00001-of-00002.safetensors",
@@ -272,6 +279,7 @@ def test_mms_requires_the_base_weights_beside_adapters(
     (requirement,) = Mms1BAll().artifact_status().requirements
     assert requirement.state == "incomplete"
     (snapshot / "model.safetensors").write_bytes(b"\x00")
+    (snapshot / "vocab.json").write_text("{}")
     (requirement,) = Mms1BAll().artifact_status().requirements
     assert requirement.state == ARTIFACT_READY
 
@@ -400,11 +408,18 @@ def test_refresh_re_resolves_a_ready_mutable_source(
 ) -> None:
     fake_loader()
     FakeSnapshot.cached_path = str(_snapshot_dir(tmp_path))
-    engine = WhisperTiny()
+    FakeHfApi.remote_sha = PINNED
+    engine = WhisperTiny(hf_token="hf_abc")
     assert engine.acquire_artifacts().readiness == ARTIFACTS_READY
     assert FakeSnapshot.download_calls == 0  # plain pull: ready is a no-op
+    assert FakeHfApi.model_info_calls == []  # plain pull never queries the source
     engine.acquire_artifacts(refresh=True)
     assert FakeSnapshot.download_calls == 1  # refresh re-resolves the branch
+    # The re-resolution evidence: one metadata query against the preset's
+    # repo, with the engine's credentials.
+    (call,) = FakeHfApi.model_info_calls
+    assert call == {"repo_id": "openai/whisper-tiny", "revision": None}
+    assert FakeHfApi.last_token == "hf_abc"
 
 
 def test_refresh_skips_a_pinned_revision(
@@ -415,6 +430,7 @@ def test_refresh_skips_a_pinned_revision(
     report = WhisperTiny(revision=PINNED).acquire_artifacts(refresh=True)
     assert report.readiness == ARTIFACTS_READY
     assert FakeSnapshot.download_calls == 0
+    assert FakeHfApi.model_info_calls == []  # a pinned commit needs no query
 
 
 def test_pull_on_missing_model_path_raises_action_required(
@@ -534,6 +550,8 @@ def test_partial_snapshot_reports_incomplete_and_pull_repairs(
 
     def _complete_download() -> None:
         (partial / "model.safetensors").write_bytes(b"\x00" * 8)
+        (partial / "tokenizer.json").write_text("{}")
+        (partial / "preprocessor_config.json").write_text("{}")
 
     FakeSnapshot.on_download = _complete_download
     repaired = WhisperTiny().acquire_artifacts()
@@ -552,6 +570,7 @@ def test_refresh_respects_engine_local_files_only(
         WhisperTiny(local_files_only=True).acquire_artifacts(refresh=True)
     assert exc_info.value.reason == "downloads_disabled"
     assert FakeSnapshot.download_calls == 0
+    assert FakeHfApi.model_info_calls == []  # gated before the source query
 
 
 def test_unreadable_cache_reports_unknown_not_missing(
@@ -625,6 +644,251 @@ def test_streaming_session_emits_artifact_unavailable_terminal(
     (error,) = [event for event in events if event.type == "error"]
     assert error.code == "artifact_unavailable"
     assert error.recoverable is False
+
+
+# --------------------------------------------------------------------------- #
+# Round-3 review regressions: shard closures and refresh evidence
+# --------------------------------------------------------------------------- #
+def test_partial_shard_set_without_index_is_incomplete(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # An interrupted download can hold shard files while the index has not
+    # arrived; each shard names its own closure (-NNNNN-of-NNNNN), and the
+    # strict=False loader would load the fragment into fluent garbage.
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "tokenizer.json").write_text("{}")
+    (snapshot / "preprocessor_config.json").write_text("{}")
+    (snapshot / "model-00001-of-00003.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.cached_path = str(snapshot)
+    (requirement,) = WhisperTiny().artifact_status().requirements
+    assert requirement.state == "incomplete"
+
+    (snapshot / "model-00002-of-00003.safetensors").write_bytes(b"\x00" * 8)
+    (snapshot / "model-00003-of-00003.safetensors").write_bytes(b"\x00" * 8)
+    (requirement,) = WhisperTiny().artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+
+
+def test_whisper_missing_processor_files_is_incomplete(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # The Whisper backend needs the WhisperProcessor files beside the
+    # weights: without them the loader only WARNS and the first generate
+    # fails ("Processor not found"), so a snapshot lacking them must not
+    # report ready -- and the same closure applies to an operator
+    # model_path (round-4 review).
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.cached_path = str(snapshot)
+    (requirement,) = WhisperTiny().artifact_status().requirements
+    assert requirement.state == "incomplete"
+
+    local = tmp_path / "local"
+    local.mkdir()
+    (local / "config.json").write_text("{}")
+    (local / "model.safetensors").write_bytes(b"\x00" * 8)
+    (requirement,) = WhisperTiny(model_path=str(local)).artifact_status().requirements
+    assert requirement.state == "incomplete"
+
+    for root in (snapshot, local):
+        (root / "tokenizer.json").write_text("{}")
+        (root / "preprocessor_config.json").write_text("{}")
+    (requirement,) = WhisperTiny().artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+    (requirement,) = WhisperTiny(model_path=str(local)).artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+
+
+def test_unreadable_shard_index_is_incomplete(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # An index that cannot be parsed proves nothing; it must never count as
+    # a complete checkpoint.
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "tokenizer.json").write_text("{}")
+    (snapshot / "preprocessor_config.json").write_text("{}")
+    (snapshot / "model.safetensors.index.json").write_text("{not json")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.cached_path = str(snapshot)
+    (requirement,) = WhisperTiny().artifact_status().requirements
+    assert requirement.state == "incomplete"
+
+
+def test_model_path_honors_preset_required_files(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # A model_path still loads through the preset's family: an MMS directory
+    # with an adapter but no base weights would reach the strict=False loader
+    # as a fragment, so the preset's required files apply to it too.
+    fake_loader()
+    root = tmp_path / "mms"
+    root.mkdir()
+    (root / "config.json").write_text("{}")
+    (root / "adapter.eng.safetensors").write_bytes(b"\x00" * 8)
+    (requirement,) = Mms1BAll(model_path=str(root)).artifact_status().requirements
+    assert requirement.state == "incomplete"
+
+    (root / "model.safetensors").write_bytes(b"\x00" * 8)
+    (root / "vocab.json").write_text("{}")
+    (requirement,) = Mms1BAll(model_path=str(root)).artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+
+
+def test_implicit_load_rechecks_completeness_after_resolution(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # Resolution success is not completeness: with the remote unreachable the
+    # hub client silently falls back to the local cache, so an allowed
+    # implicit acquisition can return the same incomplete directory status
+    # just reported. The loader must never receive that fragment.
+    loader = fake_loader()
+    partial = tmp_path / "snapshots" / PINNED
+    partial.mkdir(parents=True)
+    (partial / "config.json").write_text("{}")  # weights never arrived
+    FakeSnapshot.cached_path = str(partial)
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        WhisperTiny().prepare()
+    assert exc_info.value.reason == "failed"
+    assert "complete" in str(exc_info.value)
+    assert loader.load_calls == []  # the fragment never reached the loader
+
+
+def test_refresh_fails_when_the_source_is_unreachable(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # The downloader silently falls back to the local cache when the remote
+    # is unreachable, so refresh must fail without re-resolution evidence
+    # instead of reporting the stale cache as fresh (spec AR.4).
+    fake_loader()
+    FakeSnapshot.cached_path = str(_snapshot_dir(tmp_path))
+    FakeHfApi.raise_on_model_info = ConnectionError("network is down")
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        WhisperTiny().acquire_artifacts(refresh=True)
+    assert exc_info.value.reason == "failed"
+    assert isinstance(exc_info.value.__cause__, ConnectionError)
+    assert FakeSnapshot.download_calls == 0  # fail fast, before any transfer
+
+
+def test_refresh_detects_a_stale_cache_fallback(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # The source re-resolved to a new commit, but the download resolved the
+    # old snapshot (the mid-transfer fallback): success here would claim
+    # freshness the source never confirmed.
+    fake_loader()
+    FakeSnapshot.cached_path = str(_snapshot_dir(tmp_path))
+    FakeHfApi.remote_sha = "f" * 40
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        WhisperTiny().acquire_artifacts(refresh=True)
+    assert exc_info.value.reason == "failed"
+    assert "fell back" in str(exc_info.value)
+
+
+def test_refresh_gated_source_query_reports_request_access(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # An access rejection during the metadata query carries the same
+    # discovered action as one during the transfer.
+    import httpx
+    from huggingface_hub.errors import GatedRepoError
+
+    fake_loader()
+    FakeSnapshot.cached_path = str(_snapshot_dir(tmp_path))
+    response = httpx.Response(403, request=httpx.Request("GET", "https://huggingface.co/x"))
+    FakeHfApi.raise_on_model_info = GatedRepoError("gated", response=response)
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        WhisperTiny().acquire_artifacts(refresh=True)
+    assert exc_info.value.reason == "action_required"
+    (action,) = exc_info.value.required_actions
+    assert action.kind == "request_access"
+
+
+def test_refresh_fails_when_the_source_names_no_commit(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    fake_loader()
+    FakeSnapshot.cached_path = str(_snapshot_dir(tmp_path))
+    FakeHfApi.remote_sha = None
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        WhisperTiny().acquire_artifacts(refresh=True)
+    assert exc_info.value.reason == "failed"
+    assert "commit" in str(exc_info.value)
+
+
+# --------------------------------------------------------------------------- #
+# Round-8 review regressions: per-family inference closures
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("preset_name", "family_files"),
+    [
+        # Decode falls back to numeric token ids without the bpe model, and
+        # feature normalization is silently skipped without am.mvn.
+        ("SenseVoiceSmall", ("chn_jpn_yue_eng_ko_spectok.bpe.model", "am.mvn")),
+        # Missing dict.txt yields a silently EMPTY transcript; missing
+        # cmvn.json silently skips normalization.
+        ("FireRedAsr2Aed", ("dict.txt", "cmvn.json", "train_bpe1000.model")),
+        # The upstream hook swallows the tokenizer load failure and decode
+        # falls back to per-id characters.
+        ("MoonshineTiny", ("tokenizer.json",)),
+        # The tokenizer is loaded optionally and its absence raises only at
+        # the first generate.
+        ("Canary1BV2", ("tokenizer.model",)),
+    ],
+)
+def test_family_inference_closure_gates_ready(
+    fake_loader: Callable[..., FakeLoader],
+    tmp_path: Path,
+    preset_name: str,
+    family_files: tuple[str, ...],
+) -> None:
+    # A snapshot holding only config + weights must NOT report ready for
+    # families whose loaders silently degrade (numeric ids, empty text,
+    # character soup) or fail only at the first request when their
+    # non-weight inference files are absent (round-8 review; every listed
+    # file is verified against the installed loader AND the preset's repo).
+    import std_mlx_audio
+
+    preset = getattr(std_mlx_audio, preset_name)
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.cached_path = str(snapshot)
+    (requirement,) = preset().artifact_status().requirements
+    assert requirement.state == "incomplete"
+
+    for name in family_files:
+        (snapshot / name).write_text("{}")
+    (requirement,) = preset().artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+
+
+def test_snapshot_filter_includes_the_mvn_gap(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # SenseVoice's am.mvn is load-bearing (normalization stats, no config
+    # fallback) but the upstream default allow patterns never fetch it; the
+    # plugin's snapshot filter must close that gap or the required file
+    # could never arrive.
+    fake_loader()
+    with pytest.raises(ArtifactUnavailableError):
+        # Any resolution records the kwargs; the cold cache then raises.
+        from std_mlx_audio import SenseVoiceSmall
+
+        SenseVoiceSmall(local_files_only=True).prepare()
+    patterns = FakeSnapshot.last_kwargs["allow_patterns"]
+    assert "*.mvn" in patterns
+    assert "*.model" in patterns  # the upstream defaults are still present
 
 
 def test_error_translation_degrades_without_hub_errors_module(

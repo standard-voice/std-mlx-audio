@@ -75,6 +75,7 @@ from . import backends
 from ._artifacts import (
     HUB_ARTIFACT_ID,
     acquire,
+    checkpoint_complete,
     normalized_model_path,
     raise_for_gated_source,
     resolve_for_load,
@@ -355,7 +356,26 @@ class MlxAudioASR(EngineBase):
             # under ``mlx-int8/``); mlx-audio's ``load`` only resolves
             # config.json at the path root, so point it at the subfolder.
             subfolder = type(self).hf_subfolder
-            model_source = str(snapshot_root / subfolder if subfolder else snapshot_root)
+            checkpoint_dir = snapshot_root / subfolder if subfolder else snapshot_root
+            # Resolution success is not completeness: when the remote is
+            # unreachable, the hub client silently falls back to whatever the
+            # local cache holds, so the allowed implicit acquisition above can
+            # return the same incomplete directory status just reported.
+            # Re-verify with the status check's own rule before the
+            # strict=False loader turns a fragment into fluent garbage.
+            if not (
+                checkpoint_dir.is_dir()
+                and checkpoint_complete(checkpoint_dir, type(self).required_snapshot_files)
+            ):
+                raise ArtifactAcquisitionError(
+                    f"The {type(self).hf_repo} snapshot resolved without a "
+                    "complete checkpoint; the source may be unreachable and "
+                    "the local cache incomplete.",
+                    reason="failed",
+                    report=report,
+                    hint="Run 'standard-asr pull' while the source is reachable.",
+                )
+            model_source = str(checkpoint_dir)
         # Upstream infers the model family from the LAST path component when
         # config.json omits model_type (NeMo-format repos): a local path --
         # snapshot or operator-provided -- would feed it the commit hash or an
@@ -517,9 +537,11 @@ class MlxAudioASR(EngineBase):
         """Acquire the preset's filtered snapshot without loading or priming.
 
         A ``model_path`` requirement is externally provided and never reaches
-        this hook. ``snapshot_download`` re-resolves a mutable revision on
-        every online call, so plain acquisition and refresh share one path;
-        ``pull`` never runs the priming inference that :meth:`prepare` keeps.
+        this hook. A refresh carries its own re-resolution evidence:
+        ``snapshot_download`` silently falls back to the local cache when the
+        remote is unreachable, so ``acquire`` verifies the source resolution
+        itself (spec AR.4). ``pull`` never runs the priming inference that
+        :meth:`prepare` keeps.
 
         Args:
             context: Resolved artifact context.
@@ -532,7 +554,7 @@ class MlxAudioASR(EngineBase):
         """
         config = cast(MlxAudioConfig, self.config)
         if any(item.artifact_id == HUB_ARTIFACT_ID for item in requirements):
-            acquire(config, type(self).hf_repo, progress)
+            acquire(config, type(self).hf_repo, progress, refresh=refresh)
 
     # ------------------------------------------------------------------ #
     # Batch
@@ -885,6 +907,13 @@ class WhisperLargeV3Turbo(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "openai/whisper-large-v3-turbo"
+    # The WhisperProcessor files are part of the inference closure: without
+    # them the loader only WARNS and the first generate fails ("Processor
+    # not found"), so a snapshot lacking them must not report ready.
+    required_snapshot_files: ClassVar[tuple[str, ...]] = (
+        "tokenizer.json",
+        "preprocessor_config.json",
+    )
     backend: ClassVar[ModelBackend] = WhisperBackend()
     properties: ClassVar[BaseProperties] = WhisperLargeV3TurboProperties()
     declared_capabilities: ClassVar[DeclaredCapabilities] = _WHISPER_CAPABILITIES
@@ -899,6 +928,11 @@ class WhisperTiny(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "openai/whisper-tiny"
+    # See WhisperLargeV3Turbo: the processor files are inference closure.
+    required_snapshot_files: ClassVar[tuple[str, ...]] = (
+        "tokenizer.json",
+        "preprocessor_config.json",
+    )
     backend: ClassVar[ModelBackend] = WhisperBackend()
     properties: ClassVar[BaseProperties] = WhisperTinyProperties()
     declared_capabilities: ClassVar[DeclaredCapabilities] = _WHISPER_CAPABILITIES
@@ -940,6 +974,15 @@ class SenseVoiceSmall(MlxAudioASR):
     """``mlx-audio/sensevoice-small`` — FunAudioLLM SenseVoice (language ID + ITN)."""
 
     hf_repo: ClassVar[str] = "mlx-community/SenseVoiceSmall"
+    # Both are SILENT when absent (round-8 review): without the bpe model
+    # the decoder emits numeric token ids as the transcript, and without
+    # am.mvn the feature normalization is silently skipped (the config
+    # carries no cmvn fallback). am.mvn needs the plugin's extended
+    # snapshot allow patterns -- the upstream defaults never fetch it.
+    required_snapshot_files: ClassVar[tuple[str, ...]] = (
+        "chn_jpn_yue_eng_ko_spectok.bpe.model",
+        "am.mvn",
+    )
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(
             model_types=("sensevoice",),
@@ -1085,6 +1128,9 @@ class Canary1BV2(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "CogniSoftOrg/canary-1b-v2-mlx-bf16"
+    # Loaded optionally by the upstream hook; absence surfaces only at the
+    # first generate, so it is part of the ready closure.
+    required_snapshot_files: ClassVar[tuple[str, ...]] = ("tokenizer.model",)
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(
             model_types=("canary",),
@@ -1208,7 +1254,15 @@ class GraniteSpeechNar2B(MlxAudioASR):
 
 
 class VibeVoiceAsr(MlxAudioASR):
-    """``mlx-audio/vibevoice-asr`` — Microsoft VibeVoice-ASR (context-biased)."""
+    """``mlx-audio/vibevoice-asr`` — Microsoft VibeVoice-ASR (context-biased).
+
+    Caveat: the checkpoint repo ships NO tokenizer files, and the upstream
+    loader silently falls back to fetching the ``Qwen/Qwen2.5-7B`` tokenizer
+    from the Hub on every cold load -- a network fetch the engine's
+    ``local_files_only`` cannot gate (it happens inside the upstream hook,
+    through transformers). Offline use requires a warm transformers cache
+    for that tokenizer. See docs/STANDARD_ASR_FINDINGS.md.
+    """
 
     hf_repo: ClassVar[str] = "mlx-community/VibeVoice-ASR-4bit"
     backend: ClassVar[ModelBackend] = GenericSttBackend(
@@ -1241,6 +1295,9 @@ class MoonshineTiny(MlxAudioASR):
     """``mlx-audio/moonshine-tiny`` — UsefulSensors Moonshine tiny (English, ~27M)."""
 
     hf_repo: ClassVar[str] = "UsefulSensors/moonshine-tiny"
+    # SILENT when absent (round-8 review): the upstream hook swallows the
+    # tokenizer load failure and decode falls back to per-id characters.
+    required_snapshot_files: ClassVar[tuple[str, ...]] = ("tokenizer.json",)
     backend: ClassVar[ModelBackend] = GenericSttBackend(SttFamilySpec(model_types=("moonshine",)))
     properties: ClassVar[BaseProperties] = stt_properties(
         model_name="moonshine-tiny",
@@ -1262,9 +1319,14 @@ class Mms1BAll(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "facebook/mms-1b-all"
-    #: The base encoder weights sit BESIDE 1198 per-language adapter files, so
-    #: a bare weights glob would report ready with only an adapter present.
-    required_snapshot_files: ClassVar[tuple[str, ...]] = ("model.safetensors",)
+    #: The base encoder weights sit BESIDE 1198 per-language adapter files
+    #: (a bare weights glob would report ready with only an adapter
+    #: present), and vocab.json decodes the CTC ids -- without it the
+    #: transcript is silently the numeric ids (round-8 review).
+    required_snapshot_files: ClassVar[tuple[str, ...]] = (
+        "model.safetensors",
+        "vocab.json",
+    )
     backend: ClassVar[ModelBackend] = GenericSttBackend(SttFamilySpec(model_types=("mms",)))
     properties: ClassVar[BaseProperties] = stt_properties(
         model_name="mms-1b-all",
@@ -1285,6 +1347,14 @@ class FireRedAsr2Aed(MlxAudioASR):
     """``mlx-audio/fireredasr2-aed`` — FireRedASR2-AED (Chinese/English, beam search)."""
 
     hf_repo: ClassVar[str] = "mlx-community/FireRedASR2-AED-mlx"
+    # All three are loaded optionally upstream (round-8 review): without
+    # dict.txt the transcript is silently EMPTY, and without cmvn.json the
+    # feature normalization is silently skipped.
+    required_snapshot_files: ClassVar[tuple[str, ...]] = (
+        "dict.txt",
+        "cmvn.json",
+        "train_bpe1000.model",
+    )
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(model_types=("fireredasr2",), forward=(("beam_size", "beam_size"),))
     )

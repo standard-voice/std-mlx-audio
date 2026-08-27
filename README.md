@@ -81,13 +81,24 @@ downloads). Once published to PyPI this becomes `uv pip install std-mlx-audio`.
 
 **Artifact lifecycle (protocol 1.1).** `standard-asr status mlx-audio/<model>`
 reports whether the preset's snapshot is cached and provably complete (a
-sharded checkpoint is ready only when every file in its safetensors index is
-present; MMS additionally requires the base weights beside its per-language
-adapters). `standard-asr pull` acquires or repairs the snapshot without
-loading or priming a model; `pull --refresh` re-resolves a mutable revision
-(a pinned 40-hex commit is immutable and a no-op). With
-`local_files_only=true` the engine refuses every network transfer, including
-a refresh.
+sharded checkpoint is ready only when every shard is present -- named by the
+safetensors index, or by the shards' own `-NNNNN-of-NNNNN` names when the
+index has not arrived yet). Presets whose upstream loaders silently degrade
+without their non-weight files declare those in the ready closure -- the MMS
+base weights and CTC vocab, the Whisper processor pair, the SenseVoice bpe
+and normalization stats, the FireRed dict/cmvn/spm, the Moonshine tokenizer,
+the Canary SentencePiece model -- each verified against the installed loader
+and the preset's repo, and each applying to an operator `model_path` too.
+`standard-asr pull` acquires or repairs the snapshot without loading or
+priming a model.
+`pull --refresh` re-resolves a mutable revision and verifies against the
+source that the re-resolution happened: the downloader alone silently falls
+back to the local cache when the source is unreachable, and a refresh fails
+rather than report the stale cache as fresh (a pinned 40-hex commit is
+immutable and a no-op). The implicit first-use load re-verifies completeness
+after its online resolution for the same reason, so the non-strict loader
+never receives a fragment. With `local_files_only=true` the engine refuses
+every network transfer, including a refresh.
 
 ## Use
 

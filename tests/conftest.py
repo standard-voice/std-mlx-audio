@@ -136,6 +136,22 @@ def _make_fake_snapshot_dir() -> str:
     root.mkdir(parents=True)
     (root / "config.json").write_text("{}")
     (root / "model.safetensors").write_bytes(b"\x00" * 8)
+    # Every preset-declared inference closure must be satisfied by this shared
+    # default (the per-family files coexist harmlessly): the Whisper processor
+    # pair, the SenseVoice bpe + normalization stats, the Canary SentencePiece
+    # model, the FireRed dict/cmvn/spm, and the MMS vocab.
+    for name in (
+        "tokenizer.json",
+        "preprocessor_config.json",
+        "chn_jpn_yue_eng_ko_spectok.bpe.model",
+        "am.mvn",
+        "tokenizer.model",
+        "dict.txt",
+        "cmvn.json",
+        "train_bpe1000.model",
+        "vocab.json",
+    ):
+        (root / name).write_text("{}")
     return str(root)
 
 
@@ -220,6 +236,39 @@ def _fake_snapshot_download(
     return FakeSnapshot.cached_path or FAKE_SNAPSHOT_DIR
 
 
+class FakeHfApi:
+    """Controls the fake ``huggingface_hub.HfApi`` source metadata queries.
+
+    A refresh re-resolves the mutable revision through ``model_info``;
+    ``remote_sha`` is the commit the fake source answers with (``None``
+    models a source that names no commit), and ``raise_on_model_info``
+    models an unreachable or rejecting source.
+    """
+
+    remote_sha: str | None = None
+    raise_on_model_info: BaseException | None = None
+    model_info_calls: list[dict[str, Any]] = []
+    last_token: str | None = None
+
+    def __init__(self, token: str | None = None) -> None:
+        FakeHfApi.last_token = token
+
+    def model_info(self, repo_id: str, *, revision: str | None = None) -> Any:
+        FakeHfApi.model_info_calls.append({"repo_id": repo_id, "revision": revision})
+        if FakeHfApi.raise_on_model_info is not None:
+            raise FakeHfApi.raise_on_model_info
+        import types
+
+        return types.SimpleNamespace(sha=FakeHfApi.remote_sha)
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.remote_sha = None
+        cls.raise_on_model_info = None
+        cls.model_info_calls = []
+        cls.last_token = None
+
+
 def install_fake_loader(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -247,7 +296,9 @@ def install_fake_loader(
     import mlx_audio.stt as stt
 
     FakeSnapshot.reset()
+    FakeHfApi.reset()
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot_download)
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeHfApi)
     model = FakeMlxModel(output=output, output_fn=output_fn)
     loader = FakeLoader(model)
     monkeypatch.setattr(stt, "load", loader)
