@@ -36,8 +36,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from standard_asr.contract.results import Segment, TranscriptionResult, Word
 from standard_asr.contract.params import WordTimestampGranularity
+from standard_asr.contract.results import Segment, TranscriptionResult, Word
 
 from . import languages
 from ._config import MlxAudioParams

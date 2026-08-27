@@ -41,19 +41,35 @@ from standard_asr import (
     TranscriptionSession,
 )
 from standard_asr.audio.format import AudioFormat
+from standard_asr.contract.artifacts import (
+    ARTIFACT_MISSING,
+    ARTIFACT_READY,
+    ArtifactContext,
+    ArtifactProgressCallback,
+    ArtifactRequirement,
+)
 from standard_asr.contract.capabilities import DeclaredCapabilities
+from standard_asr.contract.exceptions import (
+    ArtifactAcquisitionError,
+    ArtifactUnavailableError,
+    DiscoveryError,
+    TranscriptionError,
+)
+from standard_asr.contract.language import effective_language
+from standard_asr.contract.params import ProviderParams
 from standard_asr.engine import (
+    ArtifactDeclaration,
     BaseConfig,
     BaseProperties,
+    DeclaredEngineMetadata,
+    Diagnostic,
     EngineBase,
     PreparedAudio,
 )
-from standard_asr.contract.exceptions import DiscoveryError, TranscriptionError
-from standard_asr.contract.language import effective_language
-from standard_asr.runtime.downloads import allow_downloads, resolve_download_root
-from standard_asr.contract.params import ProviderParams
+from standard_asr.runtime.downloads import allow_downloads
 
 from . import backends
+from ._artifacts import HUB_ARTIFACT_ID, acquire, resolve_for_load, status_requirement
 from ._config import MlxAudioConfig, MlxAudioParams
 from ._metadata import (
     _PARAKEET_CAPABILITIES,
@@ -138,6 +154,18 @@ class MlxAudioASR(EngineBase):
     #: ``load`` at ``<snapshot>/<subfolder>``. ``None`` (default) loads from root.
     hf_subfolder: ClassVar[str | None] = None
 
+    #: Static upper bounds shared by every preset in this plugin-owned family:
+    #: each Hub preset supports explicit snapshot acquisition (plugin-side
+    #: ``snapshot_download``) and can also acquire on first use inside
+    #: ``_ensure_model_loaded``. A ``model_path`` instance narrows both to an
+    #: externally provided requirement dynamically.
+    declared_metadata: ClassVar[DeclaredEngineMetadata] = DeclaredEngineMetadata(
+        artifacts=ArtifactDeclaration(
+            acquisition_applicable=True,
+            supports_explicit_acquisition=True,
+            may_acquire_during_inference=True,
+        )
+    )
     provider_params_type: ClassVar[type[ProviderParams] | None] = MlxAudioParams
     config_type: ClassVar[type[BaseConfig[str]] | None] = MlxAudioConfig
 
@@ -182,15 +210,21 @@ class MlxAudioASR(EngineBase):
     def _ensure_model_loaded(self) -> None:
         """Load the MLX model lazily via ``mlx_audio.stt.load``.
 
-        Honors the download policy (spec IC.9): when downloads are disabled
-        (the ``local_files_only`` config flag, or ``STANDARD_ASR_ALLOW_DOWNLOAD``
-        set to a disable value) we pass ``local_files_only=True`` so the loader
-        uses only cached weights and fails loudly instead of reaching out to the
-        network. (An UNSET toggle defaults to downloads-enabled per the policy.)
+        The artifact guard runs first, then the snapshot is resolved
+        PLUGIN-SIDE (``huggingface_hub.snapshot_download`` with the resolved
+        cache root, token, revision, and offline flag) and the loader receives
+        a local directory. The upstream loader accepts none of those controls
+        (it silently swallows unknown kwargs), so plugin-side resolution is
+        what makes ``download_root``, ``hf_token``, and ``local_files_only``
+        honored rather than declared-but-inert.
 
         Raises:
-            DiscoveryError: If mlx-audio is missing, the platform is not
-                Apple-Silicon/Metal, or weights cannot be loaded.
+            DiscoveryError: If mlx-audio is not installed.
+            ArtifactUnavailableError: If required artifacts are missing and
+                cannot be acquired under the current policy.
+            ArtifactAcquisitionError: If an allowed first-use acquisition
+                fails.
+            TranscriptionError: If a locally available model fails to load.
         """
         if self._model is not None:
             return
@@ -215,37 +249,64 @@ class MlxAudioASR(EngineBase):
 
         config = cast(MlxAudioConfig, self.config)
         local_only = config.local_files_only or not allow_downloads()
-        # mlx-audio resolves repos via the HF hub cache (it HAS a library
-        # default), so forward the None passthrough for the cache root unchanged
-        # — forcing a directory would break offline loads of hub-cached models.
-        resolve_download_root(config.download_root, has_library_default=True)
+        # The artifact guard: the same cheap inspection artifact_status()
+        # reports. It decides whether a failure below is a failed implicit
+        # acquisition or an engine-execution fault.
+        requirement = status_requirement(config, type(self).hf_repo, type(self).hf_subfolder)
+        if requirement.state != ARTIFACT_READY:
+            if config.model_path is not None and requirement.state == ARTIFACT_MISSING:
+                raise ArtifactUnavailableError(
+                    f"The configured model_path {config.model_path!r} does not exist.",
+                    reason="missing",
+                    report=self.artifact_status(),
+                    hint="Provide the MLX checkpoint directory or unset model_path.",
+                )
+            if config.model_path is None and local_only:
+                raise ArtifactUnavailableError(
+                    f"The {type(self).hf_repo} snapshot is not cached and "
+                    "downloads are disabled.",
+                    reason="downloads_disabled",
+                    report=self.artifact_status(),
+                    hint=(
+                        "Run 'standard-asr pull' with downloads enabled, or set "
+                        "STANDARD_ASR_ALLOW_DOWNLOAD=1."
+                    ),
+                )
         # Model selection is by preset (spec IC.7); a local model_path wins.
-        model_source = config.model_path or type(self).hf_repo
-        load_kwargs: dict[str, Any] = {"local_files_only": local_only}
-        if config.revision is not None:
-            load_kwargs["revision"] = config.revision
+        if config.model_path is not None:
+            model_source: str = config.model_path
+        else:
+            try:
+                snapshot_root = resolve_for_load(
+                    config,
+                    type(self).hf_repo,
+                    ready=requirement.state == ARTIFACT_READY,
+                )
+            except Exception as exc:
+                # The resolution was the allowed implicit acquisition path.
+                raise ArtifactAcquisitionError(
+                    f"First-use acquisition of the {type(self).hf_repo} "
+                    f"snapshot failed: {type(exc).__name__}.",
+                    reason="failed",
+                    hint="Run 'standard-asr pull' to acquire it explicitly.",
+                ) from exc
+            # Some repos keep the checkpoint in a subfolder (e.g. Cohere-ASR
+            # under ``mlx-int8/``); mlx-audio's ``load`` only resolves
+            # config.json at the path root, so point it at the subfolder.
+            subfolder = type(self).hf_subfolder
+            model_source = str(snapshot_root / subfolder if subfolder else snapshot_root)
+        load_kwargs: dict[str, Any] = {}
         # A few repos mislabel their config.json model_type (e.g. MMS says
         # "wav2vec2"); the preset pins the family so the loader does not mis-route.
         if type(self).load_model_type is not None:
             load_kwargs["model_type"] = type(self).load_model_type
-        # Some repos keep the checkpoint in a subfolder (e.g. Cohere-ASR under
-        # ``mlx-int8/``); mlx-audio's ``load`` only resolves config.json at the
-        # repo root, so snapshot-download the repo and load from the subfolder.
-        # A caller-supplied local ``model_path`` is assumed to already point at the
-        # checkpoint, so the subfolder rewrite applies only to the repo default.
-        subfolder = type(self).hf_subfolder
-        if subfolder and config.model_path is None:
-            model_source = self._resolve_subfolder(model_source, subfolder, config, local_only)
-            # ``revision`` was consumed by snapshot_download; load() now gets a
-            # local path, for which passing a revision is meaningless.
-            load_kwargs.pop("revision", None)
         try:
             self._model = load(model_source, **load_kwargs)
         except Exception as exc:
-            raise DiscoveryError(
-                f"Failed to load MLX model {model_source!r}. If downloads are "
-                "disabled, set STANDARD_ASR_ALLOW_DOWNLOAD=1 or pre-download the "
-                "model; ensure you are on Apple Silicon with Metal."
+            raise TranscriptionError(
+                f"mlx-audio failed to load the model at {model_source!r}: "
+                f"{type(exc).__name__}. Ensure the checkpoint is a valid MLX "
+                "bundle and the platform can run MLX."
             ) from exc
         self._verify_model_family()
         self._prime_generation_thread()
@@ -297,48 +358,6 @@ class MlxAudioASR(EngineBase):
                 exc_info=True,
             )
 
-    @staticmethod
-    def _resolve_subfolder(
-        repo: str, subfolder: str, config: MlxAudioConfig, local_only: bool
-    ) -> str:
-        """Snapshot-download ``repo`` and return its local ``<snapshot>/<subfolder>``.
-
-        mlx-audio's ``load`` resolves ``config.json`` at the path root, so a repo
-        whose checkpoint lives in a subfolder must be pointed at the subfolder
-        directly. We materialize the full snapshot (so the tokenizer/processor
-        files alongside the weights come down too) and return the subfolder path.
-
-        Args:
-            repo: The Hugging Face repo id.
-            subfolder: The subfolder holding ``config.json`` + weights.
-            config: The engine config (supplies the optional ``revision``).
-            local_only: Whether downloads are disabled (cache-only resolution).
-
-        Returns:
-            The local filesystem path to the checkpoint subfolder.
-
-        Raises:
-            DiscoveryError: If the snapshot cannot be resolved.
-        """
-        import os
-
-        # snapshot_download's huggingface_hub overloads carry Unknown generics
-        # (user_agent/tqdm_class), so pyright strict flags the imported symbol as
-        # partially unknown; the return is a str (dry_run defaults False), annotated below.
-        from huggingface_hub import snapshot_download  # pyright: ignore[reportUnknownVariableType]
-
-        try:
-            local_root: str = snapshot_download(
-                repo, revision=config.revision, local_files_only=local_only
-            )
-        except Exception as exc:
-            raise DiscoveryError(
-                f"Failed to resolve MLX model {repo!r} (subfolder {subfolder!r}). "
-                "If downloads are disabled, set STANDARD_ASR_ALLOW_DOWNLOAD=1 or "
-                "pre-download the model; ensure you are on Apple Silicon with Metal."
-            ) from exc
-        return os.path.join(local_root, subfolder)
-
     def _verify_model_family(self) -> None:
         """Assert the loaded model's family matches this preset's backend (spec IC.7).
 
@@ -369,15 +388,74 @@ class MlxAudioASR(EngineBase):
             )
 
     def prepare(self) -> None:
-        """Preload model weights without transcribing (spec IC.11).
+        """Warm up the MLX model without transcribing (spec IC.11).
 
-        Idempotent and synchronous; self-checks the download policy via
-        :meth:`_ensure_model_loaded`.
+        Idempotent and synchronous. The warm-up loads the model and runs the
+        thread-affinity priming; a cold cache acquires the snapshot on this
+        path too (under the same download policy and artifact errors as
+        inference). Explicit artifact-only acquisition, which never loads or
+        primes, is :meth:`acquire_artifacts`.
 
         Raises:
-            DiscoveryError: If weights cannot be loaded.
+            ArtifactUnavailableError: If required artifacts are missing and
+                cannot be acquired under the current policy.
+            ArtifactAcquisitionError: If an allowed acquisition attempt fails.
+            TranscriptionError: If a locally available model fails to load.
         """
         self._ensure_model_loaded()
+
+    # ------------------------------------------------------------------ #
+    # Inference-artifact lifecycle (protocol 1.1)
+    # ------------------------------------------------------------------ #
+    def _artifact_requirements(
+        self,
+        context: ArtifactContext,
+    ) -> tuple[bool, tuple[ArtifactRequirement, ...], tuple[Diagnostic, ...]]:
+        """Report the snapshot requirement for the resolved config.
+
+        Batch and streaming share the same snapshot, so the closure does not
+        depend on the request context. The MMS preset deliberately reports ONE
+        filtered-snapshot requirement (base plus every safetensors adapter):
+        the current plugin has no language-adapter selector, so claiming
+        request-dependent adapter requirements would describe an architecture
+        it does not have.
+
+        Args:
+            context: Resolved, best-effort-gated request context.
+
+        Returns:
+            One requirement: the Hub snapshot or the operator-provided path.
+        """
+        config = cast(MlxAudioConfig, self.config)
+        requirement = status_requirement(config, type(self).hf_repo, type(self).hf_subfolder)
+        return True, (requirement,), ()
+
+    def _acquire_artifacts(
+        self,
+        context: ArtifactContext,
+        requirements: tuple[ArtifactRequirement, ...],
+        refresh: bool,
+        progress: ArtifactProgressCallback | None,
+    ) -> None:
+        """Acquire the preset's filtered snapshot without loading or priming.
+
+        A ``model_path`` requirement is externally provided and never reaches
+        this hook. ``snapshot_download`` re-resolves a mutable revision on
+        every online call, so plain acquisition and refresh share one path;
+        ``pull`` never runs the priming inference that :meth:`prepare` keeps.
+
+        Args:
+            context: Resolved artifact context.
+            requirements: Runnable acquisition and refresh targets.
+            refresh: Whether mutable targets must be re-resolved.
+            progress: Serialized progress observer, if requested.
+
+        Returns:
+            None.
+        """
+        config = cast(MlxAudioConfig, self.config)
+        if any(item.artifact_id == HUB_ARTIFACT_ID for item in requirements):
+            acquire(config, type(self).hf_repo, progress)
 
     # ------------------------------------------------------------------ #
     # Batch

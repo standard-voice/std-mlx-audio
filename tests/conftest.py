@@ -122,6 +122,70 @@ class FakeLoader:
         return self.model
 
 
+#: The path the fake snapshot resolution returns for an online "download" when
+#: a test has not staged a concrete cache directory.
+FAKE_SNAPSHOT_DIR = "/fake/snapshots/deadbeef"
+
+
+class FakeSnapshot:
+    """Controls the fake ``huggingface_hub.snapshot_download``.
+
+    ``cached_path`` is the local hit a ``local_files_only=True`` call returns
+    (``None`` = not cached: the call raises, like the real helper). An online
+    call records itself, optionally raises, and can flip the cache to
+    ``download_target`` (simulating a completed acquisition).
+    """
+
+    cached_path: str | None = None
+    download_target: str | None = None
+    raise_on_download: BaseException | None = None
+    last_kwargs: dict[str, Any] = {}
+    #: Kwargs of the last ONLINE call only (a later cache-only status query
+    #: overwrites ``last_kwargs``, so acquisition tests read this one).
+    last_download_kwargs: dict[str, Any] = {}
+    download_calls: int = 0
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.cached_path = None
+        cls.download_target = None
+        cls.raise_on_download = None
+        cls.last_kwargs = {}
+        cls.last_download_kwargs = {}
+        cls.download_calls = 0
+
+
+def _fake_snapshot_download(
+    repo_id: str,
+    *,
+    revision: str | None = None,
+    cache_dir: str | None = None,
+    local_files_only: bool = False,
+    token: str | None = None,
+    allow_patterns: list[str] | None = None,
+) -> str:
+    """Mirror the ``snapshot_download`` contract against ``FakeSnapshot``."""
+    FakeSnapshot.last_kwargs = {
+        "repo_id": repo_id,
+        "revision": revision,
+        "cache_dir": cache_dir,
+        "local_files_only": local_files_only,
+        "token": token,
+        "allow_patterns": allow_patterns,
+    }
+    if local_files_only:
+        if FakeSnapshot.cached_path is None:
+            raise FileNotFoundError("snapshot is not cached locally")
+        return FakeSnapshot.cached_path
+    FakeSnapshot.last_download_kwargs = dict(FakeSnapshot.last_kwargs)
+    FakeSnapshot.download_calls += 1
+    if FakeSnapshot.raise_on_download is not None:
+        raise FakeSnapshot.raise_on_download
+    if FakeSnapshot.download_target is not None:
+        FakeSnapshot.cached_path = FakeSnapshot.download_target
+    return FakeSnapshot.cached_path or FAKE_SNAPSHOT_DIR
+
+
 def install_fake_loader(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -132,7 +196,10 @@ def install_fake_loader(
 
     The engine does ``from mlx_audio.stt import load`` *inside*
     ``_ensure_model_loaded``, so we patch the attribute on the real
-    ``mlx_audio.stt`` module; the lazy import then resolves to our fake.
+    ``mlx_audio.stt`` module; the lazy import then resolves to our fake. The
+    plugin-side snapshot resolution (``huggingface_hub.snapshot_download``) is
+    faked alongside it, backed by :class:`FakeSnapshot`, so no test ever
+    touches the network.
 
     Args:
         monkeypatch: The pytest monkeypatch fixture.
@@ -142,8 +209,11 @@ def install_fake_loader(
     Returns:
         The installed :class:`FakeLoader` (inspect ``load_calls`` / ``model``).
     """
+    import huggingface_hub
     import mlx_audio.stt as stt
 
+    FakeSnapshot.reset()
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot_download)
     model = FakeMlxModel(output=output, output_fn=output_fn)
     loader = FakeLoader(model)
     monkeypatch.setattr(stt, "load", loader)

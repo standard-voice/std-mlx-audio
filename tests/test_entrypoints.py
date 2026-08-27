@@ -11,6 +11,8 @@ application (and CI) sees it — they exercise the *installed* entry points via
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from standard_asr import discover_models
 from standard_asr.audio.format import AudioFormat
 from standard_asr.compliance import (
@@ -46,6 +48,8 @@ from std_mlx_audio import (
     create_whisper_large_v3_turbo,
     create_whisper_tiny,
 )
+
+from .conftest import FakeSTTOutput
 
 #: Every entry-point factory paired with the model key it must build. Calling each
 #: covers all factory bodies and pins the factory<->entry-point-key wiring.
@@ -159,10 +163,15 @@ def test_streaming_param_gating_compliant_each_model() -> None:
         assert report.passed, [i.message for i in report.issues]
 
 
-def test_sync_bridge_no_deadlock_each_family(fake_loader: object) -> None:
+def test_sync_bridge_no_deadlock_each_family(
+    fake_loader: Callable[..., object],
+) -> None:
     # The standard sync->async bridge must terminate without deadlock or a leaked
-    # thread for each backend family's windowed session.
-    from .conftest import install_fake_loader  # noqa: F401 - fixture already patched
+    # thread for each backend family's windowed session. The fake loader MUST be
+    # installed here: the fixture returns an installer, and the earlier version
+    # of this test never called it, so the bridge sessions loaded REAL models --
+    # which only "worked" on a machine that already had them cached.
+    fake_loader(output=FakeSTTOutput(text="x"))
 
     fmt = AudioFormat(encoding="pcm_s16le", sample_rate=16000, channels=1)
     for engine in (Qwen3Asr06B(), ParakeetTdt06BV3(), WhisperTiny()):

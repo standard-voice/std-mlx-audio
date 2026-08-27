@@ -14,13 +14,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pytest
 from standard_asr import RuntimeParams
 from standard_asr.audio.input import AudioArray
-from standard_asr.contract.exceptions import DiscoveryError
+from standard_asr.contract.exceptions import ArtifactAcquisitionError, DiscoveryError
 
 from std_mlx_audio import (
     Canary1BV2,
@@ -45,6 +44,7 @@ from .conftest import (
     FakeAlignedSentence,
     FakeAlignedToken,
     FakeLoader,
+    FakeSnapshot,
     FakeSTTOutput,
 )
 
@@ -299,30 +299,31 @@ def test_vibevoice_text_rebuilt_from_segments(fake_loader: Callable[..., FakeLoa
 # Cohere-ASR loads from the repo's mlx-int8/ subfolder
 # --------------------------------------------------------------------------- #
 def test_cohere_loads_from_subfolder(
-    fake_loader: Callable[..., FakeLoader], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
 ) -> None:
-    # The repo stores its checkpoint under mlx-int8/; the loader snapshot-downloads
-    # the repo and points load() at the subfolder (not the root, where there is no
-    # config.json), dropping the now-meaningless revision for the local path.
-    import huggingface_hub
-
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *_a, **_k: str(tmp_path))
+    # The repo stores its checkpoint under mlx-int8/; the plugin-side snapshot
+    # resolution returns the cached root and load() is pointed at the subfolder
+    # (not the root, where there is no config.json). The local path carries no
+    # revision or offline flag -- those were consumed by the resolution.
+    subfolder = tmp_path / "mlx-int8"
+    subfolder.mkdir()
+    (subfolder / "config.json").write_text("{}")
     loader = fake_loader(output=FakeSTTOutput(text="hi"))
+    FakeSnapshot.cached_path = str(tmp_path)
     CohereAsr().prepare()
     assert loader.load_calls[0]["model_path"] == str(tmp_path / "mlx-int8")
     assert "revision" not in loader.load_calls[0]
+    assert "local_files_only" not in loader.load_calls[0]
 
 
 def test_cohere_subfolder_download_failure_raises(
-    fake_loader: Callable[..., FakeLoader], monkeypatch: pytest.MonkeyPatch
+    fake_loader: Callable[..., FakeLoader],
 ) -> None:
-    # A snapshot-download failure surfaces as a clean DiscoveryError, not a raw OSError.
-    import huggingface_hub
-
-    def _boom(*_a: Any, **_k: Any) -> str:
-        raise OSError("offline")
-
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", _boom)
+    # A snapshot-download failure on the implicit path is a failed acquisition
+    # (protocol 1.1), with the native error preserved as the cause.
     fake_loader(output=FakeSTTOutput(text="hi"))
-    with pytest.raises(DiscoveryError, match="cohere-asr-mlx"):
+    FakeSnapshot.raise_on_download = OSError("offline")
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
         CohereAsr().prepare()
+    assert exc_info.value.reason == "failed"
+    assert isinstance(exc_info.value.__cause__, OSError)

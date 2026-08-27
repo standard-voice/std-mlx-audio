@@ -41,7 +41,7 @@ Public surface:
 
 from __future__ import annotations
 
-from ._config import MlxAudioConfig, MlxAudioParams, MlxDtype
+from ._config import MlxAudioConfig, MlxAudioParams
 from ._metadata import (
     MlxAudioProperties,
     ParakeetTdt06BV3Properties,
@@ -120,7 +120,6 @@ __all__ = [
     "MlxAudioParams",
     "MlxAudioProperties",
     "MlxAudioStreamingSession",
-    "MlxDtype",
     "Mms1BAll",
     "ModelBackend",
     "MoonshineTiny",
