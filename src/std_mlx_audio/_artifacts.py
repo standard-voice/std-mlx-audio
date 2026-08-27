@@ -32,6 +32,7 @@ from standard_asr.contract.artifacts import (
     ArtifactAction,
     ArtifactProgress,
     ArtifactProgressCallback,
+    ArtifactReport,
     ArtifactRequirement,
 )
 from standard_asr.contract.exceptions import ArtifactAcquisitionError
@@ -67,25 +68,47 @@ def _is_local_entry_not_found(exc: BaseException) -> bool:
     return isinstance(exc, LocalEntryNotFoundError)
 
 
-def _looks_like_checkpoint(root: Path) -> bool:
-    """Return whether a directory has the minimal MLX checkpoint shape.
+def _looks_like_checkpoint(root: Path, required_files: tuple[str, ...] = ()) -> bool:
+    """Return whether a directory is a provably complete MLX checkpoint.
 
     Resolution success only proves the snapshot directory exists; upstream
     documents that it cannot verify the files inside, so completeness is this
-    plugin's own check.
+    plugin's own check. A sharded checkpoint is complete only when EVERY file
+    in its safetensors index is present: the upstream loader globs whatever
+    shards exist and loads them with ``strict=False``, so a missing shard
+    would silently leave parameters at random init -- fluent garbage, the
+    cardinal sin.
 
     Args:
         root: Candidate checkpoint directory.
+        required_files: Extra preset-declared files that must exist (for
+            example the MMS base weights beside its per-language adapters).
 
     Returns:
-        ``True`` when a config and at least one weights file are present.
+        ``True`` when the config, the index closure, and every required file
+        are present.
     """
     if not (root / "config.json").is_file():
         return False
-    return any(root.glob("*.safetensors")) or any(root.glob("*.npz")) or any(root.glob("*.pth"))
+    for name in required_files:
+        if not (root / name).is_file():
+            return False
+    index = root / "model.safetensors.index.json"
+    if index.is_file():
+        import json
+
+        try:
+            weight_map = json.loads(index.read_text()).get("weight_map", {})
+            shards = {str(value) for value in weight_map.values()}
+        except Exception:
+            # An unreadable index cannot prove completeness.
+            return False
+        return bool(shards) and all((root / shard).is_file() for shard in shards)
+    # Upstream load_weights consumes safetensors and npz only.
+    return any(root.glob("*.safetensors")) or any(root.glob("*.npz"))
 
 
-def normalized_model_path(config: MlxAudioConfig) -> Path:
+def normalized_model_path(model_path: str) -> Path:
     """Return the operator ``model_path`` in its one canonical absolute form.
 
     Status inspection and the loader MUST agree on this form: expanding only
@@ -93,13 +116,12 @@ def normalized_model_path(config: MlxAudioConfig) -> Path:
     receives the raw string.
 
     Args:
-        config: Resolved engine configuration with ``model_path`` set.
+        model_path: The configured local checkpoint path.
 
     Returns:
         The expanded, resolved path.
     """
-    assert config.model_path is not None
-    return Path(config.model_path).expanduser().resolve()
+    return Path(model_path).expanduser().resolve()
 
 
 def _revision_is_pinned(revision: str | None) -> bool:
@@ -186,23 +208,32 @@ def _local_path_requirement(config: MlxAudioConfig) -> ArtifactRequirement:
     Returns:
         The single logical requirement for the operator-provided directory.
     """
-    path = normalized_model_path(config)
+    assert config.model_path is not None
+    path = normalized_model_path(config.model_path)
     if not path.exists():
         state = ARTIFACT_MISSING
         message: str | None = (
             f"Provide an MLX checkpoint directory at {path} (the configured "
             "model_path), or unset model_path to use the preset's Hub repo."
         )
+    elif path.is_file():
+        state = ARTIFACT_INCOMPLETE
+        message = (
+            f"The configured model_path {path} is a file; point it at the "
+            "MLX checkpoint DIRECTORY containing config.json and its weights."
+        )
     elif _looks_like_checkpoint(path):
         state = ARTIFACT_READY
         message = None
     else:
-        # The path exists but lacks the checkpoint shape; unknown never means
-        # ready, and the operator still gets a concrete next step.
-        state = ARTIFACT_UNKNOWN
+        # The directory exists but is provably not a complete checkpoint (the
+        # loader requires config.json, and an incomplete shard set would load
+        # with strict=False into fluent garbage). This check already ran and
+        # answered, so the state is incomplete, not unknown.
+        state = ARTIFACT_INCOMPLETE
         message = (
-            f"The configured model_path {path} exists but has no config.json "
-            "plus weights file; point it at the MLX checkpoint directory "
+            f"The configured model_path {path} has no config.json plus "
+            "complete weights; point it at the MLX checkpoint directory "
             "itself."
         )
 
@@ -224,7 +255,10 @@ def _local_path_requirement(config: MlxAudioConfig) -> ArtifactRequirement:
 
 
 def _hub_requirement(
-    config: MlxAudioConfig, hf_repo: str, subfolder: str | None
+    config: MlxAudioConfig,
+    hf_repo: str,
+    subfolder: str | None,
+    required_files: tuple[str, ...] = (),
 ) -> ArtifactRequirement:
     """Build the Hub-preset requirement from a cache-only resolution.
 
@@ -241,22 +275,25 @@ def _hub_requirement(
     try:
         resolved = snapshot(config, hf_repo, local_files_only=True)
     except Exception as exc:
-        if _is_local_entry_not_found(exc):
-            # The documented not-in-cache outcome of an offline resolution:
-            # the one failure that is reliable evidence of a missing snapshot.
-            state = ARTIFACT_MISSING
-        else:
-            # Anything else (the resolution stack unavailable, an unreadable
-            # cache, a permission failure) is not evidence of absence;
-            # unknown never means ready, and it never claims missing either.
-            state = ARTIFACT_UNKNOWN
+        # Only the documented not-in-cache failure is reliable evidence of a
+        # missing snapshot; anything else (the resolution stack unavailable,
+        # an unreadable cache, a permission failure) is not evidence of
+        # absence -- unknown never means ready, and never claims missing.
+        state = ARTIFACT_MISSING if _is_local_entry_not_found(exc) else ARTIFACT_UNKNOWN
     else:
         # Resolution success only proves the snapshot directory exists;
         # completeness (and the preset's subfolder) is this plugin's check.
         # An interrupted download is repairable: a later online resolution
         # fetches only the files that are absent.
         location = resolved / subfolder if subfolder is not None else resolved
-        state = ARTIFACT_READY if _looks_like_checkpoint(location) else ARTIFACT_INCOMPLETE
+        if location.is_dir() and _looks_like_checkpoint(location, required_files):
+            state = ARTIFACT_READY
+        else:
+            state = ARTIFACT_INCOMPLETE
+            if not location.is_dir():
+                # The preset's subfolder is not in the snapshot yet; report
+                # the content that DOES exist (the snapshot root).
+                location = resolved
 
     # Prefer the resolved commit over the configured mutable reference: two
     # engines resolving the same snapshot must report the same version, and a
@@ -292,13 +329,18 @@ def _hub_requirement(
         source_is_mutable=not _revision_is_pinned(config.revision),
         acquisition_blocker=blocker,
         location=location,
-        size_bytes=_tree_size_bytes(location) if state == ARTIFACT_READY and location else None,
+        # The present logical size is reported for incomplete content too --
+        # exactly what an operator wants to see for an interrupted download.
+        size_bytes=_tree_size_bytes(location) if location is not None else None,
         artifact_version=artifact_version,
     )
 
 
 def status_requirement(
-    config: MlxAudioConfig, hf_repo: str, subfolder: str | None
+    config: MlxAudioConfig,
+    hf_repo: str,
+    subfolder: str | None,
+    required_files: tuple[str, ...] = (),
 ) -> ArtifactRequirement:
     """Report the engine's one logical requirement for the resolved config.
 
@@ -306,16 +348,21 @@ def status_requirement(
         config: Resolved engine configuration.
         hf_repo: The preset's Hugging Face repo id.
         subfolder: Optional checkpoint subfolder inside the snapshot.
+        required_files: Preset-declared files that must exist for readiness.
 
     Returns:
         The requirement for either the operator path or the Hub preset.
     """
     if config.model_path is not None:
         return _local_path_requirement(config)
-    return _hub_requirement(config, hf_repo, subfolder)
+    return _hub_requirement(config, hf_repo, subfolder, required_files)
 
 
-def raise_for_gated_source(exc: BaseException, hf_repo: str) -> None:
+def raise_for_gated_source(
+    exc: BaseException,
+    hf_repo: str,
+    report: ArtifactReport | None = None,
+) -> None:
     """Translate a gated or unauthenticated Hub rejection into actions.
 
     Shared by the explicit acquisition hook and the implicit first-use path:
@@ -325,6 +372,7 @@ def raise_for_gated_source(exc: BaseException, hf_repo: str) -> None:
     Args:
         exc: The native failure raised by the Hub client.
         hf_repo: The preset's Hugging Face repo id, for the message.
+        report: The preflight report to attach, when the caller has one.
 
     Returns:
         None when the failure is not an access problem.
@@ -345,6 +393,7 @@ def raise_for_gated_source(exc: BaseException, hf_repo: str) -> None:
         raise ArtifactAcquisitionError(
             f"The {hf_repo} repository is gated.",
             reason="action_required",
+            report=report,
             required_actions=(
                 ArtifactAction(
                     kind=ARTIFACT_ACTION_REQUEST_ACCESS,
@@ -361,6 +410,7 @@ def raise_for_gated_source(exc: BaseException, hf_repo: str) -> None:
         raise ArtifactAcquisitionError(
             f"The {hf_repo} repository rejected the request as unauthenticated.",
             reason="action_required",
+            report=report,
             required_actions=(
                 ArtifactAction(
                     kind=ARTIFACT_ACTION_AUTHENTICATE,
@@ -397,8 +447,7 @@ def acquire(
     """
     if config.local_files_only or not allow_downloads():
         raise ArtifactAcquisitionError(
-            "Acquisition needs a network transfer, and downloads are disabled "
-            "for this engine.",
+            "Acquisition needs a network transfer, and downloads are disabled for this engine.",
             reason="downloads_disabled",
             hint=(
                 "Unset local_files_only and set STANDARD_ASR_ALLOW_DOWNLOAD=1 "

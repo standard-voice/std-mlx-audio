@@ -183,9 +183,7 @@ def test_model_path_missing_needs_provide_artifacts(
     assert action.kind == "provide_artifacts"
 
 
-def test_model_path_ready_directory(
-    fake_loader: Callable[..., FakeLoader], tmp_path: Path
-) -> None:
+def test_model_path_ready_directory(fake_loader: Callable[..., FakeLoader], tmp_path: Path) -> None:
     fake_loader()
     local = _mlx_dir(tmp_path)
     (requirement,) = WhisperTiny(model_path=str(local)).artifact_status().requirements
@@ -194,18 +192,106 @@ def test_model_path_ready_directory(
     assert requirement.size_bytes == 18
 
 
-def test_model_path_without_checkpoint_shape_is_unknown_with_guidance(
+def test_model_path_without_checkpoint_shape_is_incomplete_with_guidance(
     fake_loader: Callable[..., FakeLoader], tmp_path: Path
 ) -> None:
-    # The most common operator mistake (pointing one level too high) gets the
-    # same concrete next step as an absent path, not a bare unsupported.
+    # The most common operator mistake (pointing one level too high) is
+    # provably not a complete checkpoint -- the check already ran and
+    # answered, so the state is incomplete, with a concrete next step.
     fake_loader()
     (requirement,) = WhisperTiny(model_path=str(tmp_path)).artifact_status().requirements
-    assert requirement.state == ARTIFACT_UNKNOWN
+    assert requirement.state == "incomplete"
     assert requirement.acquisition_blocker == "action_required"
     (action,) = requirement.required_actions
     assert action.kind == "provide_artifacts"
     assert "config.json" in action.message
+
+
+def test_model_path_pointing_at_a_file_is_incomplete(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    fake_loader()
+    target = tmp_path / "model.safetensors"
+    target.write_bytes(b"\x00")
+    (requirement,) = WhisperTiny(model_path=str(target)).artifact_status().requirements
+    assert requirement.state == "incomplete"
+    (action,) = requirement.required_actions
+    assert "DIRECTORY" in action.message
+
+
+def test_prepare_incomplete_model_path_is_unavailable(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # The guard translates the already-answered incompleteness instead of a
+    # strict=False load producing fluent garbage or an opaque native failure.
+    fake_loader()
+    with pytest.raises(ArtifactUnavailableError) as exc_info:
+        WhisperTiny(model_path=str(tmp_path)).prepare()
+    assert exc_info.value.reason == "incomplete"
+
+
+def test_sharded_checkpoint_missing_a_shard_is_incomplete(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # A partial shard set would load with strict=False into random weights --
+    # fluent garbage. The safetensors index is the completeness authority.
+    import json
+
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    index = {
+        "weight_map": {
+            "a.weight": "model-00001-of-00002.safetensors",
+            "b.weight": "model-00002-of-00002.safetensors",
+        }
+    }
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps(index))
+    (snapshot / "model-00001-of-00002.safetensors").write_bytes(b"\x00")
+    FakeSnapshot.cached_path = str(snapshot)
+    (requirement,) = WhisperTiny().artifact_status().requirements
+    assert requirement.state == "incomplete"
+    # The second shard arrives; the same snapshot is now provably complete.
+    (snapshot / "model-00002-of-00002.safetensors").write_bytes(b"\x00")
+    (requirement,) = WhisperTiny().artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+
+
+def test_mms_requires_the_base_weights_beside_adapters(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # config.json plus a single language adapter must NOT report ready: the
+    # base encoder is required_snapshot_files on the preset.
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "adapter.fra.safetensors").write_bytes(b"\x00")
+    FakeSnapshot.cached_path = str(snapshot)
+    (requirement,) = Mms1BAll().artifact_status().requirements
+    assert requirement.state == "incomplete"
+    (snapshot / "model.safetensors").write_bytes(b"\x00")
+    (requirement,) = Mms1BAll().artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+
+
+def test_loader_receives_name_parts_for_model_path_too(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # The routing fix is symmetric: an operator checkpoint for a preset whose
+    # repo config omits model_type must not infer its family from an
+    # arbitrary directory name.
+    from std_mlx_audio import ParakeetTdt06BV3
+
+    loader = fake_loader()
+    local = tmp_path / "ckpt"
+    local.mkdir()
+    (local / "config.json").write_text("{}")
+    (local / "model.safetensors").write_bytes(b"\x00")
+    ParakeetTdt06BV3(model_path=str(local)).prepare()
+    parts = loader.load_calls[0]["model_name_parts"]
+    assert parts and parts[0] == "parakeet"
 
 
 # --------------------------------------------------------------------------- #
@@ -237,9 +323,7 @@ def test_pull_acquires_and_reports_ready(
     assert FakeSnapshot.last_kwargs["local_files_only"] is True  # final status query
 
 
-def test_pull_never_loads_or_primes(
-    fake_loader: Callable[..., FakeLoader], tmp_path: Path
-) -> None:
+def test_pull_never_loads_or_primes(fake_loader: Callable[..., FakeLoader], tmp_path: Path) -> None:
     loader = fake_loader()
     FakeSnapshot.download_target = str(_snapshot_dir(tmp_path))
     WhisperTiny().acquire_artifacts()

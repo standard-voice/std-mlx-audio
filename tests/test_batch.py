@@ -73,9 +73,7 @@ def test_transcribe_loads_preset_repo(fake_loader: Callable[..., FakeLoader]) ->
     assert loader.load_calls[0]["model_path"] == FAKE_SNAPSHOT_DIR
 
 
-def test_model_path_override_wins(
-    fake_loader: Callable[..., FakeLoader], tmp_path: Path
-) -> None:
+def test_model_path_override_wins(fake_loader: Callable[..., FakeLoader], tmp_path: Path) -> None:
     # The artifact guard inspects the path before loading, so the override must
     # be a real MLX checkpoint directory.
     (tmp_path / "config.json").write_text("{}")
@@ -113,6 +111,7 @@ def test_local_files_only_config_forces_local(
     Qwen3Asr06B(local_files_only=True).prepare()
     assert FakeSnapshot.last_kwargs["local_files_only"] is True
     assert FakeSnapshot.download_calls == 0
+    assert loader.load_calls[0]["model_path"] == FAKE_SNAPSHOT_DIR
 
 
 def test_download_enabled_allows_network(

@@ -321,7 +321,9 @@ def test_build_events_segment_without_end_never_settles(
         WhisperTiny(), RuntimeParams(), settle_margin_s=0.0, max_window_s=None
     )
     session._window = np.zeros(16000 * 10, dtype=np.float32)
-    events = session._build_events([Segment(text="no end yet", start=None, end=None)], cursor=10.0, final_pass=False)
+    events = session._build_events(
+        [Segment(text="no end yet", start=None, end=None)], cursor=10.0, final_pass=False
+    )
     (partial,) = events
     assert partial.type == "partial"
     assert partial.start is None and partial.end is None

@@ -79,6 +79,16 @@ This pulls `mlx-audio[stt]` (which pulls `mlx`, `mlx-lm`, `transformers`) and
 Hub on first use (set `STANDARD_ASR_ALLOW_DOWNLOAD=1` if your environment disables
 downloads). Once published to PyPI this becomes `uv pip install std-mlx-audio`.
 
+**Artifact lifecycle (protocol 1.1).** `standard-asr status mlx-audio/<model>`
+reports whether the preset's snapshot is cached and provably complete (a
+sharded checkpoint is ready only when every file in its safetensors index is
+present; MMS additionally requires the base weights beside its per-language
+adapters). `standard-asr pull` acquires or repairs the snapshot without
+loading or priming a model; `pull --refresh` re-resolves a mutable revision
+(a pinned 40-hex commit is immutable and a no-op). With
+`local_files_only=true` the engine refuses every network transfer, including
+a refresh.
+
 ## Use
 
 ### CLI (no code)

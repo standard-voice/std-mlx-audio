@@ -42,6 +42,7 @@ from standard_asr import (
 )
 from standard_asr.audio.format import AudioFormat
 from standard_asr.contract.artifacts import (
+    ARTIFACT_INCOMPLETE,
     ARTIFACT_MISSING,
     ARTIFACT_READY,
     ArtifactContext,
@@ -65,10 +66,10 @@ from standard_asr.engine import (
     DeclaredEngineMetadata,
     Diagnostic,
     EngineBase,
+    Mode,
     PreparedAudio,
 )
 from standard_asr.runtime.downloads import allow_downloads
-from standard_asr.runtime.gating import Mode
 
 from . import backends
 from ._artifacts import (
@@ -162,6 +163,11 @@ class MlxAudioASR(EngineBase):
     #: ``mlx-int8/``). When set, the loader snapshot-downloads the repo and points
     #: ``load`` at ``<snapshot>/<subfolder>``. ``None`` (default) loads from root.
     hf_subfolder: ClassVar[str | None] = None
+    #: Files that MUST exist in the resolved snapshot for readiness, beyond the
+    #: generic checkpoint shape (config.json + weights / a complete shard
+    #: index). MMS uses it: its base weights sit beside 1198 per-language
+    #: adapters, and any single adapter would satisfy a bare glob.
+    required_snapshot_files: ClassVar[tuple[str, ...]] = ()
 
     #: Static upper bounds shared by every preset in this plugin-owned family:
     #: each Hub preset supports explicit snapshot acquisition (plugin-side
@@ -281,17 +287,30 @@ class MlxAudioASR(EngineBase):
         # acquisition or an engine-execution fault. The report on a guard
         # error is built from this same requirement (no second inspection, no
         # TOCTOU window) with the caller's mode.
-        requirement = status_requirement(config, type(self).hf_repo, type(self).hf_subfolder)
+        requirement = status_requirement(
+            config,
+            type(self).hf_repo,
+            type(self).hf_subfolder,
+            type(self).required_snapshot_files,
+        )
         report = ArtifactReport.from_requirements(
             mode=mode, applicable=True, requirements=(requirement,)
         )
         if requirement.state != ARTIFACT_READY:
-            if config.model_path is not None and requirement.state == ARTIFACT_MISSING:
+            if config.model_path is not None and requirement.state in (
+                ARTIFACT_MISSING,
+                ARTIFACT_INCOMPLETE,
+            ):
+                # The status check already ran and answered (the path is
+                # absent, a file, or provably not a complete checkpoint); the
+                # loader would only turn that knowledge into an opaque native
+                # failure -- or fluent garbage via a strict=False load.
                 raise ArtifactUnavailableError(
-                    f"The configured model_path {config.model_path!r} does not exist.",
-                    reason="missing",
+                    f"The configured model_path {config.model_path!r} is not a "
+                    f"usable MLX checkpoint (state: {requirement.state}).",
+                    reason=cast("Any", requirement.state),
                     report=report,
-                    hint="Provide the MLX checkpoint directory or unset model_path.",
+                    hint="Provide the complete MLX checkpoint directory or unset model_path.",
                 )
             if config.model_path is None and local_only:
                 raise ArtifactUnavailableError(
@@ -312,7 +331,7 @@ class MlxAudioASR(EngineBase):
         # The path uses the same canonical form status inspected.
         load_kwargs: dict[str, Any] = {}
         if config.model_path is not None:
-            model_source: str = str(normalized_model_path(config))
+            model_source: str = str(normalized_model_path(config.model_path))
         else:
             try:
                 snapshot_root = resolve_for_load(
@@ -324,7 +343,7 @@ class MlxAudioASR(EngineBase):
                 # The resolution was the allowed implicit acquisition path. An
                 # access rejection carries its discovered action (the reason
                 # comes from the blocker, not from which code path noticed).
-                raise_for_gated_source(exc, type(self).hf_repo)
+                raise_for_gated_source(exc, type(self).hf_repo, report)
                 raise ArtifactAcquisitionError(
                     f"First-use acquisition of the {type(self).hf_repo} "
                     f"snapshot failed: {type(exc).__name__}.",
@@ -337,15 +356,18 @@ class MlxAudioASR(EngineBase):
             # config.json at the path root, so point it at the subfolder.
             subfolder = type(self).hf_subfolder
             model_source = str(snapshot_root / subfolder if subfolder else snapshot_root)
-            # Upstream infers the model family from the LAST path component
-            # when config.json omits model_type (NeMo-format repos): a local
-            # snapshot path would feed it the commit hash, so hand it the
-            # repo-derived name parts explicitly.
-            from mlx_audio.utils import (  # pyright: ignore[reportMissingImports]
-                get_model_name_parts,
-            )
+        # Upstream infers the model family from the LAST path component when
+        # config.json omits model_type (NeMo-format repos): a local path --
+        # snapshot or operator-provided -- would feed it the commit hash or an
+        # arbitrary directory name, so hand it the repo-derived name parts
+        # explicitly on both branches (the preset knows its family by
+        # construction; _verify_model_family stays the loud backstop for a
+        # mismatched checkpoint).
+        from mlx_audio.utils import (  # pyright: ignore[reportMissingImports]
+            get_model_name_parts,
+        )
 
-            load_kwargs["model_name_parts"] = get_model_name_parts(type(self).hf_repo)
+        load_kwargs["model_name_parts"] = get_model_name_parts(type(self).hf_repo)
         # A few repos mislabel their config.json model_type (e.g. MMS says
         # "wav2vec2"); the preset pins the family so the loader does not mis-route.
         if type(self).load_model_type is not None:
@@ -373,7 +395,7 @@ class MlxAudioASR(EngineBase):
         and then streams from a session pump thread. Priming with 0.1 s of
         silence ON THIS THREAD pins the stream state here; afterwards,
         generates from any thread are stable (both orders verified
-        empirically; present on at least mlx 0.31–0.32 / mlx-audio 0.4.4–0.4.5,
+        empirically; present on at least mlx 0.31-0.32 / mlx-audio 0.4.4-0.4.5,
         so this is not version-gated). It also pre-compiles the Metal kernels,
         making the load a real warmup.
 
@@ -477,7 +499,12 @@ class MlxAudioASR(EngineBase):
             One requirement: the Hub snapshot or the operator-provided path.
         """
         config = cast(MlxAudioConfig, self.config)
-        requirement = status_requirement(config, type(self).hf_repo, type(self).hf_subfolder)
+        requirement = status_requirement(
+            config,
+            type(self).hf_repo,
+            type(self).hf_subfolder,
+            type(self).required_snapshot_files,
+        )
         return True, (requirement,), ()
 
     def _acquire_artifacts(
@@ -1235,6 +1262,9 @@ class Mms1BAll(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "facebook/mms-1b-all"
+    #: The base encoder weights sit BESIDE 1198 per-language adapter files, so
+    #: a bare weights glob would report ready with only an adapter present.
+    required_snapshot_files: ClassVar[tuple[str, ...]] = ("model.safetensors",)
     backend: ClassVar[ModelBackend] = GenericSttBackend(SttFamilySpec(model_types=("mms",)))
     properties: ClassVar[BaseProperties] = stt_properties(
         model_name="mms-1b-all",
