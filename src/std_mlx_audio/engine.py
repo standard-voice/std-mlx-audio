@@ -46,6 +46,7 @@ from standard_asr.contract.artifacts import (
     ARTIFACT_READY,
     ArtifactContext,
     ArtifactProgressCallback,
+    ArtifactReport,
     ArtifactRequirement,
 )
 from standard_asr.contract.capabilities import DeclaredCapabilities
@@ -67,9 +68,17 @@ from standard_asr.engine import (
     PreparedAudio,
 )
 from standard_asr.runtime.downloads import allow_downloads
+from standard_asr.runtime.gating import Mode
 
 from . import backends
-from ._artifacts import HUB_ARTIFACT_ID, acquire, resolve_for_load, status_requirement
+from ._artifacts import (
+    HUB_ARTIFACT_ID,
+    acquire,
+    normalized_model_path,
+    raise_for_gated_source,
+    resolve_for_load,
+    status_requirement,
+)
 from ._config import MlxAudioConfig, MlxAudioParams
 from ._metadata import (
     _PARAKEET_CAPABILITIES,
@@ -197,17 +206,35 @@ class MlxAudioASR(EngineBase):
             The underlying mlx-audio model instance (an ``nn.Module``).
 
         Raises:
-            DiscoveryError: If mlx-audio is missing or weights cannot load.
+            DiscoveryError: If mlx-audio is not installed.
+            ArtifactUnavailableError: If required artifacts cannot resolve
+                under the current policy.
+            ArtifactAcquisitionError: If an allowed first-use acquisition
+                fails.
+            TranscriptionError: If a locally available model fails to load.
         """
         self._ensure_model_loaded()
         assert self._model is not None  # _ensure_model_loaded raises otherwise
         return self._model
 
-    def ensure_loaded(self) -> None:
-        """Public alias for the lazy loader (used by the streaming session)."""
-        self._ensure_model_loaded()
+    def ensure_loaded(self, *, mode: Mode = "batch") -> None:
+        """Public alias for the lazy loader (used by the streaming session).
 
-    def _ensure_model_loaded(self) -> None:
+        Args:
+            mode: The inference mode whose path is loading; artifact errors
+                raised here carry a report resolved for this mode.
+
+        Raises:
+            DiscoveryError: If mlx-audio is not installed.
+            ArtifactUnavailableError: If required artifacts cannot resolve
+                under the current policy.
+            ArtifactAcquisitionError: If an allowed first-use acquisition
+                fails.
+            TranscriptionError: If a locally available model fails to load.
+        """
+        self._ensure_model_loaded(mode=mode)
+
+    def _ensure_model_loaded(self, *, mode: Mode = "batch") -> None:
         """Load the MLX model lazily via ``mlx_audio.stt.load``.
 
         The artifact guard runs first, then the snapshot is resolved
@@ -251,30 +278,41 @@ class MlxAudioASR(EngineBase):
         local_only = config.local_files_only or not allow_downloads()
         # The artifact guard: the same cheap inspection artifact_status()
         # reports. It decides whether a failure below is a failed implicit
-        # acquisition or an engine-execution fault.
+        # acquisition or an engine-execution fault. The report on a guard
+        # error is built from this same requirement (no second inspection, no
+        # TOCTOU window) with the caller's mode.
         requirement = status_requirement(config, type(self).hf_repo, type(self).hf_subfolder)
+        report = ArtifactReport.from_requirements(
+            mode=mode, applicable=True, requirements=(requirement,)
+        )
         if requirement.state != ARTIFACT_READY:
             if config.model_path is not None and requirement.state == ARTIFACT_MISSING:
                 raise ArtifactUnavailableError(
                     f"The configured model_path {config.model_path!r} does not exist.",
                     reason="missing",
-                    report=self.artifact_status(),
+                    report=report,
                     hint="Provide the MLX checkpoint directory or unset model_path.",
                 )
             if config.model_path is None and local_only:
                 raise ArtifactUnavailableError(
-                    f"The {type(self).hf_repo} snapshot is not cached and "
-                    "downloads are disabled.",
+                    f"The {type(self).hf_repo} snapshot is not fully cached "
+                    f"(state: {requirement.state}) and downloads are disabled.",
                     reason="downloads_disabled",
-                    report=self.artifact_status(),
+                    report=report,
                     hint=(
-                        "Run 'standard-asr pull' with downloads enabled, or set "
-                        "STANDARD_ASR_ALLOW_DOWNLOAD=1."
+                        "Enable downloads (unset local_files_only and set "
+                        "STANDARD_ASR_ALLOW_DOWNLOAD=1), then run "
+                        "'standard-asr pull'."
                     ),
                 )
+            # A model_path in state unknown is deliberately attempted: unknown
+            # is not evidence of unavailability (AR.2), and the loader is the
+            # authoritative check for an unrecognized local layout.
         # Model selection is by preset (spec IC.7); a local model_path wins.
+        # The path uses the same canonical form status inspected.
+        load_kwargs: dict[str, Any] = {}
         if config.model_path is not None:
-            model_source: str = config.model_path
+            model_source: str = str(normalized_model_path(config))
         else:
             try:
                 snapshot_root = resolve_for_load(
@@ -283,11 +321,15 @@ class MlxAudioASR(EngineBase):
                     ready=requirement.state == ARTIFACT_READY,
                 )
             except Exception as exc:
-                # The resolution was the allowed implicit acquisition path.
+                # The resolution was the allowed implicit acquisition path. An
+                # access rejection carries its discovered action (the reason
+                # comes from the blocker, not from which code path noticed).
+                raise_for_gated_source(exc, type(self).hf_repo)
                 raise ArtifactAcquisitionError(
                     f"First-use acquisition of the {type(self).hf_repo} "
                     f"snapshot failed: {type(exc).__name__}.",
                     reason="failed",
+                    report=report,
                     hint="Run 'standard-asr pull' to acquire it explicitly.",
                 ) from exc
             # Some repos keep the checkpoint in a subfolder (e.g. Cohere-ASR
@@ -295,7 +337,15 @@ class MlxAudioASR(EngineBase):
             # config.json at the path root, so point it at the subfolder.
             subfolder = type(self).hf_subfolder
             model_source = str(snapshot_root / subfolder if subfolder else snapshot_root)
-        load_kwargs: dict[str, Any] = {}
+            # Upstream infers the model family from the LAST path component
+            # when config.json omits model_type (NeMo-format repos): a local
+            # snapshot path would feed it the commit hash, so hand it the
+            # repo-derived name parts explicitly.
+            from mlx_audio.utils import (  # pyright: ignore[reportMissingImports]
+                get_model_name_parts,
+            )
+
+            load_kwargs["model_name_parts"] = get_model_name_parts(type(self).hf_repo)
         # A few repos mislabel their config.json model_type (e.g. MMS says
         # "wav2vec2"); the preset pins the family so the loader does not mis-route.
         if type(self).load_model_type is not None:

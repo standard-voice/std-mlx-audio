@@ -331,8 +331,11 @@ def test_build_events_segment_without_end_never_settles(
 def test_build_events_window_cap_stops_at_segment_without_end(
     fake_loader: Callable[..., FakeLoader],
 ) -> None:
-    # The bounded-window force-finalize cannot force past a segment whose end
-    # is unknown: there is nothing to trim to, so the cap stops honestly.
+    # The bounded-window force-finalize stops at a segment whose end is
+    # unknown: finalizing it would leave its audio untrimmable (the trim
+    # anchor is the last settled end), and re-decoding that audio next pass
+    # would duplicate the finalized text as new segments. The bound degrades
+    # honestly (with a one-shot warning) instead.
     import numpy as np
     from standard_asr import RuntimeParams
     from standard_asr.contract.results import Segment
@@ -347,3 +350,33 @@ def test_build_events_window_cap_stops_at_segment_without_end(
     segments = [Segment(text="a", start=None, end=None), Segment(text="b", start=0.0, end=9.5)]
     session._build_events(segments, cursor=10.0, final_pass=False)
     assert session._finalized_count == 0
+
+
+def test_build_events_window_cap_forces_ended_segments(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # The cap's actual work: segments too close to the frontier to settle are
+    # force-finalized (oldest first) until trimming bounds the window again.
+    import numpy as np
+    from standard_asr import RuntimeParams
+    from standard_asr.contract.results import Segment
+
+    from std_mlx_audio._streaming import MlxAudioStreamingSession
+
+    fake_loader(output=FakeSTTOutput(text="x"))
+    session = MlxAudioStreamingSession(
+        WhisperTiny(), RuntimeParams(), settle_margin_s=100.0, max_window_s=2.0
+    )
+    session._window = np.zeros(16000 * 10, dtype=np.float32)
+    segments = [
+        Segment(text="a", start=0.0, end=7.5),
+        Segment(text="b", start=7.5, end=9.0),
+        Segment(text="c", start=9.0, end=9.8),
+    ]
+    events = session._build_events(segments, cursor=10.0, final_pass=False)
+    # Trimming to 9.0 leaves a 1.0 s window (within the 2.0 s cap), so the
+    # first two segments were force-finalized and the third stays partial.
+    finals = [e for e in events if e.type == "final"]
+    assert [e.text for e in finals] == ["a", "b"]
+    assert session._finalized_count == 2
+    assert session._window.size == 16000  # 1.0 s left after the trim

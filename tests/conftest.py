@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -122,9 +123,26 @@ class FakeLoader:
         return self.model
 
 
+def _make_fake_snapshot_dir() -> str:
+    """Create one REAL checkpoint-shaped snapshot directory for the fakes.
+
+    The plugin's status path verifies completeness on disk (config.json plus a
+    weights file), so the default fake resolution must point at a directory
+    that actually has that shape.
+    """
+    import tempfile
+
+    root = Path(tempfile.mkdtemp(prefix="std-mlx-fake-")) / "snapshots" / ("deadbeef" * 5)
+    root.mkdir(parents=True)
+    (root / "config.json").write_text("{}")
+    (root / "model.safetensors").write_bytes(b"\x00" * 8)
+    return str(root)
+
+
 #: The path the fake snapshot resolution returns for an online "download" when
-#: a test has not staged a concrete cache directory.
-FAKE_SNAPSHOT_DIR = "/fake/snapshots/deadbeef"
+#: a test has not staged a concrete cache directory. A real checkpoint-shaped
+#: directory (see ``_make_fake_snapshot_dir``).
+FAKE_SNAPSHOT_DIR = _make_fake_snapshot_dir()
 
 
 class FakeSnapshot:
@@ -138,7 +156,12 @@ class FakeSnapshot:
 
     cached_path: str | None = None
     download_target: str | None = None
+    #: Raised by a cache-only resolution (models an unreadable cache).
+    raise_on_resolve: BaseException | None = None
     raise_on_download: BaseException | None = None
+    #: Optional side effect run by an online call (models the transfer
+    #: materializing files, e.g. completing a partial snapshot).
+    on_download: Any = None
     last_kwargs: dict[str, Any] = {}
     #: Kwargs of the last ONLINE call only (a later cache-only status query
     #: overwrites ``last_kwargs``, so acquisition tests read this one).
@@ -149,7 +172,9 @@ class FakeSnapshot:
     def reset(cls) -> None:
         cls.cached_path = None
         cls.download_target = None
+        cls.raise_on_resolve = None
         cls.raise_on_download = None
+        cls.on_download = None
         cls.last_kwargs = {}
         cls.last_download_kwargs = {}
         cls.download_calls = 0
@@ -174,13 +199,22 @@ def _fake_snapshot_download(
         "allow_patterns": allow_patterns,
     }
     if local_files_only:
+        if FakeSnapshot.raise_on_resolve is not None:
+            raise FakeSnapshot.raise_on_resolve
         if FakeSnapshot.cached_path is None:
-            raise FileNotFoundError("snapshot is not cached locally")
+            # Mirror the real helper: not-in-cache surfaces as the documented
+            # LocalEntryNotFoundError, the one failure the plugin may read as
+            # reliable evidence of a missing snapshot.
+            from huggingface_hub.errors import LocalEntryNotFoundError
+
+            raise LocalEntryNotFoundError("snapshot is not cached locally")
         return FakeSnapshot.cached_path
     FakeSnapshot.last_download_kwargs = dict(FakeSnapshot.last_kwargs)
     FakeSnapshot.download_calls += 1
     if FakeSnapshot.raise_on_download is not None:
         raise FakeSnapshot.raise_on_download
+    if FakeSnapshot.on_download is not None:
+        FakeSnapshot.on_download()
     if FakeSnapshot.download_target is not None:
         FakeSnapshot.cached_path = FakeSnapshot.download_target
     return FakeSnapshot.cached_path or FAKE_SNAPSHOT_DIR

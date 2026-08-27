@@ -19,12 +19,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from standard_asr.contract.artifacts import (
+    ARTIFACT_ACTION_AUTHENTICATE,
     ARTIFACT_ACTION_PROVIDE_ARTIFACTS,
     ARTIFACT_ACTION_REQUEST_ACCESS,
     ARTIFACT_BLOCKER_ACTION_REQUIRED,
     ARTIFACT_BLOCKER_DOWNLOADS_DISABLED,
-    ARTIFACT_BLOCKER_UNSUPPORTED,
-    ARTIFACT_CORRUPT,
+    ARTIFACT_INCOMPLETE,
     ARTIFACT_MISSING,
     ARTIFACT_PROGRESS_TRANSFERRING,
     ARTIFACT_READY,
@@ -47,6 +47,59 @@ LOCAL_ARTIFACT_ID = "mlx-local-path"
 
 #: A full commit hash pins the snapshot; anything else is a mutable reference.
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _is_local_entry_not_found(exc: BaseException) -> bool:
+    """Return whether a resolution failure is the documented cache miss.
+
+    Args:
+        exc: The failure raised by a cache-only resolution.
+
+    Returns:
+        ``True`` only for the upstream ``LocalEntryNotFoundError`` class.
+    """
+    try:
+        from huggingface_hub.errors import (  # pyright: ignore[reportMissingModuleSource]
+            LocalEntryNotFoundError,
+        )
+    except Exception:
+        return False
+    return isinstance(exc, LocalEntryNotFoundError)
+
+
+def _looks_like_checkpoint(root: Path) -> bool:
+    """Return whether a directory has the minimal MLX checkpoint shape.
+
+    Resolution success only proves the snapshot directory exists; upstream
+    documents that it cannot verify the files inside, so completeness is this
+    plugin's own check.
+
+    Args:
+        root: Candidate checkpoint directory.
+
+    Returns:
+        ``True`` when a config and at least one weights file are present.
+    """
+    if not (root / "config.json").is_file():
+        return False
+    return any(root.glob("*.safetensors")) or any(root.glob("*.npz")) or any(root.glob("*.pth"))
+
+
+def normalized_model_path(config: MlxAudioConfig) -> Path:
+    """Return the operator ``model_path`` in its one canonical absolute form.
+
+    Status inspection and the loader MUST agree on this form: expanding only
+    on the status side would report a tilde path as ready while the loader
+    receives the raw string.
+
+    Args:
+        config: Resolved engine configuration with ``model_path`` set.
+
+    Returns:
+        The expanded, resolved path.
+    """
+    assert config.model_path is not None
+    return Path(config.model_path).expanduser().resolve()
 
 
 def _revision_is_pinned(revision: str | None) -> bool:
@@ -119,7 +172,9 @@ def snapshot(config: MlxAudioConfig, hf_repo: str, *, local_files_only: bool) ->
         token=token,
         allow_patterns=_allow_patterns(),
     )
-    return Path(resolved)
+    # A relative download_root yields a relative snapshot path; the report's
+    # location field requires (and callers deserve) the absolute form.
+    return Path(resolved).expanduser().resolve()
 
 
 def _local_path_requirement(config: MlxAudioConfig) -> ArtifactRequirement:
@@ -131,35 +186,25 @@ def _local_path_requirement(config: MlxAudioConfig) -> ArtifactRequirement:
     Returns:
         The single logical requirement for the operator-provided directory.
     """
-    assert config.model_path is not None
-    path = Path(config.model_path).expanduser().resolve()
+    path = normalized_model_path(config)
     if not path.exists():
         state = ARTIFACT_MISSING
-    elif (path / "config.json").is_file() and any(path.glob("*.safetensors")):
-        state = ARTIFACT_READY
-    else:
-        # The path exists but the MLX checkpoint shape cannot be cheaply
-        # confirmed; unknown never means ready.
-        state = ARTIFACT_UNKNOWN
-
-    if state == ARTIFACT_READY:
-        blocker = None
-        actions: tuple[ArtifactAction, ...] = ()
-    elif state == ARTIFACT_MISSING:
-        blocker = ARTIFACT_BLOCKER_ACTION_REQUIRED
-        actions = (
-            ArtifactAction(
-                kind=ARTIFACT_ACTION_PROVIDE_ARTIFACTS,
-                message=(
-                    f"Provide an MLX checkpoint directory at {path} (the "
-                    "configured model_path), or unset model_path to use the "
-                    "preset's Hub repo."
-                ),
-            ),
+        message: str | None = (
+            f"Provide an MLX checkpoint directory at {path} (the configured "
+            "model_path), or unset model_path to use the preset's Hub repo."
         )
+    elif _looks_like_checkpoint(path):
+        state = ARTIFACT_READY
+        message = None
     else:
-        blocker = ARTIFACT_BLOCKER_UNSUPPORTED
-        actions = ()
+        # The path exists but lacks the checkpoint shape; unknown never means
+        # ready, and the operator still gets a concrete next step.
+        state = ARTIFACT_UNKNOWN
+        message = (
+            f"The configured model_path {path} exists but has no config.json "
+            "plus weights file; point it at the MLX checkpoint directory "
+            "itself."
+        )
 
     return ArtifactRequirement(
         artifact_id=LOCAL_ARTIFACT_ID,
@@ -169,8 +214,10 @@ def _local_path_requirement(config: MlxAudioConfig) -> ArtifactRequirement:
         can_acquire_now=False,
         may_acquire_during_inference=False,
         source_is_mutable=False,
-        acquisition_blocker=blocker,
-        required_actions=actions,
+        acquisition_blocker=None if state == ARTIFACT_READY else ARTIFACT_BLOCKER_ACTION_REQUIRED,
+        required_actions=()
+        if message is None
+        else (ArtifactAction(kind=ARTIFACT_ACTION_PROVIDE_ARTIFACTS, message=message),),
         location=path if path.exists() else None,
         size_bytes=_tree_size_bytes(path) if state == ARTIFACT_READY else None,
     )
@@ -193,38 +240,34 @@ def _hub_requirement(
     location: Path | None = None
     try:
         resolved = snapshot(config, hf_repo, local_files_only=True)
-    except ImportError:
-        # The resolution stack itself is unavailable; the state cannot be
-        # established through a cheap inspection.
-        state = ARTIFACT_UNKNOWN
-    except Exception:
-        # A cache-only resolution never touches the network, so a failure is
-        # reliable evidence that no complete filtered snapshot exists (a
-        # partial download also fails here and is reported as missing).
-        state = ARTIFACT_MISSING
-    else:
-        location = resolved
-        if subfolder is not None and not (resolved / subfolder).is_dir():
-            # The snapshot resolved but the checkpoint subfolder the preset
-            # requires is not in it: a layout check failed.
-            state = ARTIFACT_CORRUPT
+    except Exception as exc:
+        if _is_local_entry_not_found(exc):
+            # The documented not-in-cache outcome of an offline resolution:
+            # the one failure that is reliable evidence of a missing snapshot.
+            state = ARTIFACT_MISSING
         else:
-            state = ARTIFACT_READY
-            if subfolder is not None:
-                location = resolved / subfolder
+            # Anything else (the resolution stack unavailable, an unreadable
+            # cache, a permission failure) is not evidence of absence;
+            # unknown never means ready, and it never claims missing either.
+            state = ARTIFACT_UNKNOWN
+    else:
+        # Resolution success only proves the snapshot directory exists;
+        # completeness (and the preset's subfolder) is this plugin's check.
+        # An interrupted download is repairable: a later online resolution
+        # fetches only the files that are absent.
+        location = resolved / subfolder if subfolder is not None else resolved
+        state = ARTIFACT_READY if _looks_like_checkpoint(location) else ARTIFACT_INCOMPLETE
 
+    # Prefer the resolved commit over the configured mutable reference: two
+    # engines resolving the same snapshot must report the same version, and a
+    # refresh that moves a branch must be observable through this field.
     artifact_version = config.revision
-    if (
-        location is not None
-        and artifact_version is None
-        and state == ARTIFACT_READY
-        and (location.parent.name == "snapshots" or location.parent.parent.name == "snapshots")
-    ):
-        # The Hugging Face cache stores one directory per resolved commit; a
-        # subfolder location sits one level below that commit directory.
-        artifact_version = (
-            location.name if location.parent.name == "snapshots" else location.parent.name
-        )
+    if location is not None:
+        if location.parent.name == "snapshots":
+            artifact_version = location.name
+        elif location.parent.parent.name == "snapshots":
+            # A subfolder location sits one level below the commit directory.
+            artifact_version = location.parent.name
 
     if state == ARTIFACT_READY:
         can_acquire_now = False
@@ -272,6 +315,62 @@ def status_requirement(
     return _hub_requirement(config, hf_repo, subfolder)
 
 
+def raise_for_gated_source(exc: BaseException, hf_repo: str) -> None:
+    """Translate a gated or unauthenticated Hub rejection into actions.
+
+    Shared by the explicit acquisition hook and the implicit first-use path:
+    the reason comes from the discovered blocker, not from which code path
+    noticed it.
+
+    Args:
+        exc: The native failure raised by the Hub client.
+        hf_repo: The preset's Hugging Face repo id, for the message.
+
+    Returns:
+        None when the failure is not an access problem.
+
+    Raises:
+        ArtifactAcquisitionError: With ``reason="action_required"`` and the
+            discovered action when the source is gated or rejects the
+            credentials.
+    """
+    try:
+        from huggingface_hub.errors import (  # pyright: ignore[reportMissingModuleSource]
+            GatedRepoError,
+            HfHubHTTPError,
+        )
+    except Exception:
+        return
+    if isinstance(exc, GatedRepoError):
+        raise ArtifactAcquisitionError(
+            f"The {hf_repo} repository is gated.",
+            reason="action_required",
+            required_actions=(
+                ArtifactAction(
+                    kind=ARTIFACT_ACTION_REQUEST_ACCESS,
+                    message=(
+                        "Accept the model terms or request access on its "
+                        "Hugging Face page, then configure hf_token."
+                    ),
+                ),
+            ),
+            hint="Set the hf_token config field after access is granted.",
+        ) from exc
+    response = getattr(exc, "response", None)
+    if isinstance(exc, HfHubHTTPError) and getattr(response, "status_code", None) == 401:
+        raise ArtifactAcquisitionError(
+            f"The {hf_repo} repository rejected the request as unauthenticated.",
+            reason="action_required",
+            required_actions=(
+                ArtifactAction(
+                    kind=ARTIFACT_ACTION_AUTHENTICATE,
+                    message="Configure a valid hf_token for this repository.",
+                ),
+            ),
+            hint="Set the hf_token config field.",
+        ) from exc
+
+
 def acquire(
     config: MlxAudioConfig,
     hf_repo: str,
@@ -296,6 +395,16 @@ def acquire(
             source reports a gated repository; every other native failure
             propagates for the template to wrap as ``reason="failed"``.
     """
+    if config.local_files_only or not allow_downloads():
+        raise ArtifactAcquisitionError(
+            "Acquisition needs a network transfer, and downloads are disabled "
+            "for this engine.",
+            reason="downloads_disabled",
+            hint=(
+                "Unset local_files_only and set STANDARD_ASR_ALLOW_DOWNLOAD=1 "
+                "to permit the transfer."
+            ),
+        )
     if progress is not None:
         # huggingface_hub reports per-file progress on its own terminal bars,
         # not through a callback seam; emit one honest indeterminate transfer
@@ -306,21 +415,7 @@ def acquire(
     try:
         snapshot(config, hf_repo, local_files_only=False)
     except Exception as exc:
-        if type(exc).__name__ == "GatedRepoError":
-            raise ArtifactAcquisitionError(
-                f"The {hf_repo} repository is gated.",
-                reason="action_required",
-                required_actions=(
-                    ArtifactAction(
-                        kind=ARTIFACT_ACTION_REQUEST_ACCESS,
-                        message=(
-                            "Accept the model terms or request access on its "
-                            "Hugging Face page, then configure hf_token."
-                        ),
-                    ),
-                ),
-                hint="Set the hf_token config field after access is granted.",
-            ) from exc
+        raise_for_gated_source(exc, hf_repo)
         raise
 
 

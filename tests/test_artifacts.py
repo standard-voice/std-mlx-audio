@@ -16,7 +16,6 @@ from pathlib import Path
 
 import pytest
 from standard_asr import (
-    ARTIFACT_CORRUPT,
     ARTIFACT_MISSING,
     ARTIFACT_READY,
     ARTIFACT_UNKNOWN,
@@ -30,7 +29,7 @@ from standard_asr.contract.exceptions import (
 
 from std_mlx_audio import CohereAsr, Mms1BAll, WhisperTiny
 
-from .conftest import FakeLoader, FakeSnapshot
+from .conftest import FAKE_SNAPSHOT_DIR, FakeLoader, FakeSnapshot
 
 PINNED = "0123456789abcdef0123456789abcdef01234567"
 
@@ -134,6 +133,7 @@ def test_subfolder_present_is_ready_at_the_subfolder(
     snapshot = _snapshot_dir(tmp_path)
     (snapshot / "mlx-int8").mkdir()
     (snapshot / "mlx-int8" / "config.json").write_text("{}")
+    (snapshot / "mlx-int8" / "model.safetensors").write_bytes(b"\x00" * 8)
     FakeSnapshot.cached_path = str(snapshot)
     (requirement,) = CohereAsr().artifact_status().requirements
     assert requirement.state == ARTIFACT_READY
@@ -142,15 +142,18 @@ def test_subfolder_present_is_ready_at_the_subfolder(
     assert requirement.artifact_version == PINNED
 
 
-def test_subfolder_absent_is_corrupt(
+def test_subfolder_absent_is_incomplete_and_acquirable(
     fake_loader: Callable[..., FakeLoader], tmp_path: Path
 ) -> None:
     fake_loader()
     FakeSnapshot.cached_path = str(_snapshot_dir(tmp_path))
     (requirement,) = CohereAsr().artifact_status().requirements
-    # The snapshot resolved but the checkpoint subfolder the preset requires is
-    # not inside it: a layout check failed, which is corrupt, not missing.
-    assert requirement.state == ARTIFACT_CORRUPT
+    # The snapshot resolved but the preset's checkpoint subfolder is not in
+    # it: this is a detectable interrupted acquisition, and reporting it as
+    # incomplete keeps it repairable through pull (an online resolution
+    # fetches only the files that are absent).
+    assert requirement.state == "incomplete"
+    assert requirement.can_acquire_now is True
 
 
 def test_mms_is_one_filtered_snapshot_requirement(
@@ -191,14 +194,18 @@ def test_model_path_ready_directory(
     assert requirement.size_bytes == 18
 
 
-def test_model_path_without_checkpoint_shape_is_unknown(
+def test_model_path_without_checkpoint_shape_is_unknown_with_guidance(
     fake_loader: Callable[..., FakeLoader], tmp_path: Path
 ) -> None:
+    # The most common operator mistake (pointing one level too high) gets the
+    # same concrete next step as an absent path, not a bare unsupported.
     fake_loader()
     (requirement,) = WhisperTiny(model_path=str(tmp_path)).artifact_status().requirements
     assert requirement.state == ARTIFACT_UNKNOWN
-    assert requirement.acquisition_blocker == "unsupported"
-    assert requirement.required_actions == ()
+    assert requirement.acquisition_blocker == "action_required"
+    (action,) = requirement.required_actions
+    assert action.kind == "provide_artifacts"
+    assert "config.json" in action.message
 
 
 # --------------------------------------------------------------------------- #
@@ -240,17 +247,46 @@ def test_pull_never_loads_or_primes(
     assert loader.model.priming_call is None
 
 
+def _gated_error() -> Exception:
+    import httpx
+    from huggingface_hub.errors import GatedRepoError
+
+    response = httpx.Response(403, request=httpx.Request("GET", "https://huggingface.co/x"))
+    return GatedRepoError("gated", response=response)
+
+
+def _unauthorized_error() -> Exception:
+    import httpx
+    from huggingface_hub.errors import HfHubHTTPError
+
+    response = httpx.Response(401, request=httpx.Request("GET", "https://huggingface.co/x"))
+    return HfHubHTTPError("401 unauthorized", response=response)
+
+
 def test_pull_gated_repo_reports_request_access(
     fake_loader: Callable[..., FakeLoader],
 ) -> None:
+    # The REAL upstream error class: name-based matching would silently stop
+    # working on a rename or subclass.
     fake_loader()
-    gated = type("GatedRepoError", (Exception,), {})
-    FakeSnapshot.raise_on_download = gated("gated")
+    FakeSnapshot.raise_on_download = _gated_error()
     with pytest.raises(ArtifactAcquisitionError) as exc_info:
         WhisperTiny().acquire_artifacts()
     assert exc_info.value.reason == "action_required"
     (action,) = exc_info.value.required_actions
     assert action.kind == "request_access"
+
+
+def test_pull_unauthenticated_repo_reports_authenticate(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    fake_loader()
+    FakeSnapshot.raise_on_download = _unauthorized_error()
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        WhisperTiny().acquire_artifacts()
+    assert exc_info.value.reason == "action_required"
+    (action,) = exc_info.value.required_actions
+    assert action.kind == "authenticate"
 
 
 def test_pull_native_failure_is_failed_with_cause(
@@ -374,3 +410,153 @@ def test_status_unknown_when_resolution_stack_unavailable(
     monkeypatch.setattr(_artifacts, "snapshot", _boom)
     (requirement,) = WhisperTiny().artifact_status().requirements
     assert requirement.state == ARTIFACT_UNKNOWN
+
+
+# --------------------------------------------------------------------------- #
+# Round-1 review regressions
+# --------------------------------------------------------------------------- #
+def test_loader_receives_repo_derived_model_name_parts(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # Upstream infers the model family from the LAST path component when
+    # config.json omits model_type (NeMo-format repos): a local snapshot path
+    # would feed it the commit hash, so the engine must hand it the
+    # repo-derived name parts explicitly or Parakeet-lineage presets brick.
+    from std_mlx_audio import ParakeetTdt06BV3
+
+    loader = fake_loader()
+    FakeSnapshot.cached_path = FAKE_SNAPSHOT_DIR
+    ParakeetTdt06BV3().prepare()
+    parts = loader.load_calls[0]["model_name_parts"]
+    assert parts and parts[0] == "parakeet"
+
+
+def test_partial_snapshot_reports_incomplete_and_pull_repairs(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # Upstream resolution returns an existing snapshot directory WITHOUT
+    # verifying its contents; readiness must come from the completeness check,
+    # and pull must be able to repair the interrupted download.
+    fake_loader()
+    partial = tmp_path / "snapshots" / PINNED
+    partial.mkdir(parents=True)
+    (partial / "config.json").write_text("{}")  # weights never arrived
+    FakeSnapshot.cached_path = str(partial)
+    report = WhisperTiny().artifact_status()
+    assert report.readiness == ARTIFACTS_UNAVAILABLE
+    (requirement,) = report.requirements
+    assert requirement.state == "incomplete"
+    assert requirement.can_acquire_now is True
+
+    def _complete_download() -> None:
+        (partial / "model.safetensors").write_bytes(b"\x00" * 8)
+
+    FakeSnapshot.on_download = _complete_download
+    repaired = WhisperTiny().acquire_artifacts()
+    assert repaired.readiness == ARTIFACTS_READY
+    assert FakeSnapshot.download_calls == 1
+
+
+def test_refresh_respects_engine_local_files_only(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # local_files_only is the engine's own offline policy; the core template
+    # only sees the global toggle, so the hook must self-gate the refresh.
+    fake_loader()
+    FakeSnapshot.cached_path = str(_snapshot_dir(tmp_path))
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        WhisperTiny(local_files_only=True).acquire_artifacts(refresh=True)
+    assert exc_info.value.reason == "downloads_disabled"
+    assert FakeSnapshot.download_calls == 0
+
+
+def test_unreadable_cache_reports_unknown_not_missing(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # A permission failure is not evidence of absence: claiming missing would
+    # tell an offline operator to enable downloads for a permissions bug.
+    fake_loader()
+    FakeSnapshot.raise_on_resolve = PermissionError("refs unreadable")
+    (requirement,) = WhisperTiny().artifact_status().requirements
+    assert requirement.state == ARTIFACT_UNKNOWN
+    assert requirement.acquisition_blocker is None
+
+
+def test_warm_cache_with_branch_revision_reports_resolved_commit(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # The resolved commit wins over the configured mutable reference, so a
+    # refresh that moves a branch is observable through artifact_version.
+    fake_loader()
+    FakeSnapshot.cached_path = str(_snapshot_dir(tmp_path))
+    (requirement,) = WhisperTiny(revision="main").artifact_status().requirements
+    assert requirement.source_is_mutable is True
+    assert requirement.artifact_version == PINNED
+
+
+def test_first_use_gated_repo_reports_request_access(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # The reason comes from the discovered blocker, not from which code path
+    # noticed it: the IMPLICIT first-use resolution carries the same action.
+    fake_loader()
+    FakeSnapshot.raise_on_download = _gated_error()
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        WhisperTiny().prepare()
+    assert exc_info.value.reason == "action_required"
+    (action,) = exc_info.value.required_actions
+    assert action.kind == "request_access"
+
+
+def test_transcribe_propagates_artifact_error_unwrapped(
+    fake_loader: Callable[..., FakeLoader], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The R7 exemption end to end: an availability failure inside the batch
+    # pipeline reaches the caller as the artifact error, never wrapped into
+    # TranscriptionError.
+    import numpy as np
+
+    fake_loader()
+    monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "0")
+    with pytest.raises(ArtifactUnavailableError):
+        WhisperTiny().transcribe((np.zeros(16000, dtype=np.float32), 16000))
+
+
+def test_streaming_session_emits_artifact_unavailable_terminal(
+    fake_loader: Callable[..., FakeLoader], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The streaming mapping end to end: the session's producer translates the
+    # availability failure into the dedicated terminal code, not engine_error.
+    from standard_asr import SyncSession
+    from standard_asr.audio.format import AudioFormat
+
+    fake_loader()
+    monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "0")
+    engine = WhisperTiny()
+    session = engine.start_transcription(
+        audio_format=AudioFormat(encoding="pcm_s16le", sample_rate=16000, channels=1)
+    )
+    with SyncSession(session) as sync:
+        events = list(sync)
+    (error,) = [event for event in events if event.type == "error"]
+    assert error.code == "artifact_unavailable"
+    assert error.recoverable is False
+
+
+def test_error_translation_degrades_without_hub_errors_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+
+    from std_mlx_audio._artifacts import _is_local_entry_not_found, raise_for_gated_source
+
+    real_import = builtins.__import__
+
+    def _import(name: str, *a: object, **k: object) -> object:
+        if name.startswith("huggingface_hub"):
+            raise ImportError("no huggingface_hub")
+        return real_import(name, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    assert _is_local_entry_not_found(FileNotFoundError("x")) is False
+    assert raise_for_gated_source(RuntimeError("x"), "repo") is None

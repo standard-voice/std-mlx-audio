@@ -156,6 +156,8 @@ class MlxAudioStreamingSession(TranscriptionSession):
         # Count of segments already emitted as `final` (also their next id). A
         # finalized segment's id and text are immutable and its audio is dropped.
         self._finalized_count = 0
+        # One-shot flag for the max_window_s degradation warning.
+        self._cap_degraded_logged = False
 
     def _resolve_language(self) -> str | None:
         """Resolve the effective language to forward to the backend.
@@ -222,7 +224,7 @@ class MlxAudioStreamingSession(TranscriptionSession):
             tail, ``progress`` heartbeats carrying the audio cursor, and a
             terminal ``done``.
         """
-        self._engine.ensure_loaded()
+        self._engine.ensure_loaded(mode="streaming")
         want_words = backends.map_word_timestamps(self._params.word_timestamps)
         pending = bytearray()
         bytes_since_decode = 0
@@ -361,9 +363,19 @@ class MlxAudioStreamingSession(TranscriptionSession):
                     if remaining <= self._max_window_s:
                         break
                     if segments[settled].end is None:
-                        # Forcing past a segment with no end time cannot shrink
-                        # the window (there is nothing to trim to); the cap
-                        # stops here rather than inventing a length.
+                        # Force-finalizing a segment whose end is unknown would
+                        # finalize text whose audio cannot be trimmed (the trim
+                        # anchor is the last settled end), and the untrimmed
+                        # audio would be re-decoded as NEW segments next pass --
+                        # duplicated transcript text. The bound therefore
+                        # degrades honestly here, and says so once.
+                        if not self._cap_degraded_logged:
+                            self._cap_degraded_logged = True
+                            _LOGGER.warning(
+                                "max_window_s cannot bound the window: a "
+                                "segment without an end time blocks the trim "
+                                "anchor; the window may grow until it settles."
+                            )
                         break
                     settled += 1
 
