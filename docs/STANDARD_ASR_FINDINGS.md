@@ -203,7 +203,13 @@ acquires it there, and a load under a no-download policy refuses instead of
 letting the upstream fetch bypass the policy. The residual (cached
 tokenizer, downloads disabled, network reachable: transformers may still
 revalidate against the Hub and fetch an updated file) stays documented on
-the preset.
+the preset. Related upstream note: the hook resolves its three speech
+marker tokens with `convert_tokens_to_ids`, which returns the
+unknown-token id for an absent token without any check, so a tokenizer
+from the wrong vocabulary silently misplaces the speech embeddings. A
+three-line marker-id validation in the hook would make that loud; the
+plugin does not second-guess a checkpoint's internal consistency (the
+same line drawn for mixed-up weights).
 
 ---
 
