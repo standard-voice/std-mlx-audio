@@ -1316,6 +1316,122 @@ def test_vibevoice_implicit_load_prefetches_the_companion(
     assert isinstance(exc_info.value.__cause__, OSError)
 
 
+# --------------------------------------------------------------------------- #
+# Round-14 review regressions: offline load proof and companion probe honesty
+# --------------------------------------------------------------------------- #
+def test_no_download_load_requires_the_offline_tokenizer_proof(
+    fake_loader: Callable[..., FakeLoader],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # File presence cannot prove a malformed tokenizer file will load, and
+    # the upstream hook's fallback on ANY local failure fetches from the
+    # Hub with no offline flag -- past the no-download policy. The engine
+    # must prove the load cannot need a transfer before the hook runs
+    # (round-14 review).
+    loader = fake_loader()
+    local = tmp_path / "vibevoice"
+    local.mkdir()
+    (local / "config.json").write_text("{}")
+    (local / "model.safetensors").write_bytes(b"\x00" * 8)
+    (local / "tokenizer.json").write_text("not a tokenizer")
+    monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "0")
+    FakeSnapshot.offline_tokenizer_result = False
+    with pytest.raises(ArtifactUnavailableError) as exc_info:
+        VibeVoiceAsr(model_path=str(local)).prepare()
+    assert exc_info.value.reason == "incomplete"
+    assert "tokenizer" in str(exc_info.value)
+    assert loader.load_calls == []
+    assert FakeSnapshot.offline_probe_calls == [(str(local), "Qwen/Qwen2.5-7B")]
+
+    FakeSnapshot.offline_tokenizer_result = True
+    VibeVoiceAsr(model_path=str(local)).prepare()
+    assert loader.load_calls[0]["model_path"] == str(local)
+
+    # With downloads allowed the fallback fetch is lawful; the probe does
+    # not run (it would tax every load for nothing).
+    monkeypatch.delenv("STANDARD_ASR_ALLOW_DOWNLOAD")
+    FakeSnapshot.offline_probe_calls = []
+    VibeVoiceAsr(model_path=str(local)).prepare()
+    assert FakeSnapshot.offline_probe_calls == []
+
+
+def test_offline_tokenizer_probe_against_real_directories(tmp_path: Path) -> None:
+    # The probe's own behavior runs the REAL transformers sequence: the
+    # checkpoint directory first, then the companion source, both offline.
+    # A generated-on-the-spot real tokenizer serialization proves the
+    # success legs without any network.
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    from std_mlx_audio._artifacts import offline_tokenizer_loads
+
+    valid = tmp_path / "valid"
+    valid.mkdir()
+    Tokenizer(WordLevel({"a": 0, "[UNK]": 1}, unk_token="[UNK]")).save(
+        str(valid / "tokenizer.json")
+    )
+    malformed = tmp_path / "malformed"
+    malformed.mkdir()
+    (malformed / "tokenizer.json").write_text("not a tokenizer")
+
+    assert offline_tokenizer_loads(str(valid), "std-asr-tests/does-not-exist") is True
+    assert offline_tokenizer_loads(str(malformed), str(valid)) is True  # second leg
+    assert offline_tokenizer_loads(str(malformed), "std-asr-tests/does-not-exist") is False
+
+
+def test_unreadable_companion_cache_reports_unknown_not_incomplete(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # An unreadable cache is not evidence of absence (AR.2): only the
+    # documented not-in-cache miss may claim the companion is absent, the
+    # same discipline as the main snapshot's resolution (round-14 review).
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.cached_path = str(snapshot)
+    FakeSnapshot.raise_on_companion_resolve = PermissionError("cache unreadable")
+    (requirement,) = VibeVoiceAsr().artifact_status().requirements
+    assert requirement.state == ARTIFACT_UNKNOWN
+
+    local = tmp_path / "local"
+    local.mkdir()
+    (local / "config.json").write_text("{}")
+    (local / "model.safetensors").write_bytes(b"\x00" * 8)
+    (requirement,) = VibeVoiceAsr(model_path=str(local)).artifact_status().requirements
+    assert requirement.state == ARTIFACT_UNKNOWN
+    assert requirement.can_acquire_now is True  # a pull attempt can resolve it
+
+
+def test_plain_pull_skips_a_provably_warm_companion(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # The hub client rethrows proxy failures before its cache fallback, so
+    # an avoidable online companion call can fail a pull whose every
+    # artifact is present. A plain pull skips the fetch when the cache
+    # provably holds the companion; a refresh still re-fetches
+    # (best-effort freshness, the documented no-evidence residual)
+    # (round-14 review).
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")  # weights arrive via pull
+    FakeSnapshot.cached_path = str(snapshot)
+    FakeSnapshot.on_download = lambda: (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.raise_on_companion_download = OSError("proxy is down")
+    report = VibeVoiceAsr().acquire_artifacts()
+    assert report.readiness == ARTIFACTS_READY
+    assert FakeSnapshot.companion_download_calls == 0
+
+    FakeSnapshot.raise_on_companion_download = None
+    FakeHfApi.remote_sha = PINNED
+    report = VibeVoiceAsr().acquire_artifacts(refresh=True)
+    assert report.readiness == ARTIFACTS_READY
+    assert FakeSnapshot.companion_download_calls == 1
+
+
 def test_error_translation_degrades_without_hub_errors_module(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

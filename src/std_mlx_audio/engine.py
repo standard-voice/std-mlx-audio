@@ -84,6 +84,7 @@ from ._artifacts import (
     companion_tokenizer_cached,
     fetch_companion_tokenizer,
     normalized_model_path,
+    offline_tokenizer_loads,
     raise_for_gated_source,
     resolve_for_load,
     status_requirement,
@@ -442,19 +443,44 @@ class MlxAudioASR(EngineBase):
         if type(self).load_model_type is not None:
             load_kwargs["model_type"] = type(self).load_model_type
         companion = type(self).companion_tokenizer_repo
-        if (
+        if companion is not None and local_only:
+            # File-presence heuristics let this load through (status is
+            # limited to cheap inspection, AR.2), but presence cannot
+            # prove a malformed tokenizer file will load -- and the
+            # upstream hook's fallback on ANY local failure fetches from
+            # the Hub with no offline flag, past the no-download policy
+            # (round-14 review). Prove the load cannot need a transfer
+            # before the hook runs; this also owns the companion-unknown
+            # status shape on the no-download path.
+            if not offline_tokenizer_loads(model_source, companion):
+                raise ArtifactUnavailableError(
+                    "The tokenizer for this model cannot load without a "
+                    f"network transfer: neither the checkpoint at "
+                    f"{model_source!r} nor the local cache of {companion} "
+                    "holds a loadable tokenizer, and downloads are disabled.",
+                    reason="incomplete",
+                    report=report,
+                    hint=(
+                        "Enable downloads for one load (or run "
+                        "'standard-asr pull') to cache the tokenizer, then "
+                        "retry offline."
+                    ),
+                )
+        elif (
             companion is not None
             and not bundled_companion_tokenizer(Path(model_source))
-            and not companion_tokenizer_cached(companion)
+            and companion_tokenizer_cached(companion) is not True
         ):
             # A bundled tokenizer keeps the load entirely local (the
             # upstream hook tries the checkpoint directory first); without
-            # one, this is only reachable with downloads allowed (the
-            # guard above refused the no-download cold-cache case): fetch
-            # the companion through the plugin's own path so a transfer
+            # one, this branch runs with downloads allowed (the guard
+            # above refused the no-download cold-cache case, and the
+            # probe branch owns every no-download load): fetch the
+            # companion through the plugin's own path so a transfer
             # failure classifies as a failed implicit acquisition, not an
             # opaque loader error from the upstream hook's uncontrolled
-            # fallback fetch.
+            # fallback fetch. An unproven cache state is fetched too --
+            # the transfer resolves it or fails loudly.
             try:
                 fetch_companion_tokenizer(companion)
             except Exception as exc:

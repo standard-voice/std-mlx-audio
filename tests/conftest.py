@@ -198,6 +198,16 @@ class FakeSnapshot:
     download_calls: int = 0
     #: The cached hit for the companion tokenizer repo (``None`` = cold).
     companion_cached_path: str | None = None
+    #: Raised by a cache-only companion resolution (models an unreadable
+    #: cache -- distinct from the not-in-cache miss the cold default
+    #: raises).
+    raise_on_companion_resolve: BaseException | None = None
+    #: The canned answer of the fake ``offline_tokenizer_loads`` probe
+    #: (the real probe runs transformers; its own unit tests exercise it
+    #: against real directories).
+    offline_tokenizer_result: bool = True
+    #: Arguments of every fake offline-probe call.
+    offline_probe_calls: list[tuple[str, str]] = []
     #: Kwargs of the last companion call (cache-only or online).
     companion_last_kwargs: dict[str, Any] = {}
     #: Kwargs of the last ONLINE companion call (a later cache-only status
@@ -221,6 +231,9 @@ class FakeSnapshot:
         cls.companion_last_download_kwargs = {}
         cls.companion_download_calls = 0
         cls.raise_on_companion_download = None
+        cls.raise_on_companion_resolve = None
+        cls.offline_tokenizer_result = True
+        cls.offline_probe_calls = []
 
 
 def _fake_snapshot_download(
@@ -243,6 +256,8 @@ def _fake_snapshot_download(
             "allow_patterns": allow_patterns,
         }
         if local_files_only:
+            if FakeSnapshot.raise_on_companion_resolve is not None:
+                raise FakeSnapshot.raise_on_companion_resolve
             if FakeSnapshot.companion_cached_path is None:
                 from huggingface_hub.errors import LocalEntryNotFoundError
 
@@ -344,10 +359,22 @@ def install_fake_loader(
     import huggingface_hub
     import mlx_audio.stt as stt
 
+    from std_mlx_audio import engine as engine_module
+
     FakeSnapshot.reset()
     FakeHfApi.reset()
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot_download)
     monkeypatch.setattr(huggingface_hub, "HfApi", FakeHfApi)
+
+    def _fake_offline_probe(checkpoint_dir: str, companion_repo: str) -> bool:
+        # The real probe runs transformers against the checkpoint and the
+        # default cache; its own unit tests exercise that against real
+        # directories. Here the canned answer keeps engine-flow tests
+        # hermetic.
+        FakeSnapshot.offline_probe_calls.append((checkpoint_dir, companion_repo))
+        return FakeSnapshot.offline_tokenizer_result
+
+    monkeypatch.setattr(engine_module, "offline_tokenizer_loads", _fake_offline_probe)
     model = FakeMlxModel(output=output, output_fn=output_fn)
     loader = FakeLoader(model)
     monkeypatch.setattr(stt, "load", loader)

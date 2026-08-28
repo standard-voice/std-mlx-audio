@@ -72,8 +72,8 @@ _COMPANION_TOKENIZER_PATTERNS = (
 )
 
 
-def companion_tokenizer_cached(companion_repo: str) -> bool:
-    """Return whether the companion tokenizer can load from the local cache.
+def companion_tokenizer_cached(companion_repo: str) -> bool | None:
+    """Report whether the companion tokenizer can load from the local cache.
 
     The probe mirrors the upstream fallback exactly: mlx-audio's VibeVoice
     hook calls ``AutoTokenizer.from_pretrained("<companion>")`` with no
@@ -88,9 +88,12 @@ def companion_tokenizer_cached(companion_repo: str) -> bool:
     Returns:
         ``True`` when the cached snapshot holds the model config (the
         repo-id load resolves AutoConfig first) plus a loadable tokenizer
-        (the fast serialization, or the slow-path vocab + merges pair).
-        Any resolution failure counts as not proven cached: the load gate
-        must not wave through a fetch it cannot rule out.
+        (the fast serialization, or the slow-path vocab + merges pair);
+        ``False`` when the cache provably lacks it (the documented
+        not-in-cache failure, or a resolved snapshot missing the files);
+        ``None`` when the inspection itself failed (an unreadable cache is
+        not evidence of absence, AR.2 -- the same discipline as the main
+        snapshot's resolution).
     """
     import huggingface_hub  # pyright: ignore[reportMissingModuleSource]
 
@@ -100,14 +103,49 @@ def companion_tokenizer_cached(companion_repo: str) -> bool:
             local_files_only=True,
             allow_patterns=list(_COMPANION_TOKENIZER_PATTERNS),
         )
-    except Exception:
-        return False
+    except Exception as exc:
+        return False if _is_local_entry_not_found(exc) else None
     root = Path(resolved)
     if not (root / "config.json").is_file():
         return False
     return (root / "tokenizer.json").is_file() or (
         (root / "vocab.json").is_file() and (root / "merges.txt").is_file()
     )
+
+
+def offline_tokenizer_loads(checkpoint_dir: str, companion_repo: str) -> bool:
+    """Prove the model's tokenizer can load without a network transfer.
+
+    File-presence probes cannot prove this: a present-but-malformed
+    tokenizer file fails the upstream hook's local attempt, and its
+    fallback then fetches from the Hub with no offline flag -- past a
+    no-download policy (round-14 review). This probe runs the SAME
+    sequence the hook runs -- the checkpoint directory first, then the
+    companion repo id -- with ``local_files_only=True`` on both legs, so
+    success proves the imminent load cannot NEED a transfer (an
+    allowed-path revalidation stays the documented preset residual).
+    Load-time proof by the real authority complements the cheap
+    file-presence heuristics status is limited to (AR.2), the same
+    layering as faster-whisper's post-load mel check.
+
+    Args:
+        checkpoint_dir: The checkpoint directory about to be loaded.
+        companion_repo: The Hub repo id of the fallback tokenizer.
+
+    Returns:
+        ``True`` when either leg loads offline; ``False`` when both fail.
+    """
+    from transformers import AutoTokenizer  # heavy import; gated path only
+
+    for source in (checkpoint_dir, companion_repo):
+        try:
+            AutoTokenizer.from_pretrained(  # pyright: ignore[reportUnknownMemberType]
+                source, trust_remote_code=True, local_files_only=True
+            )
+        except Exception:
+            continue
+        return True
+    return False
 
 
 def bundled_companion_tokenizer(root: Path) -> bool:
@@ -405,21 +443,24 @@ def _local_path_requirement(
     elif (
         companion_repo is not None
         and not bundled_companion_tokenizer(path)
-        and not companion_tokenizer_cached(companion_repo)
+        and (companion_state := companion_tokenizer_cached(companion_repo)) is not True
     ):
         # The checkpoint itself is complete, but the family's tokenizer
         # lives in a separate Hub repo the upstream loader fetches at load
         # time, and neither the checkpoint (a bundled tokenizer makes the
-        # companion moot, round-12 review) nor the default cache holds it:
-        # inference is not offline-ready (same substance as the Hub
-        # branch, round-10 review). With downloads allowed the companion
-        # is the one part the plugin CAN acquire for an operator path --
-        # pull fetches it, and a load would fetch it implicitly -- so the
+        # companion moot, round-12 review) nor the default cache provably
+        # holds it: provable absence is incomplete, a failed inspection is
+        # unknown (AR.2, round-14 review) -- inference is not
+        # offline-ready either way (same substance as the Hub branch,
+        # round-10 review). With downloads allowed the companion is the
+        # one part the plugin CAN acquire for an operator path -- pull
+        # fetches it, and a load would fetch it implicitly -- so the
         # requirement is acquirable; with downloads disabled the transfer
-        # is forbidden and the load must refuse. This is the ONLY local
-        # shape whose blocker is not action_required (the engine's guard
-        # keys on it).
-        state = ARTIFACT_INCOMPLETE
+        # is forbidden and the load must refuse (the guard keys on the
+        # blocker; the load-time offline probe backs the unknown shape).
+        # These are the ONLY local shapes whose blocker is not
+        # action_required.
+        state = ARTIFACT_INCOMPLETE if companion_state is False else ARTIFACT_UNKNOWN
         message = None
         if config.local_files_only or not allow_downloads():
             blocker = ARTIFACT_BLOCKER_DOWNLOADS_DISABLED
@@ -512,14 +553,18 @@ def _hub_requirement(
         and companion_repo is not None
         and location is not None
         and not bundled_companion_tokenizer(location)
-        and not companion_tokenizer_cached(companion_repo)
     ):
-        # The snapshot is complete, but the family's tokenizer lives in a
-        # separate Hub repo the upstream loader fetches at load time, and
-        # neither the snapshot (a bundled tokenizer would keep the load
-        # local) nor the default cache holds it: inference is not
-        # offline-ready, and pull must still acquire the companion.
-        state = ARTIFACT_INCOMPLETE
+        cached = companion_tokenizer_cached(companion_repo)
+        if cached is not True:
+            # The snapshot is complete, but the family's tokenizer lives
+            # in a separate Hub repo the upstream loader fetches at load
+            # time, and neither the snapshot (a bundled tokenizer would
+            # keep the load local) nor the default cache provably holds
+            # it: a provable absence is incomplete (pull acquires the
+            # companion), while a failed inspection is unknown -- an
+            # unreadable cache is not evidence of absence (AR.2,
+            # round-14 review).
+            state = ARTIFACT_INCOMPLETE if cached is False else ARTIFACT_UNKNOWN
 
     # Prefer the resolved commit over the configured mutable reference: two
     # engines resolving the same snapshot must report the same version, and a
@@ -790,11 +835,22 @@ def acquire(
             reason="failed",
             hint="Retry while the source is reachable.",
         )
-    if companion_repo is not None and not bundled_companion_tokenizer(resolved):
+    if (
+        companion_repo is not None
+        and not bundled_companion_tokenizer(resolved)
+        and (refresh or companion_tokenizer_cached(companion_repo) is not True)
+    ):
         # A snapshot that bundles its own loadable tokenizer is
         # self-contained: fetching the companion would be wasted transfer,
         # and a companion outage must not fail a pull whose target content
-        # is independently usable (round-13 review).
+        # is independently usable (round-13 review). The same holds for a
+        # provably warm companion cache on a plain pull (round-14 review:
+        # the hub client rethrows proxy failures before its cache
+        # fallback, so an avoidable online call can fail an acquisition
+        # whose every artifact is present); a refresh still re-fetches
+        # (best-effort freshness, the documented no-evidence residual),
+        # and an unproven cache state is attempted -- the fetch either
+        # resolves it or fails loudly.
         try:
             fetch_companion_tokenizer(companion_repo)
         except Exception as exc:
