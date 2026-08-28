@@ -1150,11 +1150,28 @@ def test_vibevoice_model_path_companion_policy(
     assert "transferring" in phases
     assert FakeSnapshot.companion_download_calls == 1
     assert FakeSnapshot.download_calls == 0  # the checkpoint is not the plugin's
+    # Ready is not "inference cannot acquire": the upstream loader still
+    # addresses the companion by unpinned repo id with no offline flag, so
+    # while downloads are permitted a load may revalidate and fetch it
+    # (round-11 review; mirrors the Hub branch's policy narrowing).
+    (requirement,) = report.requirements
+    assert requirement.state == ARTIFACT_READY
+    assert requirement.can_acquire_now is False
+    assert requirement.may_acquire_during_inference is True
 
     engine = VibeVoiceAsr(model_path=str(local))
     engine.prepare()  # the warm companion is not re-fetched
     assert FakeSnapshot.companion_download_calls == 1
     assert loader.load_calls[0]["model_path"] == str(local)
+
+    # With downloads disabled and the companion warm, the requirement is
+    # ready and the effective may_acquire_during_inference narrows to
+    # False, like every other policy-narrowed requirement.
+    monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "0")
+    (requirement,) = VibeVoiceAsr(model_path=str(local)).artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+    assert requirement.may_acquire_during_inference is False
+    monkeypatch.delenv("STANDARD_ASR_ALLOW_DOWNLOAD")
 
     # A gated companion rejection during the model_path pull carries the
     # discovered action, like every other gated translation; a plain

@@ -398,6 +398,14 @@ def _local_path_requirement(
     else:
         state = ARTIFACT_READY
         message = None
+        if companion_repo is not None and not (config.local_files_only or not allow_downloads()):
+            # Even with the companion warm, the upstream loader addresses
+            # it by UNPINNED Hub repo id with no offline flag, so a load
+            # may still revalidate against the source and fetch an updated
+            # file while downloads are permitted: the effective
+            # may_acquire_during_inference is True, mirroring the Hub
+            # branch's policy narrowing (round-11 review).
+            may_acquire_during_inference = True
 
     return ArtifactRequirement(
         artifact_id=LOCAL_ARTIFACT_ID,
