@@ -31,6 +31,7 @@ types) lives entirely in the bound backend; this class is family-agnostic.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, ClassVar, cast
 
 import numpy as np
@@ -78,6 +79,7 @@ from ._artifacts import (
     LOCAL_ARTIFACT_ID,
     acquire,
     acquire_companion,
+    bundled_companion_tokenizer,
     checkpoint_complete,
     companion_tokenizer_cached,
     fetch_companion_tokenizer,
@@ -440,12 +442,19 @@ class MlxAudioASR(EngineBase):
         if type(self).load_model_type is not None:
             load_kwargs["model_type"] = type(self).load_model_type
         companion = type(self).companion_tokenizer_repo
-        if companion is not None and not companion_tokenizer_cached(companion):
-            # Only reachable with downloads allowed (the guard above refused
-            # the no-download cold-cache case): fetch the companion through
-            # the plugin's own path so a transfer failure classifies as a
-            # failed implicit acquisition, not an opaque loader error from
-            # the upstream hook's uncontrolled fallback fetch.
+        if (
+            companion is not None
+            and not bundled_companion_tokenizer(Path(model_source))
+            and not companion_tokenizer_cached(companion)
+        ):
+            # A bundled tokenizer keeps the load entirely local (the
+            # upstream hook tries the checkpoint directory first); without
+            # one, this is only reachable with downloads allowed (the
+            # guard above refused the no-download cold-cache case): fetch
+            # the companion through the plugin's own path so a transfer
+            # failure classifies as a failed implicit acquisition, not an
+            # opaque loader error from the upstream hook's uncontrolled
+            # fallback fetch.
             try:
                 fetch_companion_tokenizer(companion)
             except Exception as exc:
@@ -636,7 +645,7 @@ class MlxAudioASR(EngineBase):
         elif companion is not None and any(
             item.artifact_id == LOCAL_ARTIFACT_ID for item in requirements
         ):
-            acquire_companion(companion, progress)
+            acquire_companion(config, companion, progress)
 
     # ------------------------------------------------------------------ #
     # Batch
@@ -1395,10 +1404,13 @@ class VibeVoiceAsr(MlxAudioASR):
     snapshot incomplete until the tokenizer is in the DEFAULT Hugging Face
     cache (``download_root`` cannot redirect the upstream call), ``pull``
     acquires it, and a load under a no-download policy refuses instead of
-    letting the upstream fetch run. Residual caveat: with the tokenizer
-    cached, downloads disabled, and the network reachable, the upstream
-    call may still revalidate against the Hub and fetch an updated file if
-    the source repo moved. See docs/STANDARD_ASR_FINDINGS.md.
+    letting the upstream fetch run. A checkpoint that bundles its own
+    loadable tokenizer (the hook tries the checkpoint directory first) is
+    self-contained and needs no companion. Residual caveat: with the
+    tokenizer cached, downloads disabled, and the network reachable, the
+    upstream call may still revalidate against the Hub and fetch an
+    updated file if the source repo moved. See
+    docs/STANDARD_ASR_FINDINGS.md.
     """
 
     hf_repo: ClassVar[str] = "mlx-community/VibeVoice-ASR-4bit"

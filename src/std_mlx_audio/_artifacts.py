@@ -110,6 +110,32 @@ def companion_tokenizer_cached(companion_repo: str) -> bool:
     )
 
 
+def bundled_companion_tokenizer(root: Path) -> bool:
+    """Return whether a checkpoint directory bundles a loadable tokenizer.
+
+    The upstream VibeVoice hook tries ``AutoTokenizer.from_pretrained``
+    on the checkpoint directory FIRST and falls back to the companion Hub
+    repo only when that fails, so a checkpoint that bundles its tokenizer
+    never needs the companion. The accepted layouts are the ones proven
+    to load beside the checkpoint's own (foreign-model-type) config.json
+    against the installed transformers (round-12 review, per-layout
+    ablation): the fast serialization alone, or the tokenizer config with
+    the slow vocab + merges pair. A bare vocab + merges pair without the
+    tokenizer config provably fails and does NOT count.
+
+    Args:
+        root: The checkpoint directory.
+
+    Returns:
+        ``True`` when the local tokenizer load provably succeeds.
+    """
+    return (root / "tokenizer.json").is_file() or (
+        (root / "tokenizer_config.json").is_file()
+        and (root / "vocab.json").is_file()
+        and (root / "merges.txt").is_file()
+    )
+
+
 def fetch_companion_tokenizer(companion_repo: str) -> None:
     """Materialize the companion tokenizer into the DEFAULT Hub cache.
 
@@ -376,17 +402,23 @@ def _local_path_requirement(
             "complete weights; point it at the MLX checkpoint directory "
             "itself."
         )
-    elif companion_repo is not None and not companion_tokenizer_cached(companion_repo):
+    elif (
+        companion_repo is not None
+        and not bundled_companion_tokenizer(path)
+        and not companion_tokenizer_cached(companion_repo)
+    ):
         # The checkpoint itself is complete, but the family's tokenizer
         # lives in a separate Hub repo the upstream loader fetches at load
-        # time, and the default cache does not hold it: inference is not
-        # offline-ready (same substance as the Hub branch, round-10
-        # review). With downloads allowed the companion is the one part
-        # the plugin CAN acquire for an operator path -- pull fetches it,
-        # and a load would fetch it implicitly -- so the requirement is
-        # acquirable; with downloads disabled the transfer is forbidden
-        # and the load must refuse. This is the ONLY local shape whose
-        # blocker is not action_required (the engine's guard keys on it).
+        # time, and neither the checkpoint (a bundled tokenizer makes the
+        # companion moot, round-12 review) nor the default cache holds it:
+        # inference is not offline-ready (same substance as the Hub
+        # branch, round-10 review). With downloads allowed the companion
+        # is the one part the plugin CAN acquire for an operator path --
+        # pull fetches it, and a load would fetch it implicitly -- so the
+        # requirement is acquirable; with downloads disabled the transfer
+        # is forbidden and the load must refuse. This is the ONLY local
+        # shape whose blocker is not action_required (the engine's guard
+        # keys on it).
         state = ARTIFACT_INCOMPLETE
         message = None
         if config.local_files_only or not allow_downloads():
@@ -398,13 +430,19 @@ def _local_path_requirement(
     else:
         state = ARTIFACT_READY
         message = None
-        if companion_repo is not None and not (config.local_files_only or not allow_downloads()):
+        if (
+            companion_repo is not None
+            and not bundled_companion_tokenizer(path)
+            and not (config.local_files_only or not allow_downloads())
+        ):
             # Even with the companion warm, the upstream loader addresses
             # it by UNPINNED Hub repo id with no offline flag, so a load
             # may still revalidate against the source and fetch an updated
             # file while downloads are permitted: the effective
             # may_acquire_during_inference is True, mirroring the Hub
-            # branch's policy narrowing (round-11 review).
+            # branch's policy narrowing (round-11 review). A bundled
+            # tokenizer keeps the load entirely local, so the field stays
+            # False then.
             may_acquire_during_inference = True
 
     return ArtifactRequirement(
@@ -472,11 +510,14 @@ def _hub_requirement(
     if (
         state == ARTIFACT_READY
         and companion_repo is not None
+        and location is not None
+        and not bundled_companion_tokenizer(location)
         and not companion_tokenizer_cached(companion_repo)
     ):
         # The snapshot is complete, but the family's tokenizer lives in a
         # separate Hub repo the upstream loader fetches at load time, and
-        # the default cache does not hold it: inference is not
+        # neither the snapshot (a bundled tokenizer would keep the load
+        # local) nor the default cache holds it: inference is not
         # offline-ready, and pull must still acquire the companion.
         state = ARTIFACT_INCOMPLETE
 
@@ -758,6 +799,7 @@ def acquire(
 
 
 def acquire_companion(
+    config: MlxAudioConfig,
     companion_repo: str,
     progress: ArtifactProgressCallback | None,
 ) -> None:
@@ -766,20 +808,32 @@ def acquire_companion(
     An operator-provided checkpoint is not the plugin's to acquire, but its
     companion tokenizer is: this is the acquisition hook's path for a
     ``model_path`` requirement whose only deficiency is the cold companion
-    cache. The template sends the target only when the requirement reported
-    ``can_acquire_now``, which the status builder sets only with downloads
-    allowed.
+    cache. The download policy is applied again at this entry, like
+    :func:`acquire`'s (spec AR.3 applies the toggle before the transfer;
+    the preflight that made the target runnable is a separate earlier
+    query).
 
     Args:
+        config: Resolved engine configuration.
         companion_repo: The Hub repo id to fetch the tokenizer files from.
         progress: Optional serialized progress observer.
 
     Raises:
-        ArtifactAcquisitionError: With ``reason="action_required"`` when the
-            source is gated or rejects the credentials; every other native
-            failure propagates for the template to wrap as
-            ``reason="failed"``.
+        ArtifactAcquisitionError: With ``reason="downloads_disabled"`` when
+            the policy forbids the transfer; with
+            ``reason="action_required"`` when the source is gated or
+            rejects the credentials; every other native failure propagates
+            for the template to wrap as ``reason="failed"``.
     """
+    if config.local_files_only or not allow_downloads():
+        raise ArtifactAcquisitionError(
+            "Acquisition needs a network transfer, and downloads are disabled for this engine.",
+            reason="downloads_disabled",
+            hint=(
+                "Unset local_files_only and set STANDARD_ASR_ALLOW_DOWNLOAD=1 "
+                "to permit the transfer."
+            ),
+        )
     if progress is not None:
         progress(
             ArtifactProgress(phase=ARTIFACT_PROGRESS_TRANSFERRING, artifact_id=LOCAL_ARTIFACT_ID)

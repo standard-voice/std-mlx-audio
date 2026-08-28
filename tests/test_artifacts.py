@@ -1188,6 +1188,88 @@ def test_vibevoice_model_path_companion_policy(
     assert isinstance(exc_info.value.__cause__, OSError)
 
 
+def test_vibevoice_bundled_tokenizer_needs_no_companion(
+    fake_loader: Callable[..., FakeLoader],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The upstream hook tries the checkpoint directory FIRST and falls
+    # back to the companion repo only when that fails, so a checkpoint
+    # bundling a loadable tokenizer is self-contained: no companion
+    # requirement, no fetch, and no acquisition possible during inference
+    # (round-12 review; the accepted layouts are ablation-proven against
+    # the installed transformers).
+    loader = fake_loader()
+    local = tmp_path / "vibevoice"
+    local.mkdir()
+    (local / "config.json").write_text("{}")
+    (local / "model.safetensors").write_bytes(b"\x00" * 8)
+    (local / "tokenizer.json").write_text("{}")
+    FakeSnapshot.companion_cached_path = None
+    monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "0")
+    engine = VibeVoiceAsr(model_path=str(local))
+    (requirement,) = engine.artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+    engine.prepare()
+    assert FakeSnapshot.companion_download_calls == 0
+    assert loader.load_calls[0]["model_path"] == str(local)
+
+    monkeypatch.delenv("STANDARD_ASR_ALLOW_DOWNLOAD")
+    (requirement,) = VibeVoiceAsr(model_path=str(local)).artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+    assert requirement.may_acquire_during_inference is False
+
+    # A bare vocab + merges pair without the tokenizer config provably
+    # FAILS to load beside the checkpoint's own config, so it does not
+    # count as bundled and the companion is still required.
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    (bare / "config.json").write_text("{}")
+    (bare / "model.safetensors").write_bytes(b"\x00" * 8)
+    (bare / "vocab.json").write_text("{}")
+    (bare / "merges.txt").write_text("")
+    monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "0")
+    (requirement,) = VibeVoiceAsr(model_path=str(bare)).artifact_status().requirements
+    assert requirement.state == "incomplete"
+    assert requirement.acquisition_blocker == "downloads_disabled"
+
+
+def test_vibevoice_bundled_hub_snapshot_needs_no_companion(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # The same self-containment applies to a Hub snapshot: if the repo
+    # ever ships tokenizer files, the load stays local and a cold
+    # companion cache must not degrade readiness.
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    (snapshot / "tokenizer.json").write_text("{}")
+    FakeSnapshot.cached_path = str(snapshot)
+    FakeSnapshot.companion_cached_path = None
+    (requirement,) = VibeVoiceAsr().artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+
+
+def test_acquire_companion_applies_the_download_policy_at_entry(
+    fake_loader: Callable[..., FakeLoader], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Spec AR.3 applies the download toggle before the transfer; the
+    # preflight that made the local target runnable is a separate earlier
+    # query, so the hook entry re-applies the policy like acquire() does
+    # (round-12 review).
+    from std_mlx_audio._artifacts import acquire_companion
+
+    fake_loader()
+    monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "0")
+    config = VibeVoiceAsr(model_path="/nonexistent").config
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        acquire_companion(config, "Qwen/Qwen2.5-7B", None)
+    assert exc_info.value.reason == "downloads_disabled"
+    assert FakeSnapshot.companion_download_calls == 0
+
+
 def test_vibevoice_implicit_load_prefetches_the_companion(
     fake_loader: Callable[..., FakeLoader], tmp_path: Path
 ) -> None:
