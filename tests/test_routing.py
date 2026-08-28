@@ -309,6 +309,8 @@ def test_cohere_loads_from_subfolder(
     subfolder.mkdir()
     (subfolder / "config.json").write_text("{}")
     (subfolder / "model.safetensors").write_bytes(b"\x00" * 8)
+    (subfolder / "tokenizer.model").write_text("{}")
+    (subfolder / "tokenizer_config.json").write_text("{}")
     loader = fake_loader(output=FakeSTTOutput(text="hi"))
     FakeSnapshot.cached_path = str(tmp_path)
     CohereAsr().prepare()

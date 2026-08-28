@@ -166,14 +166,24 @@ The `post_load_hook` of several families loads its tokenizer or
 normalization assets with `if path.exists()` (or `try/except: pass`) and the
 decode path then falls back without any signal: SenseVoice and MMS emit the
 numeric token ids as the transcript, FireRedASR2 returns an empty string,
-Moonshine joins per-id characters. A partial snapshot (config + weights,
-assets missing) therefore transcribes silently wrong. Verified per family in
-the installed mlx-audio; the plugin closes it by declaring each verified
-family's non-weight closure in `required_snapshot_files` (status reports
-`incomplete`, and the implicit-load recheck refuses the fragment). The
-remaining audited families raise at load (Qwen3, GLM, Granite x2, Voxtral
-x2, Fun-ASR, Qwen2-Audio, Cohere) or at the first generate (Canary), and
-Parakeet / Nemotron embed their vocabularies in `config.json`.
+Moonshine joins per-id characters, and Cohere-ASR decodes with an empty
+special-token set (the language, task, and speaker tags leak into the text)
+when its tokenizer config is absent. A partial snapshot (config + weights,
+assets missing) therefore transcribes silently wrong. Verified per family
+in the installed mlx-audio; the plugin closes it by declaring each verified
+family's silent-corruption files in `required_checkpoint_files` (status
+reports `incomplete` for any checkpoint, `model_path` included, and the
+implicit-load recheck refuses the fragment). The families that instead fail
+loudly at load (Qwen3, GLM, Granite x2, Voxtral x2, Fun-ASR, Qwen2-Audio)
+or at the first generate (Whisper, Canary) get `required_snapshot_files`:
+per-file-ablated single points of failure that gate only the Hub snapshot,
+so status stays honest for an interrupted download and plain `pull`
+repairs it, while alternative local layouts (Canary's `tokens.txt`, a
+vocab + merges tokenizer) are not falsely rejected. Two upstream details
+worth knowing: FireRed's `train_bpe1000.model` is loaded into a field no
+decode path reads (dead code), and Parakeet / Nemotron embed their
+vocabularies in `config.json` (the repos' tokenizer files are conversion
+by-products).
 
 ---
 
@@ -187,8 +197,13 @@ with `*.mvn`. Second, the VibeVoice-ASR checkpoint ships no tokenizer files
 at all, and the upstream hook silently falls back to downloading the
 `Qwen/Qwen2.5-7B` tokenizer from the Hub on every cold load -- a network
 fetch that happens inside transformers, past the engine's
-`local_files_only`. Offline use requires a warm transformers cache; the
-preset docstring carries the caveat.
+`local_files_only`. The plugin models that repo as the preset's companion
+tokenizer: status requires it in the default Hugging Face cache, `pull`
+acquires it there, and a load under a no-download policy refuses instead of
+letting the upstream fetch bypass the policy. The residual (cached
+tokenizer, downloads disabled, network reachable: transformers may still
+revalidate against the Hub and fetch an updated file) stays documented on
+the preset.
 
 ---
 

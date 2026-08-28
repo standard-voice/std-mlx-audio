@@ -42,6 +42,7 @@ from standard_asr import (
 )
 from standard_asr.audio.format import AudioFormat
 from standard_asr.contract.artifacts import (
+    ARTIFACT_BLOCKER_DOWNLOADS_DISABLED,
     ARTIFACT_INCOMPLETE,
     ARTIFACT_MISSING,
     ARTIFACT_READY,
@@ -76,6 +77,8 @@ from ._artifacts import (
     HUB_ARTIFACT_ID,
     acquire,
     checkpoint_complete,
+    companion_tokenizer_cached,
+    fetch_companion_tokenizer,
     normalized_model_path,
     raise_for_gated_source,
     resolve_for_load,
@@ -164,11 +167,29 @@ class MlxAudioASR(EngineBase):
     #: ``mlx-int8/``). When set, the loader snapshot-downloads the repo and points
     #: ``load`` at ``<snapshot>/<subfolder>``. ``None`` (default) loads from root.
     hf_subfolder: ClassVar[str | None] = None
-    #: Files that MUST exist in the resolved snapshot for readiness, beyond the
-    #: generic checkpoint shape (config.json + weights / a complete shard
-    #: index). MMS uses it: its base weights sit beside 1198 per-language
-    #: adapters, and any single adapter would satisfy a bare glob.
+    #: Files the installed family loader reads by ONE fixed name and whose
+    #: absence silently corrupts output (numeric ids, empty text, character
+    #: soup, unstripped special tokens). They gate EVERY checkpoint of the
+    #: family -- an operator ``model_path`` included -- beyond the generic
+    #: checkpoint shape (config.json + weights / a complete shard index).
+    #: Each entry is verified against the installed loader's code.
+    required_checkpoint_files: ClassVar[tuple[str, ...]] = ()
+    #: Files whose absence provably breaks inference for THIS preset's own
+    #: repo layout (verified by per-file loader ablation against the
+    #: installed stack). They gate only the Hub snapshot -- acquisition
+    #: completeness -- never an operator ``model_path``: the flexible
+    #: upstream loaders accept alternative local layouts (Canary reads
+    #: tokenizer.model, tokens.txt, or a config-embedded tokenizer;
+    #: transformers falls back from tokenizer.json to vocab + merges) that
+    #: an exact-name check would wrongly reject (round-9 review).
     required_snapshot_files: ClassVar[tuple[str, ...]] = ()
+    #: Optional Hub repo the upstream loader fetches its tokenizer from at
+    #: LOAD time (VibeVoice ships no tokenizer files and its hook falls back
+    #: to a Hub fetch that bypasses ``local_files_only``). When set, status
+    #: requires the companion tokenizer in the DEFAULT Hugging Face cache,
+    #: ``pull`` acquires it, and a load under a no-download policy refuses
+    #: rather than letting the upstream fetch violate the policy silently.
+    companion_tokenizer_repo: ClassVar[str | None] = None
 
     #: Static upper bounds shared by every preset in this plugin-owned family:
     #: each Hub preset supports explicit snapshot acquisition (plugin-side
@@ -292,12 +313,34 @@ class MlxAudioASR(EngineBase):
             config,
             type(self).hf_repo,
             type(self).hf_subfolder,
+            type(self).required_checkpoint_files,
             type(self).required_snapshot_files,
+            type(self).companion_tokenizer_repo,
         )
         report = ArtifactReport.from_requirements(
             mode=mode, applicable=True, requirements=(requirement,)
         )
         if requirement.state != ARTIFACT_READY:
+            if (
+                config.model_path is not None
+                and requirement.acquisition_blocker == ARTIFACT_BLOCKER_DOWNLOADS_DISABLED
+            ):
+                # The checkpoint directory itself is complete; what is
+                # missing is the family's companion tokenizer, which the
+                # upstream loader would fetch from the Hub PAST the
+                # no-download policy. Refuse loudly instead.
+                raise ArtifactUnavailableError(
+                    f"The model_path checkpoint is complete, but its tokenizer "
+                    f"comes from the {type(self).companion_tokenizer_repo} Hub "
+                    "repo, the local cache does not hold it, and downloads are "
+                    "disabled.",
+                    reason="downloads_disabled",
+                    report=report,
+                    hint=(
+                        "Enable downloads for one load to cache the tokenizer, "
+                        "or warm the Hugging Face cache on a connected machine."
+                    ),
+                )
             if config.model_path is not None and requirement.state in (
                 ARTIFACT_MISSING,
                 ARTIFACT_INCOMPLETE,
@@ -363,10 +406,8 @@ class MlxAudioASR(EngineBase):
             # return the same incomplete directory status just reported.
             # Re-verify with the status check's own rule before the
             # strict=False loader turns a fragment into fluent garbage.
-            if not (
-                checkpoint_dir.is_dir()
-                and checkpoint_complete(checkpoint_dir, type(self).required_snapshot_files)
-            ):
+            hub_required = type(self).required_checkpoint_files + type(self).required_snapshot_files
+            if not (checkpoint_dir.is_dir() and checkpoint_complete(checkpoint_dir, hub_required)):
                 raise ArtifactAcquisitionError(
                     f"The {type(self).hf_repo} snapshot resolved without a "
                     "complete checkpoint; the source may be unreachable and "
@@ -392,13 +433,33 @@ class MlxAudioASR(EngineBase):
         # "wav2vec2"); the preset pins the family so the loader does not mis-route.
         if type(self).load_model_type is not None:
             load_kwargs["model_type"] = type(self).load_model_type
+        companion = type(self).companion_tokenizer_repo
+        if companion is not None and not companion_tokenizer_cached(companion):
+            # Only reachable with downloads allowed (the guard above refused
+            # the no-download cold-cache case): fetch the companion through
+            # the plugin's own path so a transfer failure classifies as a
+            # failed implicit acquisition, not an opaque loader error from
+            # the upstream hook's uncontrolled fallback fetch.
+            try:
+                fetch_companion_tokenizer(companion)
+            except Exception as exc:
+                raise_for_gated_source(exc, companion, report)
+                raise ArtifactAcquisitionError(
+                    f"First-use acquisition of the {companion} companion "
+                    f"tokenizer failed: {type(exc).__name__}.",
+                    reason="failed",
+                    report=report,
+                    hint="Run 'standard-asr pull' while the source is reachable.",
+                ) from exc
         try:
             self._model = load(model_source, **load_kwargs)
         except Exception as exc:
             raise TranscriptionError(
                 f"mlx-audio failed to load the model at {model_source!r}: "
                 f"{type(exc).__name__}. Ensure the checkpoint is a valid MLX "
-                "bundle and the platform can run MLX."
+                "bundle and the platform can run MLX; if this model worked "
+                "before, run 'standard-asr pull --refresh' to re-fetch any "
+                "files its snapshot lacks."
             ) from exc
         self._verify_model_family()
         self._prime_generation_thread()
@@ -523,7 +584,9 @@ class MlxAudioASR(EngineBase):
             config,
             type(self).hf_repo,
             type(self).hf_subfolder,
+            type(self).required_checkpoint_files,
             type(self).required_snapshot_files,
+            type(self).companion_tokenizer_repo,
         )
         return True, (requirement,), ()
 
@@ -554,7 +617,13 @@ class MlxAudioASR(EngineBase):
         """
         config = cast(MlxAudioConfig, self.config)
         if any(item.artifact_id == HUB_ARTIFACT_ID for item in requirements):
-            acquire(config, type(self).hf_repo, progress, refresh=refresh)
+            acquire(
+                config,
+                type(self).hf_repo,
+                progress,
+                refresh=refresh,
+                companion_repo=type(self).companion_tokenizer_repo,
+            )
 
     # ------------------------------------------------------------------ #
     # Batch
@@ -859,10 +928,22 @@ def _prepared_to_pcm(prepared: PreparedAudio) -> bytes:
 # transcribe/stream pipeline are inherited unchanged. This is "one engine, many
 # models" — three DIFFERENT backend families under one engine_id.
 # --------------------------------------------------------------------------- #
+#: The Qwen3-ASR repos ship a GPT2-style tokenizer (no tokenizer.json), so all
+#: four files are single points of failure for the hook's AutoTokenizer +
+#: WhisperFeatureExtractor calls (per-file ablation, round-9 review).
+_QWEN3_SNAPSHOT_FILES = (
+    "merges.txt",
+    "preprocessor_config.json",
+    "tokenizer_config.json",
+    "vocab.json",
+)
+
+
 class Qwen3Asr06B(MlxAudioASR):
     """``mlx-audio/qwen3-asr-0.6b`` — small Qwen3-ASR (the headliner)."""
 
     hf_repo: ClassVar[str] = "mlx-community/Qwen3-ASR-0.6B-4bit"
+    required_snapshot_files: ClassVar[tuple[str, ...]] = _QWEN3_SNAPSHOT_FILES
     backend: ClassVar[ModelBackend] = Qwen3AsrBackend()
     properties: ClassVar[BaseProperties] = Qwen3Asr06BProperties()
     declared_capabilities: ClassVar[DeclaredCapabilities] = _QWEN_CAPABILITIES
@@ -872,6 +953,7 @@ class Qwen3Asr17B(MlxAudioASR):
     """``mlx-audio/qwen3-asr-1.7b`` — larger, more accurate Qwen3-ASR."""
 
     hf_repo: ClassVar[str] = "mlx-community/Qwen3-ASR-1.7B-8bit"
+    required_snapshot_files: ClassVar[tuple[str, ...]] = _QWEN3_SNAPSHOT_FILES
     backend: ClassVar[ModelBackend] = Qwen3AsrBackend()
     properties: ClassVar[BaseProperties] = Qwen3Asr17BProperties()
     declared_capabilities: ClassVar[DeclaredCapabilities] = _QWEN_CAPABILITIES
@@ -907,13 +989,12 @@ class WhisperLargeV3Turbo(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "openai/whisper-large-v3-turbo"
-    # The WhisperProcessor files are part of the inference closure: without
-    # them the loader only WARNS and the first generate fails ("Processor
-    # not found"), so a snapshot lacking them must not report ready.
-    required_snapshot_files: ClassVar[tuple[str, ...]] = (
-        "tokenizer.json",
-        "preprocessor_config.json",
-    )
+    # Without it the WhisperProcessor load only WARNS and the first generate
+    # fails ("Processor not found"). The single point of failure is the
+    # feature-extractor config: the OpenAI repos ship BOTH tokenizer layouts
+    # (tokenizer.json and vocab + merges), so no single tokenizer file is
+    # load-bearing (per-file ablation, round-9 review).
+    required_snapshot_files: ClassVar[tuple[str, ...]] = ("preprocessor_config.json",)
     backend: ClassVar[ModelBackend] = WhisperBackend()
     properties: ClassVar[BaseProperties] = WhisperLargeV3TurboProperties()
     declared_capabilities: ClassVar[DeclaredCapabilities] = _WHISPER_CAPABILITIES
@@ -928,11 +1009,9 @@ class WhisperTiny(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "openai/whisper-tiny"
-    # See WhisperLargeV3Turbo: the processor files are inference closure.
-    required_snapshot_files: ClassVar[tuple[str, ...]] = (
-        "tokenizer.json",
-        "preprocessor_config.json",
-    )
+    # See WhisperLargeV3Turbo: the feature-extractor config is the single
+    # point of failure for the processor load.
+    required_snapshot_files: ClassVar[tuple[str, ...]] = ("preprocessor_config.json",)
     backend: ClassVar[ModelBackend] = WhisperBackend()
     properties: ClassVar[BaseProperties] = WhisperTinyProperties()
     declared_capabilities: ClassVar[DeclaredCapabilities] = _WHISPER_CAPABILITIES
@@ -977,11 +1056,13 @@ class SenseVoiceSmall(MlxAudioASR):
     # Both are SILENT when absent (round-8 review): without the bpe model
     # the decoder emits numeric token ids as the transcript, and without
     # am.mvn the feature normalization is silently skipped (the config
-    # carries no cmvn fallback). am.mvn needs the plugin's extended
-    # snapshot allow patterns -- the upstream defaults never fetch it.
-    required_snapshot_files: ClassVar[tuple[str, ...]] = (
-        "chn_jpn_yue_eng_ko_spectok.bpe.model",
+    # carries no cmvn fallback). The loader reads both by fixed name, so
+    # they gate every checkpoint, model_path included. am.mvn needs the
+    # plugin's extended snapshot allow patterns -- the upstream defaults
+    # never fetch it.
+    required_checkpoint_files: ClassVar[tuple[str, ...]] = (
         "am.mvn",
+        "chn_jpn_yue_eng_ko_spectok.bpe.model",
     )
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(
@@ -1018,6 +1099,14 @@ class CohereAsr(MlxAudioASR):
     # The repo stores its checkpoint (config.json, weights, tokenizer) under the
     # ``mlx-int8/`` subfolder, not the repo root, so point the loader there.
     hf_subfolder: ClassVar[str | None] = "mlx-int8"
+    # SILENT when absent (round-9 review): the upstream tokenizer falls back
+    # to hardcoded token DEFAULTS when tokenizer_config.json is missing, so
+    # additional_special_tokens becomes empty and the 200-plus language,
+    # task, and speaker tags leak into the transcript unstripped.
+    required_checkpoint_files: ClassVar[tuple[str, ...]] = ("tokenizer_config.json",)
+    # LOUD when absent (sentencepiece raises at load), so it gates only the
+    # snapshot; the exact filename is this repo's layout.
+    required_snapshot_files: ClassVar[tuple[str, ...]] = ("tokenizer.model",)
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(
             model_types=("cohere_asr",),
@@ -1044,6 +1133,11 @@ class FunAsrNano(MlxAudioASR):
     """``mlx-audio/fun-asr-nano`` — Fun-ASR-Nano (hotwords + ITN, per-chunk timing)."""
 
     hf_repo: ClassVar[str] = "mlx-community/Fun-ASR-Nano-2512"
+    # No declared closure files: the hook loads its Qwen tokenizer from the
+    # config-named ``Qwen3-0.6B/`` subdirectory, which ships BOTH tokenizer
+    # layouts, so no single file is a point of failure (per-file ablation,
+    # round-9 review); a snapshot missing the whole subdirectory fails
+    # loudly at load and 'pull --refresh' repairs it.
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(
             model_types=("fun_asr_nano",),
@@ -1089,6 +1183,13 @@ class VoxtralMini3B(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "mlx-community/Voxtral-Mini-3B-2507-bf16"
+    # Both are single points of failure for the hook's AutoProcessor call:
+    # the feature-extractor config and the tekken tokenizer serialization
+    # (per-file ablation, round-9 review).
+    required_snapshot_files: ClassVar[tuple[str, ...]] = (
+        "preprocessor_config.json",
+        "tekken.json",
+    )
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(
             model_types=("voxtral",),
@@ -1129,7 +1230,10 @@ class Canary1BV2(MlxAudioASR):
 
     hf_repo: ClassVar[str] = "CogniSoftOrg/canary-1b-v2-mlx-bf16"
     # Loaded optionally by the upstream hook; absence surfaces only at the
-    # first generate, so it is part of the ready closure.
+    # first generate, so it is part of the SNAPSHOT closure. It must not
+    # gate a model_path: the hook also accepts a tokens.txt vocabulary or a
+    # config-embedded base64 tokenizer, so a local checkpoint using either
+    # alternative is valid (round-9 review).
     required_snapshot_files: ClassVar[tuple[str, ...]] = ("tokenizer.model",)
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(
@@ -1157,6 +1261,10 @@ class Qwen2Audio7B(MlxAudioASR):
     """``mlx-audio/qwen2-audio-7b`` — Qwen2-Audio 7B Instruct (audio-LLM ASR)."""
 
     hf_repo: ClassVar[str] = "mlx-community/Qwen2-Audio-7B-Instruct-4bit"
+    # The single point of failure for the hook's AutoProcessor call; the
+    # repo ships both tokenizer layouts, so no tokenizer file qualifies
+    # (per-file ablation, round-9 review).
+    required_snapshot_files: ClassVar[tuple[str, ...]] = ("preprocessor_config.json",)
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(
             model_types=("qwen2_audio",),
@@ -1185,6 +1293,9 @@ class GlmAsrNano(MlxAudioASR):
     """``mlx-audio/glm-asr-nano`` — GLM-ASR-Nano (per-chunk segment timing)."""
 
     hf_repo: ClassVar[str] = "mlx-community/GLM-ASR-Nano-2512-4bit"
+    # The single point of failure for the hook's AutoTokenizer call: the
+    # repo ships no slow-layout fallback (per-file ablation, round-9 review).
+    required_snapshot_files: ClassVar[tuple[str, ...]] = ("tokenizer.json",)
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(model_types=("glmasr",), segment_timing=True)
     )
@@ -1208,6 +1319,10 @@ class GraniteSpeech1B(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "mlx-community/granite-4.0-1b-speech-5bit"
+    # No declared closure files: the repo ships BOTH tokenizer layouts
+    # (tokenizer.json and vocab + merges), so no single file is a point of
+    # failure for the hook's AutoTokenizer call (per-file ablation,
+    # round-9 review).
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(model_types=("granite_speech",), translate_target_kwarg="language")
     )
@@ -1236,6 +1351,10 @@ class GraniteSpeechNar2B(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "mlx-community/granite-speech-4.1-2b-nar-mlx"
+    # The single point of failure for the hook's AutoTokenizer call: unlike
+    # the 1B repo, this one ships no slow-layout fallback (per-file
+    # ablation, round-9 review).
+    required_snapshot_files: ClassVar[tuple[str, ...]] = ("tokenizer.json",)
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(model_types=("granite_speech_nar",))
     )
@@ -1256,15 +1375,21 @@ class GraniteSpeechNar2B(MlxAudioASR):
 class VibeVoiceAsr(MlxAudioASR):
     """``mlx-audio/vibevoice-asr`` — Microsoft VibeVoice-ASR (context-biased).
 
-    Caveat: the checkpoint repo ships NO tokenizer files, and the upstream
-    loader silently falls back to fetching the ``Qwen/Qwen2.5-7B`` tokenizer
-    from the Hub on every cold load -- a network fetch the engine's
-    ``local_files_only`` cannot gate (it happens inside the upstream hook,
-    through transformers). Offline use requires a warm transformers cache
-    for that tokenizer. See docs/STANDARD_ASR_FINDINGS.md.
+    The checkpoint repo ships NO tokenizer files; the upstream hook falls
+    back to fetching the ``Qwen/Qwen2.5-7B`` tokenizer from the Hub at load
+    time, past the engine's ``local_files_only``. The preset declares that
+    repo as its :attr:`companion_tokenizer_repo`, so status reports the
+    snapshot incomplete until the tokenizer is in the DEFAULT Hugging Face
+    cache (``download_root`` cannot redirect the upstream call), ``pull``
+    acquires it, and a load under a no-download policy refuses instead of
+    letting the upstream fetch run. Residual caveat: with the tokenizer
+    cached, downloads disabled, and the network reachable, the upstream
+    call may still revalidate against the Hub and fetch an updated file if
+    the source repo moved. See docs/STANDARD_ASR_FINDINGS.md.
     """
 
     hf_repo: ClassVar[str] = "mlx-community/VibeVoice-ASR-4bit"
+    companion_tokenizer_repo: ClassVar[str | None] = "Qwen/Qwen2.5-7B"
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(
             model_types=("vibevoice_asr",),
@@ -1296,8 +1421,10 @@ class MoonshineTiny(MlxAudioASR):
 
     hf_repo: ClassVar[str] = "UsefulSensors/moonshine-tiny"
     # SILENT when absent (round-8 review): the upstream hook swallows the
-    # tokenizer load failure and decode falls back to per-id characters.
-    required_snapshot_files: ClassVar[tuple[str, ...]] = ("tokenizer.json",)
+    # tokenizer load failure and decode falls back to per-id characters, so
+    # the file gates every checkpoint, model_path included. The repo ships
+    # no slow-layout fallback (per-file ablation, round-9 review).
+    required_checkpoint_files: ClassVar[tuple[str, ...]] = ("tokenizer.json",)
     backend: ClassVar[ModelBackend] = GenericSttBackend(SttFamilySpec(model_types=("moonshine",)))
     properties: ClassVar[BaseProperties] = stt_properties(
         model_name="moonshine-tiny",
@@ -1322,8 +1449,10 @@ class Mms1BAll(MlxAudioASR):
     #: The base encoder weights sit BESIDE 1198 per-language adapter files
     #: (a bare weights glob would report ready with only an adapter
     #: present), and vocab.json decodes the CTC ids -- without it the
-    #: transcript is silently the numeric ids (round-8 review).
-    required_snapshot_files: ClassVar[tuple[str, ...]] = (
+    #: transcript is silently the numeric ids (round-8 review). Both are
+    #: read by fixed name, so they gate every checkpoint, model_path
+    #: included.
+    required_checkpoint_files: ClassVar[tuple[str, ...]] = (
         "model.safetensors",
         "vocab.json",
     )
@@ -1347,13 +1476,16 @@ class FireRedAsr2Aed(MlxAudioASR):
     """``mlx-audio/fireredasr2-aed`` — FireRedASR2-AED (Chinese/English, beam search)."""
 
     hf_repo: ClassVar[str] = "mlx-community/FireRedASR2-AED-mlx"
-    # All three are loaded optionally upstream (round-8 review): without
+    # Both are loaded optionally upstream (round-8 review): without
     # dict.txt the transcript is silently EMPTY, and without cmvn.json the
-    # feature normalization is silently skipped.
-    required_snapshot_files: ClassVar[tuple[str, ...]] = (
-        "dict.txt",
+    # feature normalization is silently skipped. The repo's
+    # train_bpe1000.model is NOT declared: the loader assigns it to a field
+    # no decode path ever reads (dead upstream code, round-9 review), so
+    # requiring it would reject a working checkpoint for a file that
+    # changes nothing.
+    required_checkpoint_files: ClassVar[tuple[str, ...]] = (
         "cmvn.json",
-        "train_bpe1000.model",
+        "dict.txt",
     )
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(model_types=("fireredasr2",), forward=(("beam_size", "beam_size"),))
@@ -1381,6 +1513,10 @@ class VoxtralRealtime4B(MlxAudioASR):
     """
 
     hf_repo: ClassVar[str] = "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit"
+    # The family reads its tekken tokenizer by fixed name and raises
+    # FileNotFoundError at load when it is absent (loud, so snapshot-only);
+    # the repo ships no other tokenizer layout (round-9 review).
+    required_snapshot_files: ClassVar[tuple[str, ...]] = ("tekken.json",)
     backend: ClassVar[ModelBackend] = GenericSttBackend(
         SttFamilySpec(model_types=("voxtral_realtime",))
     )

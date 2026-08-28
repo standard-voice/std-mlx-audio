@@ -136,19 +136,23 @@ def _make_fake_snapshot_dir() -> str:
     root.mkdir(parents=True)
     (root / "config.json").write_text("{}")
     (root / "model.safetensors").write_bytes(b"\x00" * 8)
-    # Every preset-declared inference closure must be satisfied by this shared
-    # default (the per-family files coexist harmlessly): the Whisper processor
-    # pair, the SenseVoice bpe + normalization stats, the Canary SentencePiece
-    # model, the FireRed dict/cmvn/spm, and the MMS vocab.
+    # Every preset-declared closure (both axes) must be satisfied by this
+    # shared default (the per-family files coexist harmlessly): the Whisper
+    # and Qwen3 processor files, the transformers tokenizer files, the tekken
+    # tokenizer, the SenseVoice bpe + normalization stats, the Canary and
+    # Cohere SentencePiece model, the FireRed dict/cmvn, and the MMS vocab.
+    # It doubles as the warm companion-tokenizer cache (tokenizer.json).
     for name in (
         "tokenizer.json",
+        "tokenizer_config.json",
         "preprocessor_config.json",
+        "merges.txt",
+        "tekken.json",
         "chn_jpn_yue_eng_ko_spectok.bpe.model",
         "am.mvn",
         "tokenizer.model",
         "dict.txt",
         "cmvn.json",
-        "train_bpe1000.model",
         "vocab.json",
     ):
         (root / name).write_text("{}")
@@ -160,6 +164,10 @@ def _make_fake_snapshot_dir() -> str:
 #: directory (see ``_make_fake_snapshot_dir``).
 FAKE_SNAPSHOT_DIR = _make_fake_snapshot_dir()
 
+#: The one companion tokenizer repo the plugin declares (VibeVoice); calls for
+#: it route through the FakeSnapshot companion seam.
+_COMPANION_TOKENIZER_REPO = "Qwen/Qwen2.5-7B"
+
 
 class FakeSnapshot:
     """Controls the fake ``huggingface_hub.snapshot_download``.
@@ -168,6 +176,11 @@ class FakeSnapshot:
     (``None`` = not cached: the call raises, like the real helper). An online
     call records itself, optionally raises, and can flip the cache to
     ``download_target`` (simulating a completed acquisition).
+
+    The VibeVoice companion tokenizer repo resolves through its own seam
+    (``companion_cached_path`` and the companion bookkeeping): its default is
+    the warm shared directory so the rest of the suite never trips over a
+    cold companion cache, and the VibeVoice tests set it explicitly.
     """
 
     cached_path: str | None = None
@@ -183,6 +196,15 @@ class FakeSnapshot:
     #: overwrites ``last_kwargs``, so acquisition tests read this one).
     last_download_kwargs: dict[str, Any] = {}
     download_calls: int = 0
+    #: The cached hit for the companion tokenizer repo (``None`` = cold).
+    companion_cached_path: str | None = None
+    #: Kwargs of the last companion call (cache-only or online).
+    companion_last_kwargs: dict[str, Any] = {}
+    #: Kwargs of the last ONLINE companion call (a later cache-only status
+    #: probe overwrites ``companion_last_kwargs``).
+    companion_last_download_kwargs: dict[str, Any] = {}
+    companion_download_calls: int = 0
+    raise_on_companion_download: BaseException | None = None
 
     @classmethod
     def reset(cls) -> None:
@@ -194,6 +216,11 @@ class FakeSnapshot:
         cls.last_kwargs = {}
         cls.last_download_kwargs = {}
         cls.download_calls = 0
+        cls.companion_cached_path = FAKE_SNAPSHOT_DIR
+        cls.companion_last_kwargs = {}
+        cls.companion_last_download_kwargs = {}
+        cls.companion_download_calls = 0
+        cls.raise_on_companion_download = None
 
 
 def _fake_snapshot_download(
@@ -206,6 +233,28 @@ def _fake_snapshot_download(
     allow_patterns: list[str] | None = None,
 ) -> str:
     """Mirror the ``snapshot_download`` contract against ``FakeSnapshot``."""
+    if repo_id == _COMPANION_TOKENIZER_REPO:
+        FakeSnapshot.companion_last_kwargs = {
+            "repo_id": repo_id,
+            "revision": revision,
+            "cache_dir": cache_dir,
+            "local_files_only": local_files_only,
+            "token": token,
+            "allow_patterns": allow_patterns,
+        }
+        if local_files_only:
+            if FakeSnapshot.companion_cached_path is None:
+                from huggingface_hub.errors import LocalEntryNotFoundError
+
+                raise LocalEntryNotFoundError("companion tokenizer is not cached")
+            return FakeSnapshot.companion_cached_path
+        FakeSnapshot.companion_last_download_kwargs = dict(FakeSnapshot.companion_last_kwargs)
+        FakeSnapshot.companion_download_calls += 1
+        if FakeSnapshot.raise_on_companion_download is not None:
+            raise FakeSnapshot.raise_on_companion_download
+        if FakeSnapshot.companion_cached_path is None:
+            FakeSnapshot.companion_cached_path = FAKE_SNAPSHOT_DIR
+        return FakeSnapshot.companion_cached_path
     FakeSnapshot.last_kwargs = {
         "repo_id": repo_id,
         "revision": revision,

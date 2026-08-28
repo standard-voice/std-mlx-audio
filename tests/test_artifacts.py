@@ -27,7 +27,15 @@ from standard_asr.contract.exceptions import (
     ArtifactUnavailableError,
 )
 
-from std_mlx_audio import CohereAsr, Mms1BAll, WhisperTiny
+from std_mlx_audio import (
+    Canary1BV2,
+    CohereAsr,
+    FireRedAsr2Aed,
+    Mms1BAll,
+    Qwen3Asr06B,
+    VibeVoiceAsr,
+    WhisperTiny,
+)
 
 from .conftest import FAKE_SNAPSHOT_DIR, FakeHfApi, FakeLoader, FakeSnapshot
 
@@ -47,7 +55,8 @@ def _snapshot_dir(tmp_path: Path, sha: str = PINNED) -> Path:
     snapshot.mkdir(parents=True)
     (snapshot / "config.json").write_text("{}")
     (snapshot / "model.safetensors").write_bytes(b"\x00" * 64)
-    # The Whisper presets declare the processor files as inference closure.
+    # The Whisper presets declare the feature-extractor config as snapshot
+    # closure; the tokenizer file is a harmless extra.
     (snapshot / "tokenizer.json").write_text("{}")
     (snapshot / "preprocessor_config.json").write_text("{}")
     return snapshot
@@ -139,6 +148,8 @@ def test_subfolder_present_is_ready_at_the_subfolder(
     (snapshot / "mlx-int8").mkdir()
     (snapshot / "mlx-int8" / "config.json").write_text("{}")
     (snapshot / "mlx-int8" / "model.safetensors").write_bytes(b"\x00" * 8)
+    (snapshot / "mlx-int8" / "tokenizer.model").write_text("{}")
+    (snapshot / "mlx-int8" / "tokenizer_config.json").write_text("{}")
     FakeSnapshot.cached_path = str(snapshot)
     (requirement,) = CohereAsr().artifact_status().requirements
     assert requirement.state == ARTIFACT_READY
@@ -672,19 +683,22 @@ def test_partial_shard_set_without_index_is_incomplete(
     assert requirement.state == ARTIFACT_READY
 
 
-def test_whisper_missing_processor_files_is_incomplete(
+def test_whisper_missing_processor_config_is_incomplete(
     fake_loader: Callable[..., FakeLoader], tmp_path: Path
 ) -> None:
-    # The Whisper backend needs the WhisperProcessor files beside the
-    # weights: without them the loader only WARNS and the first generate
-    # fails ("Processor not found"), so a snapshot lacking them must not
-    # report ready -- and the same closure applies to an operator
-    # model_path (round-4 review).
+    # The Whisper backend needs the WhisperProcessor beside the weights:
+    # without it the loader only WARNS and the first generate fails
+    # ("Processor not found"). The single point of failure is the
+    # feature-extractor config (the OpenAI repos ship both tokenizer
+    # layouts), and the snapshot axis gates only the Hub snapshot: a
+    # model_path may use any layout the flexible loader accepts, so it
+    # stays ready without the file (round-9 review).
     fake_loader()
     snapshot = tmp_path / "snapshots" / PINNED
     snapshot.mkdir(parents=True)
     (snapshot / "config.json").write_text("{}")
     (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    (snapshot / "tokenizer.json").write_text("{}")
     FakeSnapshot.cached_path = str(snapshot)
     (requirement,) = WhisperTiny().artifact_status().requirements
     assert requirement.state == "incomplete"
@@ -694,14 +708,10 @@ def test_whisper_missing_processor_files_is_incomplete(
     (local / "config.json").write_text("{}")
     (local / "model.safetensors").write_bytes(b"\x00" * 8)
     (requirement,) = WhisperTiny(model_path=str(local)).artifact_status().requirements
-    assert requirement.state == "incomplete"
-
-    for root in (snapshot, local):
-        (root / "tokenizer.json").write_text("{}")
-        (root / "preprocessor_config.json").write_text("{}")
-    (requirement,) = WhisperTiny().artifact_status().requirements
     assert requirement.state == ARTIFACT_READY
-    (requirement,) = WhisperTiny(model_path=str(local)).artifact_status().requirements
+
+    (snapshot / "preprocessor_config.json").write_text("{}")
+    (requirement,) = WhisperTiny().artifact_status().requirements
     assert requirement.state == ARTIFACT_READY
 
 
@@ -835,13 +845,25 @@ def test_refresh_fails_when_the_source_names_no_commit(
         ("SenseVoiceSmall", ("chn_jpn_yue_eng_ko_spectok.bpe.model", "am.mvn")),
         # Missing dict.txt yields a silently EMPTY transcript; missing
         # cmvn.json silently skips normalization.
-        ("FireRedAsr2Aed", ("dict.txt", "cmvn.json", "train_bpe1000.model")),
+        ("FireRedAsr2Aed", ("dict.txt", "cmvn.json")),
         # The upstream hook swallows the tokenizer load failure and decode
         # falls back to per-id characters.
         ("MoonshineTiny", ("tokenizer.json",)),
         # The tokenizer is loaded optionally and its absence raises only at
         # the first generate.
         ("Canary1BV2", ("tokenizer.model",)),
+        # The hook's AutoTokenizer + WhisperFeatureExtractor calls each
+        # break without their single-point files (per-file ablation).
+        (
+            "Qwen3Asr06B",
+            ("merges.txt", "preprocessor_config.json", "tokenizer_config.json", "vocab.json"),
+        ),
+        # AutoTokenizer breaks without the fast serialization (no slow
+        # fallback in this repo).
+        ("GlmAsrNano", ("tokenizer.json",)),
+        # The realtime tokenizer reads tekken.json by fixed name and raises
+        # at load without it.
+        ("VoxtralRealtime4B", ("tekken.json",)),
     ],
 )
 def test_family_inference_closure_gates_ready(
@@ -850,11 +872,11 @@ def test_family_inference_closure_gates_ready(
     preset_name: str,
     family_files: tuple[str, ...],
 ) -> None:
-    # A snapshot holding only config + weights must NOT report ready for
-    # families whose loaders silently degrade (numeric ids, empty text,
-    # character soup) or fail only at the first request when their
-    # non-weight inference files are absent (round-8 review; every listed
-    # file is verified against the installed loader AND the preset's repo).
+    # A snapshot holding only config + weights must NOT report ready when a
+    # preset-declared closure file is absent: silent-corruption files
+    # (checkpoint axis) and repo-layout single points of failure (snapshot
+    # axis) both gate the Hub snapshot (rounds 8-9; every listed file is
+    # verified against the installed loader AND the preset's repo).
     import std_mlx_audio
 
     preset = getattr(std_mlx_audio, preset_name)
@@ -889,6 +911,238 @@ def test_snapshot_filter_includes_the_mvn_gap(
     patterns = FakeSnapshot.last_kwargs["allow_patterns"]
     assert "*.mvn" in patterns
     assert "*.model" in patterns  # the upstream defaults are still present
+
+
+# --------------------------------------------------------------------------- #
+# Round-9 review regressions: the two closure axes and the companion tokenizer
+# --------------------------------------------------------------------------- #
+def test_canary_model_path_accepts_the_loader_alternatives(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # The Canary hook reads tokenizer.model, tokens.txt, OR a
+    # config-embedded tokenizer. Requiring the Hub repo's exact filename
+    # rejected valid local checkpoints (round-9 review), so the snapshot
+    # axis must not gate a model_path.
+    loader = fake_loader()
+    root = tmp_path / "canary"
+    root.mkdir()
+    (root / "config.json").write_text("{}")
+    (root / "model.safetensors").write_bytes(b"\x00" * 8)
+    (root / "tokens.txt").write_text("a 1\n")
+    engine = Canary1BV2(model_path=str(root))
+    (requirement,) = engine.artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+    engine.prepare()
+    assert loader.load_calls[0]["model_path"] == str(root)
+
+
+def test_firered_dead_spm_file_is_not_required(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # The loader assigns train_bpe1000.model to a field no decode path ever
+    # reads (dead upstream code): requiring it rejected working checkpoints
+    # for a file that changes nothing (round-9 review).
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    for name in ("config.json", "dict.txt", "cmvn.json"):
+        (snapshot / name).write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.cached_path = str(snapshot)
+    (requirement,) = FireRedAsr2Aed().artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+
+
+def test_cohere_missing_tokenizer_config_gates_a_model_path(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # Without tokenizer_config.json the upstream tokenizer silently falls
+    # back to an EMPTY additional_special_tokens list, so the 200-plus
+    # language, task, and speaker tags leak into the transcript unstripped
+    # (round-9 review): the checkpoint axis gates a model_path too.
+    fake_loader()
+    local = tmp_path / "cohere"
+    local.mkdir()
+    (local / "config.json").write_text("{}")
+    (local / "model.safetensors").write_bytes(b"\x00" * 8)
+    (local / "tokenizer.model").write_text("{}")
+    (requirement,) = CohereAsr(model_path=str(local)).artifact_status().requirements
+    assert requirement.state == "incomplete"
+
+    (local / "tokenizer_config.json").write_text("{}")
+    (requirement,) = CohereAsr(model_path=str(local)).artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+
+
+def test_loud_family_fragment_reports_incomplete_and_plain_pull_repairs(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # Round-9 review: with an empty closure, an interrupted snapshot of a
+    # family whose loader fails loudly still reported READY, the load
+    # failure was misclassified as an engine fault, and plain pull was a
+    # no-op (only refresh could repair). With the ablation-verified closure
+    # declared, status is honest and plain pull completes the fragment.
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    for name in ("merges.txt", "preprocessor_config.json", "tokenizer_config.json"):
+        (snapshot / name).write_text("{}")
+    # vocab.json never arrived.
+    FakeSnapshot.cached_path = str(snapshot)
+    engine = Qwen3Asr06B()
+    (requirement,) = engine.artifact_status().requirements
+    assert requirement.state == "incomplete"
+    assert requirement.can_acquire_now is True
+
+    FakeSnapshot.on_download = lambda: (snapshot / "vocab.json").write_text("{}")
+    report = engine.acquire_artifacts()
+    assert report.readiness == ARTIFACTS_READY
+
+
+def test_vibevoice_cold_companion_degrades_status_and_pull_fetches_it(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # The checkpoint repo ships no tokenizer files; the upstream hook
+    # Hub-fetches Qwen/Qwen2.5-7B at load time. A complete snapshot without
+    # the cached companion is NOT offline-ready, and pull must acquire the
+    # companion into the DEFAULT cache -- the upstream from_pretrained call
+    # reads only there (round-9 review).
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.cached_path = str(snapshot)
+    FakeSnapshot.companion_cached_path = None
+    engine = VibeVoiceAsr()
+    (requirement,) = engine.artifact_status().requirements
+    assert requirement.state == "incomplete"
+    assert requirement.can_acquire_now is True
+
+    report = engine.acquire_artifacts()
+    assert report.readiness == ARTIFACTS_READY
+    assert FakeSnapshot.companion_download_calls == 1
+    assert FakeSnapshot.companion_last_download_kwargs["cache_dir"] is None
+    assert FakeSnapshot.companion_last_download_kwargs["token"] is None
+    patterns = FakeSnapshot.companion_last_download_kwargs["allow_patterns"] or []
+    assert "tokenizer.json" in patterns
+    assert "tokenizer_config.json" in patterns
+
+
+def test_vibevoice_pull_translates_a_gated_companion(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # A companion rejection during pull carries the discovered action, the
+    # same way the main snapshot's gated translation does.
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.cached_path = str(snapshot)
+    FakeSnapshot.companion_cached_path = None
+    FakeSnapshot.raise_on_companion_download = _gated_error()
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        VibeVoiceAsr().acquire_artifacts()
+    assert exc_info.value.reason == "action_required"
+
+    # A plain network failure propagates for the template to wrap.
+    FakeSnapshot.raise_on_companion_download = OSError("offline")
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        VibeVoiceAsr().acquire_artifacts()
+    assert exc_info.value.reason == "failed"
+    assert isinstance(exc_info.value.__cause__, OSError)
+
+
+def test_vibevoice_cold_companion_with_downloads_disabled_refuses_load(
+    fake_loader: Callable[..., FakeLoader],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Loading would let the upstream hook fetch the tokenizer PAST the
+    # no-download policy (spec AR.9); the engine must refuse loudly first.
+    loader = fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.cached_path = str(snapshot)
+    FakeSnapshot.companion_cached_path = None
+    monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "0")
+    engine = VibeVoiceAsr()
+    (requirement,) = engine.artifact_status().requirements
+    assert requirement.state == "incomplete"
+    assert requirement.acquisition_blocker == "downloads_disabled"
+    with pytest.raises(ArtifactUnavailableError) as exc_info:
+        engine.prepare()
+    assert exc_info.value.reason == "downloads_disabled"
+    assert loader.load_calls == []
+
+
+def test_vibevoice_model_path_companion_policy(
+    fake_loader: Callable[..., FakeLoader],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A model_path checkpoint is complete on disk, but the load still needs
+    # the companion tokenizer: with downloads disabled and a cold cache the
+    # engine refuses (naming the tokenizer, not the checkpoint); with
+    # downloads allowed the load-time fetch is a lawful implicit
+    # acquisition, so status stays ready and the plugin pre-fetches the
+    # companion through its own classified path.
+    loader = fake_loader()
+    local = tmp_path / "vibevoice"
+    local.mkdir()
+    (local / "config.json").write_text("{}")
+    (local / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.companion_cached_path = None
+    monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "0")
+    engine = VibeVoiceAsr(model_path=str(local))
+    (requirement,) = engine.artifact_status().requirements
+    assert requirement.state == "incomplete"
+    assert requirement.acquisition_blocker == "downloads_disabled"
+    with pytest.raises(ArtifactUnavailableError) as exc_info:
+        engine.prepare()
+    assert "tokenizer" in str(exc_info.value)
+    assert loader.load_calls == []
+
+    monkeypatch.delenv("STANDARD_ASR_ALLOW_DOWNLOAD")
+    engine = VibeVoiceAsr(model_path=str(local))
+    (requirement,) = engine.artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+    engine.prepare()
+    assert FakeSnapshot.companion_download_calls == 1
+    assert loader.load_calls[0]["model_path"] == str(local)
+
+
+def test_vibevoice_implicit_load_prefetches_the_companion(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # On the allowed implicit path the plugin fetches the companion itself,
+    # so the transfer is classified (and a failure surfaces as a failed
+    # acquisition) instead of happening inside the upstream hook.
+    loader = fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.cached_path = str(snapshot)
+    FakeSnapshot.companion_cached_path = None
+    VibeVoiceAsr().prepare()
+    assert FakeSnapshot.companion_download_calls == 1
+    assert loader.load_calls  # the load followed the fetch
+
+    FakeSnapshot.reset()
+    FakeSnapshot.cached_path = str(snapshot)
+    FakeSnapshot.companion_cached_path = None
+    FakeSnapshot.raise_on_companion_download = OSError("offline")
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        VibeVoiceAsr().prepare()
+    assert exc_info.value.reason == "failed"
+    assert "companion" in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, OSError)
 
 
 def test_error_translation_degrades_without_hub_errors_module(

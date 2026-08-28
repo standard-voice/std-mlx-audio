@@ -54,6 +54,75 @@ _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 #: must be present before the fragment counts as weights.
 _SHARD_NAME = re.compile(r"^(?P<prefix>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.safetensors$")
 
+#: The files fetched for a preset's companion tokenizer repo (VibeVoice): the
+#: fast-tokenizer serialization, the slow-path pair transformers falls back
+#: to, and the config files naming the class and special tokens.
+_COMPANION_TOKENIZER_PATTERNS = (
+    "merges.txt",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+)
+
+
+def companion_tokenizer_cached(companion_repo: str) -> bool:
+    """Return whether the companion tokenizer can load from the local cache.
+
+    The probe mirrors the upstream fallback exactly: mlx-audio's VibeVoice
+    hook calls ``AutoTokenizer.from_pretrained("<companion>")`` with no
+    ``cache_dir`` and no token, so this reads the DEFAULT Hugging Face cache
+    -- honoring ``download_root`` here would report ready while the upstream
+    call still sees a cold default cache.
+
+    Args:
+        companion_repo: The Hub repo id the upstream loader fetches its
+            tokenizer from.
+
+    Returns:
+        ``True`` when the cached snapshot holds a loadable tokenizer (the
+        fast serialization, or the slow-path vocab + merges pair). Any
+        resolution failure counts as not proven cached: the load gate must
+        not wave through a fetch it cannot rule out.
+    """
+    import huggingface_hub  # pyright: ignore[reportMissingModuleSource]
+
+    try:
+        resolved: str = huggingface_hub.snapshot_download(  # pyright: ignore[reportUnknownMemberType]
+            companion_repo,
+            local_files_only=True,
+            allow_patterns=list(_COMPANION_TOKENIZER_PATTERNS),
+        )
+    except Exception:
+        return False
+    root = Path(resolved)
+    return (root / "tokenizer.json").is_file() or (
+        (root / "vocab.json").is_file() and (root / "merges.txt").is_file()
+    )
+
+
+def fetch_companion_tokenizer(companion_repo: str) -> None:
+    """Materialize the companion tokenizer into the DEFAULT Hub cache.
+
+    The transfer must land where the upstream loader's own
+    ``AutoTokenizer.from_pretrained`` call (no ``cache_dir``, no token) will
+    look for it, so this never honors ``download_root``.
+
+    Args:
+        companion_repo: The Hub repo id to fetch the tokenizer files from.
+
+    Raises:
+        Exception: Whatever ``huggingface_hub`` raises when the transfer
+            fails.
+    """
+    import huggingface_hub  # pyright: ignore[reportMissingModuleSource]
+
+    huggingface_hub.snapshot_download(  # pyright: ignore[reportUnknownMemberType]
+        companion_repo,
+        local_files_only=False,
+        allow_patterns=list(_COMPANION_TOKENIZER_PATTERNS),
+    )
+
 
 def _is_local_entry_not_found(exc: BaseException) -> bool:
     """Return whether a resolution failure is the documented cache miss.
@@ -87,20 +156,28 @@ def checkpoint_complete(root: Path, required_files: tuple[str, ...] = ()) -> boo
 
     The weights closure is checked structurally; non-weight inference files
     (tokenizers, normalization stats) vary per model family, so they enter
-    through ``required_files`` as each family's loader-code fact is verified
-    -- a guessed universal list would report a complete download of another
-    family as forever incomplete. Families whose loaders swallow a missing
-    asset and degrade SILENTLY (SenseVoice, MMS, FireRed, Moonshine emit
-    numeric ids, empty text, or character soup) or fail only at the first
-    request (Whisper, Canary) declare their closures on the presets; the
-    remaining audited families raise at load, where the engine translates
-    the failure loudly.
+    through ``required_files`` from the presets' two declared axes (round-9
+    review). ``required_checkpoint_files`` are files the installed loader
+    reads by one fixed name and whose absence silently corrupts output
+    (SenseVoice, MMS, FireRed, Moonshine, Cohere); they gate every
+    checkpoint, an operator ``model_path`` included. ``required_snapshot_files``
+    are files whose absence provably breaks inference for the preset's OWN
+    repo layout; they gate only the Hub snapshot (acquisition completeness),
+    because the flexible upstream loaders accept alternative local layouts
+    (Canary reads ``tokenizer.model``, ``tokens.txt``, or a config-embedded
+    tokenizer; transformers falls back from ``tokenizer.json`` to
+    vocab + merges) that an exact-name check would wrongly reject. Every
+    declared file is verified as a single point of failure against the
+    installed loader (per-file ablation or the loader's code); a fragment
+    that dodges both lists (a dual-layout repo missing every alternative at
+    once) still fails LOUDLY at load or at the first request, and
+    ``pull --refresh`` re-fetches whatever files its snapshot lacks.
 
     Args:
         root: Candidate checkpoint directory.
-        required_files: Preset-declared files that must exist (for example
-            the MMS base weights beside its per-language adapters, or the
-            Whisper processor files).
+        required_files: Preset-declared files that must exist -- the
+            checkpoint axis for a ``model_path``, the union of both axes
+            for a Hub snapshot.
 
     Returns:
         ``True`` when the config, the shard closure, and every required file
@@ -241,23 +318,30 @@ def snapshot(config: MlxAudioConfig, hf_repo: str, *, local_files_only: bool) ->
 def _local_path_requirement(
     config: MlxAudioConfig,
     required_files: tuple[str, ...] = (),
+    companion_repo: str | None = None,
 ) -> ArtifactRequirement:
     """Build the externally provided requirement for a ``model_path`` config.
 
-    The preset's ``required_files`` apply here too: a ``model_path`` still
-    loads through the preset's model family, so a directory lacking the
-    family's declared weights (the MMS base checkpoint beside its adapters)
-    would reach the ``strict=False`` loader as a fragment.
+    The preset's checkpoint-axis ``required_files`` apply here too: a
+    ``model_path`` still loads through the preset's model family, so a
+    directory lacking a file the loader reads by one fixed name (the MMS
+    base weights, SenseVoice's normalization stats) would silently corrupt
+    output. The snapshot-axis files do NOT apply: the flexible upstream
+    loaders accept alternative local layouts that an exact-name check would
+    wrongly reject (round-9 review).
 
     Args:
         config: Resolved engine configuration with ``model_path`` set.
-        required_files: Preset-declared files that must exist for readiness.
+        required_files: Preset-declared checkpoint-axis files.
+        companion_repo: Optional Hub repo the upstream loader fetches its
+            tokenizer from at load time (VibeVoice).
 
     Returns:
         The single logical requirement for the operator-provided directory.
     """
     assert config.model_path is not None
     path = normalized_model_path(config.model_path)
+    blocker = ARTIFACT_BLOCKER_ACTION_REQUIRED
     if not path.exists():
         state = ARTIFACT_MISSING
         message: str | None = (
@@ -270,10 +354,7 @@ def _local_path_requirement(
             f"The configured model_path {path} is a file; point it at the "
             "MLX checkpoint DIRECTORY containing config.json and its weights."
         )
-    elif checkpoint_complete(path, required_files):
-        state = ARTIFACT_READY
-        message = None
-    else:
+    elif not checkpoint_complete(path, required_files):
         # The directory exists but is provably not a complete checkpoint (the
         # loader requires config.json, and an incomplete shard set would load
         # with strict=False into fluent garbage). This check already ran and
@@ -284,6 +365,23 @@ def _local_path_requirement(
             "complete weights; point it at the MLX checkpoint directory "
             "itself."
         )
+    elif (
+        companion_repo is not None
+        and (config.local_files_only or not allow_downloads())
+        and not companion_tokenizer_cached(companion_repo)
+    ):
+        # The checkpoint itself is complete, but the family's tokenizer
+        # lives in a separate Hub repo the upstream loader fetches at load
+        # time, downloads are disabled, and the default cache does not hold
+        # it: the load cannot succeed without a transfer the policy
+        # forbids. With downloads allowed the load-time fetch is a lawful
+        # implicit acquisition, so the requirement stays ready then.
+        state = ARTIFACT_INCOMPLETE
+        blocker = ARTIFACT_BLOCKER_DOWNLOADS_DISABLED
+        message = None
+    else:
+        state = ARTIFACT_READY
+        message = None
 
     return ArtifactRequirement(
         artifact_id=LOCAL_ARTIFACT_ID,
@@ -293,7 +391,7 @@ def _local_path_requirement(
         can_acquire_now=False,
         may_acquire_during_inference=False,
         source_is_mutable=False,
-        acquisition_blocker=None if state == ARTIFACT_READY else ARTIFACT_BLOCKER_ACTION_REQUIRED,
+        acquisition_blocker=None if state == ARTIFACT_READY else blocker,
         required_actions=()
         if message is None
         else (ArtifactAction(kind=ARTIFACT_ACTION_PROVIDE_ARTIFACTS, message=message),),
@@ -307,6 +405,7 @@ def _hub_requirement(
     hf_repo: str,
     subfolder: str | None,
     required_files: tuple[str, ...] = (),
+    companion_repo: str | None = None,
 ) -> ArtifactRequirement:
     """Build the Hub-preset requirement from a cache-only resolution.
 
@@ -314,6 +413,10 @@ def _hub_requirement(
         config: Resolved engine configuration.
         hf_repo: The preset's Hugging Face repo id.
         subfolder: Optional checkpoint subfolder inside the snapshot.
+        required_files: Preset-declared files that must exist for readiness
+            (the union of the checkpoint and snapshot axes).
+        companion_repo: Optional Hub repo the upstream loader fetches its
+            tokenizer from at load time (VibeVoice).
 
     Returns:
         The single logical requirement for the preset's snapshot.
@@ -342,6 +445,16 @@ def _hub_requirement(
                 # The preset's subfolder is not in the snapshot yet; report
                 # the content that DOES exist (the snapshot root).
                 location = resolved
+    if (
+        state == ARTIFACT_READY
+        and companion_repo is not None
+        and not companion_tokenizer_cached(companion_repo)
+    ):
+        # The snapshot is complete, but the family's tokenizer lives in a
+        # separate Hub repo the upstream loader fetches at load time, and
+        # the default cache does not hold it: inference is not
+        # offline-ready, and pull must still acquire the companion.
+        state = ARTIFACT_INCOMPLETE
 
     # Prefer the resolved commit over the configured mutable reference: two
     # engines resolving the same snapshot must report the same version, and a
@@ -388,22 +501,40 @@ def status_requirement(
     config: MlxAudioConfig,
     hf_repo: str,
     subfolder: str | None,
-    required_files: tuple[str, ...] = (),
+    checkpoint_files: tuple[str, ...] = (),
+    snapshot_files: tuple[str, ...] = (),
+    companion_repo: str | None = None,
 ) -> ArtifactRequirement:
     """Report the engine's one logical requirement for the resolved config.
+
+    The two file axes gate different questions (round-9 review): the
+    checkpoint axis (silent-corruption files, one fixed name each) applies
+    to every checkpoint, while the snapshot axis (files whose absence
+    provably breaks inference for the preset's own repo layout) applies
+    only to the Hub snapshot -- an operator ``model_path`` may use any
+    alternative layout the flexible upstream loaders accept.
 
     Args:
         config: Resolved engine configuration.
         hf_repo: The preset's Hugging Face repo id.
         subfolder: Optional checkpoint subfolder inside the snapshot.
-        required_files: Preset-declared files that must exist for readiness.
+        checkpoint_files: Preset-declared files every checkpoint needs.
+        snapshot_files: Preset-declared files only the Hub snapshot needs.
+        companion_repo: Optional Hub repo the upstream loader fetches its
+            tokenizer from at load time (VibeVoice).
 
     Returns:
         The requirement for either the operator path or the Hub preset.
     """
     if config.model_path is not None:
-        return _local_path_requirement(config, required_files)
-    return _hub_requirement(config, hf_repo, subfolder, required_files)
+        return _local_path_requirement(config, checkpoint_files, companion_repo)
+    return _hub_requirement(
+        config,
+        hf_repo,
+        subfolder,
+        checkpoint_files + snapshot_files,
+        companion_repo,
+    )
 
 
 def raise_for_gated_source(
@@ -510,6 +641,7 @@ def acquire(
     progress: ArtifactProgressCallback | None,
     *,
     refresh: bool = False,
+    companion_repo: str | None = None,
 ) -> None:
     """Materialize the preset's filtered snapshot without loading a model.
 
@@ -518,14 +650,19 @@ def acquire(
     call alone: ``snapshot_download`` silently falls back to the local cache
     when the remote is unreachable, so a refresh first re-resolves the
     mutable revision against the source and then verifies that the resolved
-    snapshot is that resolution (spec AR.4). ``model.generate`` is never
-    called here.
+    snapshot is that resolution (spec AR.4). A companion tokenizer is
+    fetched into the default cache after the snapshot; it is a best-effort
+    convenience fetch of the upstream loader's own source, so the refresh
+    evidence covers the snapshot only. ``model.generate`` is never called
+    here.
 
     Args:
         config: Resolved engine configuration.
         hf_repo: The preset's Hugging Face repo id.
         progress: Optional serialized progress observer.
         refresh: Whether the mutable revision must be re-resolved.
+        companion_repo: Optional Hub repo the upstream loader fetches its
+            tokenizer from at load time (VibeVoice).
 
     Returns:
         None.
@@ -588,6 +725,12 @@ def acquire(
             reason="failed",
             hint="Retry while the source is reachable.",
         )
+    if companion_repo is not None:
+        try:
+            fetch_companion_tokenizer(companion_repo)
+        except Exception as exc:
+            raise_for_gated_source(exc, companion_repo)
+            raise
 
 
 def resolve_for_load(config: MlxAudioConfig, hf_repo: str, *, ready: bool) -> Path:

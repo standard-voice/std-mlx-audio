@@ -83,14 +83,23 @@ downloads). Once published to PyPI this becomes `uv pip install std-mlx-audio`.
 reports whether the preset's snapshot is cached and provably complete (a
 sharded checkpoint is ready only when every shard is present -- named by the
 safetensors index, or by the shards' own `-NNNNN-of-NNNNN` names when the
-index has not arrived yet). Presets whose upstream loaders silently degrade
-without their non-weight files declare those in the ready closure -- the MMS
-base weights and CTC vocab, the Whisper processor pair, the SenseVoice bpe
-and normalization stats, the FireRed dict/cmvn/spm, the Moonshine tokenizer,
-the Canary SentencePiece model -- each verified against the installed loader
-and the preset's repo, and each applying to an operator `model_path` too.
-`standard-asr pull` acquires or repairs the snapshot without loading or
-priming a model.
+index has not arrived yet). Non-weight files enter the ready closure on two
+verified axes. Files a loader reads by one fixed name and silently corrupts
+without (the MMS base weights and CTC vocab, the SenseVoice bpe and
+normalization stats, the FireRed dict and cmvn, the Moonshine tokenizer,
+the Cohere tokenizer config) gate every checkpoint, an operator
+`model_path` included. Files whose absence provably breaks inference for
+the preset's own repo layout (the Whisper and Qwen3 processor configs, the
+GLM, Granite NAR, and tekken tokenizers, the Canary SentencePiece model)
+gate only the Hub snapshot: the flexible upstream loaders accept
+alternative local layouts an exact-name check would wrongly reject. Each
+declared file is verified as a single point of failure against the
+installed loader, by per-file ablation. VibeVoice's tokenizer lives in a
+separate Hub repo its upstream loader fetches at load time; the preset
+models it as a companion, so status requires it cached, `pull` acquires
+it, and a load under a no-download policy refuses instead of letting the
+fetch bypass the policy. `standard-asr pull` acquires or repairs the
+snapshot without loading or priming a model.
 `pull --refresh` re-resolves a mutable revision and verifies against the
 source that the re-resolution happened: the downloader alone silently falls
 back to the local cache when the source is unreachable, and a refresh fails
