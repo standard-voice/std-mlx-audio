@@ -75,7 +75,9 @@ from standard_asr.runtime.downloads import allow_downloads
 from . import backends
 from ._artifacts import (
     HUB_ARTIFACT_ID,
+    LOCAL_ARTIFACT_ID,
     acquire,
+    acquire_companion,
     checkpoint_complete,
     companion_tokenizer_cached,
     fetch_companion_tokenizer,
@@ -341,14 +343,18 @@ class MlxAudioASR(EngineBase):
                         "or warm the Hugging Face cache on a connected machine."
                     ),
                 )
-            if config.model_path is not None and requirement.state in (
-                ARTIFACT_MISSING,
-                ARTIFACT_INCOMPLETE,
+            if (
+                config.model_path is not None
+                and requirement.state in (ARTIFACT_MISSING, ARTIFACT_INCOMPLETE)
+                and requirement.acquisition_blocker is not None
             ):
                 # The status check already ran and answered (the path is
                 # absent, a file, or provably not a complete checkpoint); the
                 # loader would only turn that knowledge into an opaque native
-                # failure -- or fluent garbage via a strict=False load.
+                # failure -- or fluent garbage via a strict=False load. The
+                # one local incomplete WITHOUT a blocker is the acquirable
+                # cold companion tokenizer (downloads allowed): the load
+                # proceeds and pre-fetches it below.
                 raise ArtifactUnavailableError(
                     f"The configured model_path {config.model_path!r} is not a "
                     f"usable MLX checkpoint (state: {requirement.state}).",
@@ -599,12 +605,14 @@ class MlxAudioASR(EngineBase):
     ) -> None:
         """Acquire the preset's filtered snapshot without loading or priming.
 
-        A ``model_path`` requirement is externally provided and never reaches
-        this hook. A refresh carries its own re-resolution evidence:
-        ``snapshot_download`` silently falls back to the local cache when the
-        remote is unreachable, so ``acquire`` verifies the source resolution
-        itself (spec AR.4). ``pull`` never runs the priming inference that
-        :meth:`prepare` keeps.
+        A ``model_path`` requirement is externally provided and reaches this
+        hook only when its single acquirable part -- the companion tokenizer
+        of a preset that declares one -- is what is missing; then the hook
+        fetches exactly that. A refresh carries its own re-resolution
+        evidence: ``snapshot_download`` silently falls back to the local
+        cache when the remote is unreachable, so ``acquire`` verifies the
+        source resolution itself (spec AR.4). ``pull`` never runs the
+        priming inference that :meth:`prepare` keeps.
 
         Args:
             context: Resolved artifact context.
@@ -616,14 +624,19 @@ class MlxAudioASR(EngineBase):
             None.
         """
         config = cast(MlxAudioConfig, self.config)
+        companion = type(self).companion_tokenizer_repo
         if any(item.artifact_id == HUB_ARTIFACT_ID for item in requirements):
             acquire(
                 config,
                 type(self).hf_repo,
                 progress,
                 refresh=refresh,
-                companion_repo=type(self).companion_tokenizer_repo,
+                companion_repo=companion,
             )
+        elif companion is not None and any(
+            item.artifact_id == LOCAL_ARTIFACT_ID for item in requirements
+        ):
+            acquire_companion(companion, progress)
 
     # ------------------------------------------------------------------ #
     # Batch

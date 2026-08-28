@@ -1029,6 +1029,35 @@ def test_vibevoice_cold_companion_degrades_status_and_pull_fetches_it(
     patterns = FakeSnapshot.companion_last_download_kwargs["allow_patterns"] or []
     assert "tokenizer.json" in patterns
     assert "tokenizer_config.json" in patterns
+    # Loading by REPO ID resolves AutoConfig first, so the closure must
+    # carry config.json (round-10 review, verified against the Hub).
+    assert "config.json" in patterns
+
+
+def test_vibevoice_companion_needs_the_model_config(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # A companion cache holding the tokenizer but not config.json is NOT
+    # loadable by repo id: transformers resolves AutoConfig first, so an
+    # offline load fails and an online load silently fetches the file
+    # (round-10 review, verified end to end against the Hub). The probe
+    # must not report such a cache as warm.
+    fake_loader()
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.cached_path = str(snapshot)
+    companion = tmp_path / "companion"
+    companion.mkdir()
+    (companion / "tokenizer.json").write_text("{}")
+    FakeSnapshot.companion_cached_path = str(companion)
+    (requirement,) = VibeVoiceAsr().artifact_status().requirements
+    assert requirement.state == "incomplete"
+
+    (companion / "config.json").write_text("{}")
+    (requirement,) = VibeVoiceAsr().artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
 
 
 def test_vibevoice_pull_translates_a_gated_companion(
@@ -1089,9 +1118,10 @@ def test_vibevoice_model_path_companion_policy(
     # A model_path checkpoint is complete on disk, but the load still needs
     # the companion tokenizer: with downloads disabled and a cold cache the
     # engine refuses (naming the tokenizer, not the checkpoint); with
-    # downloads allowed the load-time fetch is a lawful implicit
-    # acquisition, so status stays ready and the plugin pre-fetches the
-    # companion through its own classified path.
+    # downloads allowed the requirement is incomplete AND acquirable -- the
+    # companion is the one part the plugin can acquire for an operator
+    # path, so pull fetches exactly it (round-10 review), and a direct
+    # load pre-fetches it through the same classified path.
     loader = fake_loader()
     local = tmp_path / "vibevoice"
     local.mkdir()
@@ -1111,10 +1141,34 @@ def test_vibevoice_model_path_companion_policy(
     monkeypatch.delenv("STANDARD_ASR_ALLOW_DOWNLOAD")
     engine = VibeVoiceAsr(model_path=str(local))
     (requirement,) = engine.artifact_status().requirements
-    assert requirement.state == ARTIFACT_READY
-    engine.prepare()
+    assert requirement.state == "incomplete"
+    assert requirement.can_acquire_now is True
+    assert requirement.may_acquire_during_inference is True
+    phases: list[str] = []
+    report = engine.acquire_artifacts(progress=lambda event: phases.append(event.phase))
+    assert report.readiness == ARTIFACTS_READY
+    assert "transferring" in phases
+    assert FakeSnapshot.companion_download_calls == 1
+    assert FakeSnapshot.download_calls == 0  # the checkpoint is not the plugin's
+
+    engine = VibeVoiceAsr(model_path=str(local))
+    engine.prepare()  # the warm companion is not re-fetched
     assert FakeSnapshot.companion_download_calls == 1
     assert loader.load_calls[0]["model_path"] == str(local)
+
+    # A gated companion rejection during the model_path pull carries the
+    # discovered action, like every other gated translation; a plain
+    # network failure propagates for the template to wrap.
+    FakeSnapshot.companion_cached_path = None
+    FakeSnapshot.raise_on_companion_download = _gated_error()
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        VibeVoiceAsr(model_path=str(local)).acquire_artifacts()
+    assert exc_info.value.reason == "action_required"
+    FakeSnapshot.raise_on_companion_download = OSError("offline")
+    with pytest.raises(ArtifactAcquisitionError) as exc_info:
+        VibeVoiceAsr(model_path=str(local)).acquire_artifacts()
+    assert exc_info.value.reason == "failed"
+    assert isinstance(exc_info.value.__cause__, OSError)
 
 
 def test_vibevoice_implicit_load_prefetches_the_companion(

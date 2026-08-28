@@ -29,6 +29,7 @@ from standard_asr.contract.artifacts import (
     ARTIFACT_PROGRESS_TRANSFERRING,
     ARTIFACT_READY,
     ARTIFACT_UNKNOWN,
+    ArtifactAcquisitionBlocker,
     ArtifactAction,
     ArtifactProgress,
     ArtifactProgressCallback,
@@ -56,8 +57,13 @@ _SHARD_NAME = re.compile(r"^(?P<prefix>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\
 
 #: The files fetched for a preset's companion tokenizer repo (VibeVoice): the
 #: fast-tokenizer serialization, the slow-path pair transformers falls back
-#: to, and the config files naming the class and special tokens.
+#: to, the config files naming the class and special tokens, and the model
+#: config -- loading by REPO ID resolves AutoConfig from config.json even
+#: when the tokenizer files alone would satisfy a local-directory load
+#: (verified end to end against the Hub, round-10 review: without it the
+#: offline load fails, and an online load silently fetches it).
 _COMPANION_TOKENIZER_PATTERNS = (
+    "config.json",
     "merges.txt",
     "special_tokens_map.json",
     "tokenizer.json",
@@ -80,10 +86,11 @@ def companion_tokenizer_cached(companion_repo: str) -> bool:
             tokenizer from.
 
     Returns:
-        ``True`` when the cached snapshot holds a loadable tokenizer (the
-        fast serialization, or the slow-path vocab + merges pair). Any
-        resolution failure counts as not proven cached: the load gate must
-        not wave through a fetch it cannot rule out.
+        ``True`` when the cached snapshot holds the model config (the
+        repo-id load resolves AutoConfig first) plus a loadable tokenizer
+        (the fast serialization, or the slow-path vocab + merges pair).
+        Any resolution failure counts as not proven cached: the load gate
+        must not wave through a fetch it cannot rule out.
     """
     import huggingface_hub  # pyright: ignore[reportMissingModuleSource]
 
@@ -96,6 +103,8 @@ def companion_tokenizer_cached(companion_repo: str) -> bool:
     except Exception:
         return False
     root = Path(resolved)
+    if not (root / "config.json").is_file():
+        return False
     return (root / "tokenizer.json").is_file() or (
         (root / "vocab.json").is_file() and (root / "merges.txt").is_file()
     )
@@ -341,7 +350,9 @@ def _local_path_requirement(
     """
     assert config.model_path is not None
     path = normalized_model_path(config.model_path)
-    blocker = ARTIFACT_BLOCKER_ACTION_REQUIRED
+    blocker: ArtifactAcquisitionBlocker | None = ARTIFACT_BLOCKER_ACTION_REQUIRED
+    can_acquire_now = False
+    may_acquire_during_inference = False
     if not path.exists():
         state = ARTIFACT_MISSING
         message: str | None = (
@@ -365,20 +376,25 @@ def _local_path_requirement(
             "complete weights; point it at the MLX checkpoint directory "
             "itself."
         )
-    elif (
-        companion_repo is not None
-        and (config.local_files_only or not allow_downloads())
-        and not companion_tokenizer_cached(companion_repo)
-    ):
+    elif companion_repo is not None and not companion_tokenizer_cached(companion_repo):
         # The checkpoint itself is complete, but the family's tokenizer
         # lives in a separate Hub repo the upstream loader fetches at load
-        # time, downloads are disabled, and the default cache does not hold
-        # it: the load cannot succeed without a transfer the policy
-        # forbids. With downloads allowed the load-time fetch is a lawful
-        # implicit acquisition, so the requirement stays ready then.
+        # time, and the default cache does not hold it: inference is not
+        # offline-ready (same substance as the Hub branch, round-10
+        # review). With downloads allowed the companion is the one part
+        # the plugin CAN acquire for an operator path -- pull fetches it,
+        # and a load would fetch it implicitly -- so the requirement is
+        # acquirable; with downloads disabled the transfer is forbidden
+        # and the load must refuse. This is the ONLY local shape whose
+        # blocker is not action_required (the engine's guard keys on it).
         state = ARTIFACT_INCOMPLETE
-        blocker = ARTIFACT_BLOCKER_DOWNLOADS_DISABLED
         message = None
+        if config.local_files_only or not allow_downloads():
+            blocker = ARTIFACT_BLOCKER_DOWNLOADS_DISABLED
+        else:
+            blocker = None
+            can_acquire_now = True
+            may_acquire_during_inference = True
     else:
         state = ARTIFACT_READY
         message = None
@@ -388,8 +404,8 @@ def _local_path_requirement(
         label="Operator-provided MLX checkpoint directory",
         state=state,
         required_for_inference=True,
-        can_acquire_now=False,
-        may_acquire_during_inference=False,
+        can_acquire_now=can_acquire_now,
+        may_acquire_during_inference=may_acquire_during_inference,
         source_is_mutable=False,
         acquisition_blocker=None if state == ARTIFACT_READY else blocker,
         required_actions=()
@@ -731,6 +747,40 @@ def acquire(
         except Exception as exc:
             raise_for_gated_source(exc, companion_repo)
             raise
+
+
+def acquire_companion(
+    companion_repo: str,
+    progress: ArtifactProgressCallback | None,
+) -> None:
+    """Fetch only the companion tokenizer (a ``model_path`` pull target).
+
+    An operator-provided checkpoint is not the plugin's to acquire, but its
+    companion tokenizer is: this is the acquisition hook's path for a
+    ``model_path`` requirement whose only deficiency is the cold companion
+    cache. The template sends the target only when the requirement reported
+    ``can_acquire_now``, which the status builder sets only with downloads
+    allowed.
+
+    Args:
+        companion_repo: The Hub repo id to fetch the tokenizer files from.
+        progress: Optional serialized progress observer.
+
+    Raises:
+        ArtifactAcquisitionError: With ``reason="action_required"`` when the
+            source is gated or rejects the credentials; every other native
+            failure propagates for the template to wrap as
+            ``reason="failed"``.
+    """
+    if progress is not None:
+        progress(
+            ArtifactProgress(phase=ARTIFACT_PROGRESS_TRANSFERRING, artifact_id=LOCAL_ARTIFACT_ID)
+        )
+    try:
+        fetch_companion_tokenizer(companion_repo)
+    except Exception as exc:
+        raise_for_gated_source(exc, companion_repo)
+        raise
 
 
 def resolve_for_load(config: MlxAudioConfig, hf_repo: str, *, ready: bool) -> Path:
