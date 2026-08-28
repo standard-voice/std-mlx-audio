@@ -1133,10 +1133,15 @@ def test_vibevoice_model_path_companion_policy(
     (requirement,) = engine.artifact_status().requirements
     assert requirement.state == "incomplete"
     assert requirement.acquisition_blocker == "downloads_disabled"
+    # The offline proof, not the status heuristic, decides the no-download
+    # load (round-15 review); a genuinely cold cache fails both its legs.
+    FakeSnapshot.offline_tokenizer_result = False
     with pytest.raises(ArtifactUnavailableError) as exc_info:
         engine.prepare()
+    assert exc_info.value.reason == "incomplete"
     assert "tokenizer" in str(exc_info.value)
     assert loader.load_calls == []
+    FakeSnapshot.offline_tokenizer_result = True
 
     monkeypatch.delenv("STANDARD_ASR_ALLOW_DOWNLOAD")
     engine = VibeVoiceAsr(model_path=str(local))
@@ -1314,6 +1319,93 @@ def test_vibevoice_implicit_load_prefetches_the_companion(
     assert exc_info.value.reason == "failed"
     assert "companion" in str(exc_info.value)
     assert isinstance(exc_info.value.__cause__, OSError)
+
+
+# --------------------------------------------------------------------------- #
+# Round-15 review regressions: companion mutability, unknown deference, EACCES
+# --------------------------------------------------------------------------- #
+def test_refresh_reaches_the_companion_for_local_and_pinned_hub(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # An ACTIVE companion is an unpinned Hub source: with
+    # source_is_mutable=False the template silently dropped refresh before
+    # the hook could re-fetch it, for a ready model_path and for a
+    # commit-pinned snapshot alike (round-15 review, spec AR.4).
+    fake_loader()
+    local = tmp_path / "vibevoice"
+    local.mkdir()
+    (local / "config.json").write_text("{}")
+    (local / "model.safetensors").write_bytes(b"\x00" * 8)
+    engine = VibeVoiceAsr(model_path=str(local))
+    (requirement,) = engine.artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+    assert requirement.source_is_mutable is True
+    report = engine.acquire_artifacts(refresh=True)
+    assert report.readiness == ARTIFACTS_READY
+    assert FakeSnapshot.companion_download_calls == 1
+
+    snapshot = tmp_path / "snapshots" / PINNED
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.companion_download_calls = 0
+    FakeSnapshot.cached_path = str(snapshot)
+    engine = VibeVoiceAsr(revision=PINNED)
+    (requirement,) = engine.artifact_status().requirements
+    assert requirement.state == ARTIFACT_READY
+    assert requirement.source_is_mutable is True  # the companion stays unpinned
+    report = engine.acquire_artifacts(refresh=True)
+    assert report.readiness == ARTIFACTS_READY
+    assert FakeSnapshot.companion_download_calls == 1
+
+
+def test_unknown_companion_defers_to_the_offline_proof(
+    fake_loader: Callable[..., FakeLoader],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An unreadable companion cache is a failed inspection, not proof of
+    # unavailability: the no-download load must reach the offline probe,
+    # which is the deciding authority (round-15 review).
+    loader = fake_loader()
+    local = tmp_path / "vibevoice"
+    local.mkdir()
+    (local / "config.json").write_text("{}")
+    (local / "model.safetensors").write_bytes(b"\x00" * 8)
+    FakeSnapshot.raise_on_companion_resolve = PermissionError("cache unreadable")
+    monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "0")
+    engine = VibeVoiceAsr(model_path=str(local))
+    (requirement,) = engine.artifact_status().requirements
+    assert requirement.state == ARTIFACT_UNKNOWN
+    engine.prepare()
+    assert FakeSnapshot.offline_probe_calls == [(str(local), "Qwen/Qwen2.5-7B")]
+    assert loader.load_calls
+
+    FakeSnapshot.offline_tokenizer_result = False
+    with pytest.raises(ArtifactUnavailableError) as exc_info:
+        VibeVoiceAsr(model_path=str(local)).prepare()
+    assert exc_info.value.reason == "incomplete"
+
+
+def test_companion_inspection_failure_inside_the_snapshot_is_unknown(
+    fake_loader: Callable[..., FakeLoader], tmp_path: Path
+) -> None:
+    # The resolver can hand back a directory whose CONTENTS cannot be
+    # inspected (Path.is_file re-raises EACCES): that is a failed
+    # inspection, not evidence of absence (round-15 review).
+    import os
+
+    from std_mlx_audio._artifacts import companion_tokenizer_cached
+
+    fake_loader()
+    guarded = tmp_path / "guarded"
+    guarded.mkdir()
+    FakeSnapshot.companion_cached_path = str(guarded)
+    os.chmod(guarded, 0)
+    try:
+        assert companion_tokenizer_cached("Qwen/Qwen2.5-7B") is None
+    finally:
+        os.chmod(guarded, 0o700)
 
 
 # --------------------------------------------------------------------------- #

@@ -43,7 +43,7 @@ from standard_asr import (
 )
 from standard_asr.audio.format import AudioFormat
 from standard_asr.contract.artifacts import (
-    ARTIFACT_BLOCKER_DOWNLOADS_DISABLED,
+    ARTIFACT_BLOCKER_ACTION_REQUIRED,
     ARTIFACT_INCOMPLETE,
     ARTIFACT_MISSING,
     ARTIFACT_READY,
@@ -328,36 +328,20 @@ class MlxAudioASR(EngineBase):
         if requirement.state != ARTIFACT_READY:
             if (
                 config.model_path is not None
-                and requirement.acquisition_blocker == ARTIFACT_BLOCKER_DOWNLOADS_DISABLED
-            ):
-                # The checkpoint directory itself is complete; what is
-                # missing is the family's companion tokenizer, which the
-                # upstream loader would fetch from the Hub PAST the
-                # no-download policy. Refuse loudly instead.
-                raise ArtifactUnavailableError(
-                    f"The model_path checkpoint is complete, but its tokenizer "
-                    f"comes from the {type(self).companion_tokenizer_repo} Hub "
-                    "repo, the local cache does not hold it, and downloads are "
-                    "disabled.",
-                    reason="downloads_disabled",
-                    report=report,
-                    hint=(
-                        "Enable downloads for one load to cache the tokenizer, "
-                        "or warm the Hugging Face cache on a connected machine."
-                    ),
-                )
-            if (
-                config.model_path is not None
                 and requirement.state in (ARTIFACT_MISSING, ARTIFACT_INCOMPLETE)
-                and requirement.acquisition_blocker is not None
+                and requirement.acquisition_blocker == ARTIFACT_BLOCKER_ACTION_REQUIRED
             ):
                 # The status check already ran and answered (the path is
                 # absent, a file, or provably not a complete checkpoint); the
                 # loader would only turn that knowledge into an opaque native
                 # failure -- or fluent garbage via a strict=False load. The
-                # one local incomplete WITHOUT a blocker is the acquirable
-                # cold companion tokenizer (downloads allowed): the load
-                # proceeds and pre-fetches it below.
+                # local companion shapes carry a different blocker (or none)
+                # and fall through on purpose: with downloads allowed the
+                # pre-fetch below acquires the companion, and on a
+                # no-download load the offline probe below is the deciding
+                # authority -- a status heuristic (a cold or unreadable
+                # companion cache) must not refuse a load the probe can
+                # prove local (round-15 review).
                 raise ArtifactUnavailableError(
                     f"The configured model_path {config.model_path!r} is not a "
                     f"usable MLX checkpoint (state: {requirement.state}).",

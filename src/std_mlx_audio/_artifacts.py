@@ -106,11 +106,17 @@ def companion_tokenizer_cached(companion_repo: str) -> bool | None:
     except Exception as exc:
         return False if _is_local_entry_not_found(exc) else None
     root = Path(resolved)
-    if not (root / "config.json").is_file():
-        return False
-    return (root / "tokenizer.json").is_file() or (
-        (root / "vocab.json").is_file() and (root / "merges.txt").is_file()
-    )
+    try:
+        if not (root / "config.json").is_file():
+            return False
+        return (root / "tokenizer.json").is_file() or (
+            (root / "vocab.json").is_file() and (root / "merges.txt").is_file()
+        )
+    except OSError:
+        # The resolver can hand back a directory whose contents cannot be
+        # inspected (Path.is_file re-raises EACCES): that is a failed
+        # inspection, not evidence of absence (round-15 review).
+        return None
 
 
 def offline_tokenizer_loads(checkpoint_dir: str, companion_repo: str) -> bool:
@@ -486,6 +492,16 @@ def _local_path_requirement(
             # False then.
             may_acquire_during_inference = True
 
+    # The operator directory itself is immutable, but an ACTIVE companion
+    # tokenizer source (declared, and not made moot by a bundled tokenizer)
+    # is an unpinned Hub reference the load may consult: the requirement's
+    # sources include it, so the requirement must be mutable for refresh to
+    # reach the companion fetch hook at all -- source_is_mutable=False made
+    # 'pull --refresh' a silent no-op for this shape (round-15 review,
+    # spec AR.4).
+    companion_active = companion_repo is not None and not (
+        path.is_dir() and bundled_companion_tokenizer(path)
+    )
     return ArtifactRequirement(
         artifact_id=LOCAL_ARTIFACT_ID,
         label="Operator-provided MLX checkpoint directory",
@@ -493,7 +509,7 @@ def _local_path_requirement(
         required_for_inference=True,
         can_acquire_now=can_acquire_now,
         may_acquire_during_inference=may_acquire_during_inference,
-        source_is_mutable=False,
+        source_is_mutable=companion_active,
         acquisition_blocker=None if state == ARTIFACT_READY else blocker,
         required_actions=()
         if message is None
@@ -597,7 +613,18 @@ def _hub_requirement(
         required_for_inference=True,
         can_acquire_now=can_acquire_now,
         may_acquire_during_inference=not downloads_blocked,
-        source_is_mutable=not _revision_is_pinned(config.revision),
+        # A pinned snapshot is immutable, but an ACTIVE companion tokenizer
+        # source stays an unpinned Hub reference: it keeps the requirement
+        # mutable so refresh reaches the hook, which handles a pinned
+        # snapshot correctly (no re-resolution evidence needed) and
+        # re-fetches the companion (round-15 review, spec AR.4).
+        source_is_mutable=(not _revision_is_pinned(config.revision))
+        or (
+            companion_repo is not None
+            and not (
+                location is not None and location.is_dir() and bundled_companion_tokenizer(location)
+            )
+        ),
         acquisition_blocker=blocker,
         location=location,
         # The present logical size is reported for incomplete content too --
