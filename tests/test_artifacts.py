@@ -1239,7 +1239,9 @@ def test_vibevoice_bundled_hub_snapshot_needs_no_companion(
 ) -> None:
     # The same self-containment applies to a Hub snapshot: if the repo
     # ever ships tokenizer files, the load stays local and a cold
-    # companion cache must not degrade readiness.
+    # companion cache must not degrade readiness -- and acquisition must
+    # not fetch (or fail on) a companion the snapshot does not need
+    # (round-13 review).
     fake_loader()
     snapshot = tmp_path / "snapshots" / PINNED
     snapshot.mkdir(parents=True)
@@ -1250,6 +1252,22 @@ def test_vibevoice_bundled_hub_snapshot_needs_no_companion(
     FakeSnapshot.companion_cached_path = None
     (requirement,) = VibeVoiceAsr().artifact_status().requirements
     assert requirement.state == ARTIFACT_READY
+
+    # A cold pull that resolves a bundled snapshot skips the companion --
+    # even one whose source is down.
+    FakeSnapshot.reset()
+    FakeSnapshot.download_target = str(snapshot)
+    FakeSnapshot.companion_cached_path = None
+    FakeSnapshot.raise_on_companion_download = OSError("companion source is down")
+    report = VibeVoiceAsr().acquire_artifacts()
+    assert report.readiness == ARTIFACTS_READY
+    assert FakeSnapshot.companion_download_calls == 0
+
+    # So does a refresh of the cached bundled snapshot.
+    FakeHfApi.remote_sha = PINNED
+    report = VibeVoiceAsr().acquire_artifacts(refresh=True)
+    assert report.readiness == ARTIFACTS_READY
+    assert FakeSnapshot.companion_download_calls == 0
 
 
 def test_acquire_companion_applies_the_download_policy_at_entry(

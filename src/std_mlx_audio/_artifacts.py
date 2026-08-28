@@ -790,7 +790,11 @@ def acquire(
             reason="failed",
             hint="Retry while the source is reachable.",
         )
-    if companion_repo is not None:
+    if companion_repo is not None and not bundled_companion_tokenizer(resolved):
+        # A snapshot that bundles its own loadable tokenizer is
+        # self-contained: fetching the companion would be wasted transfer,
+        # and a companion outage must not fail a pull whose target content
+        # is independently usable (round-13 review).
         try:
             fetch_companion_tokenizer(companion_repo)
         except Exception as exc:
