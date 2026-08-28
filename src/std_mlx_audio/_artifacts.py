@@ -545,10 +545,20 @@ def _hub_requirement(
     try:
         resolved = snapshot(config, hf_repo, local_files_only=True)
     except Exception as exc:
-        # Only the documented not-in-cache failure is reliable evidence of a
-        # missing snapshot; anything else (the resolution stack unavailable,
-        # an unreadable cache, a permission failure) is not evidence of
+        # Only the documented not-in-cache failure claims a missing
+        # snapshot; anything else (the resolution stack unavailable, an
+        # unreadable cache, a permission failure) is not evidence of
         # absence -- unknown never means ready, and never claims missing.
+        # Known imprecision (round-16 review): the hub client checks the
+        # cache with os.path.exists, which swallows EACCES, so an
+        # UNTRAVERSABLE cache root raises the same not-in-cache miss and
+        # reports missing where unknown is truer. Distinguishing them
+        # needs a parent-walking reachability check mirroring the hub's
+        # own path resolution -- fragile machinery for a filesystem that
+        # is already broken, where every downstream operation fails
+        # loudly anyway. The conflation is upstream's
+        # (LocalEntryNotFoundError covers both); accepted, here and in
+        # the companion cache probe.
         state = ARTIFACT_MISSING if _is_local_entry_not_found(exc) else ARTIFACT_UNKNOWN
     else:
         # Resolution success only proves the snapshot directory exists;
