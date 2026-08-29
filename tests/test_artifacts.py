@@ -77,7 +77,7 @@ def _mlx_dir(tmp_path: Path) -> Path:
 # --------------------------------------------------------------------------- #
 def test_declared_metadata_upper_bounds() -> None:
     artifacts = WhisperTiny.declared_metadata.artifacts
-    assert artifacts.acquisition_applicable is True
+    assert artifacts.applicable is True
     assert artifacts.supports_explicit_acquisition is True
     assert artifacts.may_acquire_during_inference is True
 

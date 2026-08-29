@@ -203,7 +203,7 @@ class MlxAudioASR(EngineBase):
     #: externally provided requirement dynamically.
     declared_metadata: ClassVar[DeclaredEngineMetadata] = DeclaredEngineMetadata(
         artifacts=ArtifactDeclaration(
-            acquisition_applicable=True,
+            applicable=True,
             supports_explicit_acquisition=True,
             may_acquire_during_inference=True,
         )
