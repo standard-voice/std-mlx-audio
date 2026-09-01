@@ -323,7 +323,7 @@ def test_cohere_subfolder_download_failure_raises(
     fake_loader: Callable[..., FakeLoader],
 ) -> None:
     # A snapshot-download failure on the implicit path is a failed acquisition
-    # (protocol 1.1), with the native error preserved as the cause.
+    # with the native error preserved as the cause.
     fake_loader(output=FakeSTTOutput(text="hi"))
     FakeSnapshot.raise_on_download = OSError("offline")
     with pytest.raises(ArtifactAcquisitionError) as exc_info:

@@ -79,7 +79,7 @@ This pulls `mlx-audio[stt]` (which pulls `mlx`, `mlx-lm`, `transformers`) and
 Hub on first use (set `STANDARD_ASR_ALLOW_DOWNLOAD=1` if your environment disables
 downloads). Once published to PyPI this becomes `uv pip install std-mlx-audio`.
 
-**Artifact lifecycle (protocol 1.1).** `standard-asr status mlx-audio/<model>`
+**Artifact lifecycle.** `standard-asr status mlx-audio/<model>`
 reports whether the preset's snapshot is cached and provably complete (a
 sharded checkpoint is ready only when every shard is present -- named by the
 safetensors index, or by the shards' own `-NNNNN-of-NNNNN` names when the

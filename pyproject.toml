@@ -55,7 +55,7 @@ dependencies = [
     # See VoxtralMini3B and VERIFICATION.md; use voxtral-realtime-4b instead.
     # The protocol this plugin implements. Pinned to the main branch until
     # standard-asr cuts its first PyPI release; swap to a version specifier at
-    # that point. MERGE ORDER: this branch implements the protocol 1.1
+    # that point. MERGE ORDER: this branch implements the protocol 0.2
     # artifact lifecycle, which `main` gains only when the core branch
     # `feat/model-artifact-lifecycle` (0.2.0) lands -- merge the core first,
     # then repin uv.lock here, or this plugin fails to import.

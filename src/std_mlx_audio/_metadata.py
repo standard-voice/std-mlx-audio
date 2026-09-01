@@ -82,7 +82,7 @@ class MlxAudioProperties(BaseProperties):
     """
 
     engine_id: str = "mlx-audio"
-    protocol_version: str = "1.1.0"
+    protocol_version: str = "0.2.0"
     accepted_input: set[InputKind] = _ACCEPTED_INPUT
     native_sample_rate: int = _SAMPLE_RATE
     accepted_sample_rates: list[int] | SampleRateRange | Literal["any"] = [_SAMPLE_RATE]
