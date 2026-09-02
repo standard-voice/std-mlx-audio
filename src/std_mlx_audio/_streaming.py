@@ -74,6 +74,22 @@ _SAMPLE_RATE = backends.SAMPLE_RATE
 _PCM_SCALE = 32768.0
 
 
+def _rebase(origin: float, t: float | None) -> float | None:
+    """Shift a window-relative time to absolute, preserving an absent value.
+
+    Segment timestamps are optional in the core schema; a segment without one
+    keeps ``None`` rather than inventing a time.
+
+    Args:
+        origin: The sliding-window origin in absolute seconds.
+        t: A window-relative time, or ``None``.
+
+    Returns:
+        The absolute time, or ``None``.
+    """
+    return None if t is None else origin + t
+
+
 def _pcm_s16le_to_float32(data: bytes) -> NDArray[np.float32]:
     """Decode canonical 16-bit LE PCM bytes into a float32 mono waveform.
 
@@ -140,6 +156,8 @@ class MlxAudioStreamingSession(TranscriptionSession):
         # Count of segments already emitted as `final` (also their next id). A
         # finalized segment's id and text are immutable and its audio is dropped.
         self._finalized_count = 0
+        # One-shot flag for the max_window_s degradation warning.
+        self._cap_degraded_logged = False
 
     def _resolve_language(self) -> str | None:
         """Resolve the effective language to forward to the backend.
@@ -206,7 +224,7 @@ class MlxAudioStreamingSession(TranscriptionSession):
             tail, ``progress`` heartbeats carrying the audio cursor, and a
             terminal ``done``.
         """
-        self._engine.ensure_loaded()
+        self._engine.ensure_loaded(mode="streaming")
         want_words = backends.map_word_timestamps(self._params.word_timestamps)
         pending = bytearray()
         bytes_since_decode = 0
@@ -321,7 +339,10 @@ class MlxAudioStreamingSession(TranscriptionSession):
         else:
             settled = 0
             for seg in segments:
-                if seg.end <= settle_before:
+                # A segment without an end time can never be proven settled
+                # (Segment timestamps are optional in the core schema); it stays
+                # in the partial tail until the final pass.
+                if seg.end is not None and seg.end <= settle_before:
                     settled += 1
                 else:
                     break
@@ -330,11 +351,32 @@ class MlxAudioStreamingSession(TranscriptionSession):
             # leading segments so the next decode (and memory) stays bounded under
             # long, sparsely-segmented speech.
             if self._max_window_s is not None:
-                while (
-                    settled < len(segments)
-                    and ((window_len - segments[settled - 1].end) if settled else window_len)
-                    > self._max_window_s
-                ):
+                while settled < len(segments):
+                    if settled:
+                        last_end = segments[settled - 1].end
+                        # The settle run and this cap only ever count segments
+                        # with a known end time.
+                        assert last_end is not None
+                        remaining = window_len - last_end
+                    else:
+                        remaining = window_len
+                    if remaining <= self._max_window_s:
+                        break
+                    if segments[settled].end is None:
+                        # Force-finalizing a segment whose end is unknown would
+                        # finalize text whose audio cannot be trimmed (the trim
+                        # anchor is the last settled end), and the untrimmed
+                        # audio would be re-decoded as NEW segments next pass --
+                        # duplicated transcript text. The bound therefore
+                        # degrades honestly here, and says so once.
+                        if not self._cap_degraded_logged:
+                            self._cap_degraded_logged = True
+                            _LOGGER.warning(
+                                "max_window_s cannot bound the window: a "
+                                "segment without an end time blocks the trim "
+                                "anchor; the window may grow until it settles."
+                            )
+                        break
                     settled += 1
 
         events: list[TranscriptionEvent] = []
@@ -345,8 +387,8 @@ class MlxAudioStreamingSession(TranscriptionSession):
                     segment_id=f"seg-{self._finalized_count + j}",
                     text=seg.text,
                     stable_until=0,
-                    start=origin + seg.start,
-                    end=origin + seg.end,
+                    start=_rebase(origin, seg.start),
+                    end=_rebase(origin, seg.end),
                     words=self._shift_words(seg.words, origin),
                     audio_processed_until=cursor,
                 )
@@ -360,13 +402,19 @@ class MlxAudioStreamingSession(TranscriptionSession):
             for s in tail:
                 if s.words:
                     tail_words = (tail_words or []) + list(s.words)
+            # The aggregate span is legal only in the measured / start-only /
+            # unavailable shapes: when the first tail segment has no start, a
+            # later segment's end must not be emitted alone (end-without-start
+            # is unrepresentable), so the whole span degrades to unavailable.
+            tail_start = _rebase(origin, tail[0].start)
+            tail_end = _rebase(origin, tail[-1].end) if tail_start is not None else None
             events.append(
                 TranscriptionEvent.partial(
                     segment_id=f"seg-{self._finalized_count}",
                     text=tail_text,
                     stable_until=0,
-                    start=origin + tail[0].start,
-                    end=origin + tail[-1].end,
+                    start=tail_start,
+                    end=tail_end,
                     words=self._shift_words(tail_words, origin),
                     audio_processed_until=cursor,
                 )
@@ -378,7 +426,11 @@ class MlxAudioStreamingSession(TranscriptionSession):
         # next decode runs over a bounded tail (origin advances to keep times
         # absolute). Done last, so the events above used the pre-trim origin.
         if settled and not final_pass:
-            self._trim_window(segments[settled - 1].end)
+            last_settled_end = segments[settled - 1].end
+            # The settle run and the cap only ever count segments with a known
+            # end time, so a nonzero ``settled`` always has one to trim to.
+            assert last_settled_end is not None
+            self._trim_window(last_settled_end)
         return events
 
     def _trim_window(self, cut_seconds: float) -> None:

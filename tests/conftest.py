@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -122,6 +123,216 @@ class FakeLoader:
         return self.model
 
 
+def _make_fake_snapshot_dir() -> str:
+    """Create one REAL checkpoint-shaped snapshot directory for the fakes.
+
+    The plugin's status path verifies completeness on disk (config.json plus a
+    weights file), so the default fake resolution must point at a directory
+    that actually has that shape.
+    """
+    import tempfile
+
+    root = Path(tempfile.mkdtemp(prefix="std-mlx-fake-")) / "snapshots" / ("deadbeef" * 5)
+    root.mkdir(parents=True)
+    (root / "config.json").write_text("{}")
+    (root / "model.safetensors").write_bytes(b"\x00" * 8)
+    # Every preset-declared closure (both axes) must be satisfied by this
+    # shared default (the per-family files coexist harmlessly): the Whisper
+    # and Qwen3 processor files, the transformers tokenizer files, the tekken
+    # tokenizer, the SenseVoice bpe + normalization stats, the Canary and
+    # Cohere SentencePiece model, the FireRed dict/cmvn, and the MMS vocab.
+    # It doubles as the warm companion-tokenizer cache (tokenizer.json).
+    for name in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "preprocessor_config.json",
+        "merges.txt",
+        "tekken.json",
+        "chn_jpn_yue_eng_ko_spectok.bpe.model",
+        "am.mvn",
+        "tokenizer.model",
+        "dict.txt",
+        "cmvn.json",
+        "vocab.json",
+    ):
+        (root / name).write_text("{}")
+    return str(root)
+
+
+#: The path the fake snapshot resolution returns for an online "download" when
+#: a test has not staged a concrete cache directory. A real checkpoint-shaped
+#: directory (see ``_make_fake_snapshot_dir``).
+FAKE_SNAPSHOT_DIR = _make_fake_snapshot_dir()
+
+#: The one companion tokenizer repo the plugin declares (VibeVoice); calls for
+#: it route through the FakeSnapshot companion seam.
+_COMPANION_TOKENIZER_REPO = "Qwen/Qwen2.5-7B"
+
+
+class FakeSnapshot:
+    """Controls the fake ``huggingface_hub.snapshot_download``.
+
+    ``cached_path`` is the local hit a ``local_files_only=True`` call returns
+    (``None`` = not cached: the call raises, like the real helper). An online
+    call records itself, optionally raises, and can flip the cache to
+    ``download_target`` (simulating a completed acquisition).
+
+    The VibeVoice companion tokenizer repo resolves through its own seam
+    (``companion_cached_path`` and the companion bookkeeping): its default is
+    the warm shared directory so the rest of the suite never trips over a
+    cold companion cache, and the VibeVoice tests set it explicitly.
+    """
+
+    cached_path: str | None = None
+    download_target: str | None = None
+    #: Raised by a cache-only resolution (models an unreadable cache).
+    raise_on_resolve: BaseException | None = None
+    raise_on_download: BaseException | None = None
+    #: Optional side effect run by an online call (models the transfer
+    #: materializing files, e.g. completing a partial snapshot).
+    on_download: Any = None
+    last_kwargs: dict[str, Any] = {}
+    #: Kwargs of the last ONLINE call only (a later cache-only status query
+    #: overwrites ``last_kwargs``, so acquisition tests read this one).
+    last_download_kwargs: dict[str, Any] = {}
+    download_calls: int = 0
+    #: The cached hit for the companion tokenizer repo (``None`` = cold).
+    companion_cached_path: str | None = None
+    #: Raised by a cache-only companion resolution (models an unreadable
+    #: cache -- distinct from the not-in-cache miss the cold default
+    #: raises).
+    raise_on_companion_resolve: BaseException | None = None
+    #: The canned answer of the fake ``offline_tokenizer_loads`` probe
+    #: (the real probe runs transformers; its own unit tests exercise it
+    #: against real directories).
+    offline_tokenizer_result: bool = True
+    #: Arguments of every fake offline-probe call.
+    offline_probe_calls: list[tuple[str, str]] = []
+    #: Kwargs of the last companion call (cache-only or online).
+    companion_last_kwargs: dict[str, Any] = {}
+    #: Kwargs of the last ONLINE companion call (a later cache-only status
+    #: probe overwrites ``companion_last_kwargs``).
+    companion_last_download_kwargs: dict[str, Any] = {}
+    companion_download_calls: int = 0
+    raise_on_companion_download: BaseException | None = None
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.cached_path = None
+        cls.download_target = None
+        cls.raise_on_resolve = None
+        cls.raise_on_download = None
+        cls.on_download = None
+        cls.last_kwargs = {}
+        cls.last_download_kwargs = {}
+        cls.download_calls = 0
+        cls.companion_cached_path = FAKE_SNAPSHOT_DIR
+        cls.companion_last_kwargs = {}
+        cls.companion_last_download_kwargs = {}
+        cls.companion_download_calls = 0
+        cls.raise_on_companion_download = None
+        cls.raise_on_companion_resolve = None
+        cls.offline_tokenizer_result = True
+        cls.offline_probe_calls = []
+
+
+def _fake_snapshot_download(
+    repo_id: str,
+    *,
+    revision: str | None = None,
+    cache_dir: str | None = None,
+    local_files_only: bool = False,
+    token: str | None = None,
+    allow_patterns: list[str] | None = None,
+) -> str:
+    """Mirror the ``snapshot_download`` contract against ``FakeSnapshot``."""
+    if repo_id == _COMPANION_TOKENIZER_REPO:
+        FakeSnapshot.companion_last_kwargs = {
+            "repo_id": repo_id,
+            "revision": revision,
+            "cache_dir": cache_dir,
+            "local_files_only": local_files_only,
+            "token": token,
+            "allow_patterns": allow_patterns,
+        }
+        if local_files_only:
+            if FakeSnapshot.raise_on_companion_resolve is not None:
+                raise FakeSnapshot.raise_on_companion_resolve
+            if FakeSnapshot.companion_cached_path is None:
+                from huggingface_hub.errors import LocalEntryNotFoundError
+
+                raise LocalEntryNotFoundError("companion tokenizer is not cached")
+            return FakeSnapshot.companion_cached_path
+        FakeSnapshot.companion_last_download_kwargs = dict(FakeSnapshot.companion_last_kwargs)
+        FakeSnapshot.companion_download_calls += 1
+        if FakeSnapshot.raise_on_companion_download is not None:
+            raise FakeSnapshot.raise_on_companion_download
+        if FakeSnapshot.companion_cached_path is None:
+            FakeSnapshot.companion_cached_path = FAKE_SNAPSHOT_DIR
+        return FakeSnapshot.companion_cached_path
+    FakeSnapshot.last_kwargs = {
+        "repo_id": repo_id,
+        "revision": revision,
+        "cache_dir": cache_dir,
+        "local_files_only": local_files_only,
+        "token": token,
+        "allow_patterns": allow_patterns,
+    }
+    if local_files_only:
+        if FakeSnapshot.raise_on_resolve is not None:
+            raise FakeSnapshot.raise_on_resolve
+        if FakeSnapshot.cached_path is None:
+            # Mirror the real helper: not-in-cache surfaces as the documented
+            # LocalEntryNotFoundError, the one failure the plugin may read as
+            # reliable evidence of a missing snapshot.
+            from huggingface_hub.errors import LocalEntryNotFoundError
+
+            raise LocalEntryNotFoundError("snapshot is not cached locally")
+        return FakeSnapshot.cached_path
+    FakeSnapshot.last_download_kwargs = dict(FakeSnapshot.last_kwargs)
+    FakeSnapshot.download_calls += 1
+    if FakeSnapshot.raise_on_download is not None:
+        raise FakeSnapshot.raise_on_download
+    if FakeSnapshot.on_download is not None:
+        FakeSnapshot.on_download()
+    if FakeSnapshot.download_target is not None:
+        FakeSnapshot.cached_path = FakeSnapshot.download_target
+    return FakeSnapshot.cached_path or FAKE_SNAPSHOT_DIR
+
+
+class FakeHfApi:
+    """Controls the fake ``huggingface_hub.HfApi`` source metadata queries.
+
+    A refresh re-resolves the mutable revision through ``model_info``;
+    ``remote_sha`` is the commit the fake source answers with (``None``
+    models a source that names no commit), and ``raise_on_model_info``
+    models an unreachable or rejecting source.
+    """
+
+    remote_sha: str | None = None
+    raise_on_model_info: BaseException | None = None
+    model_info_calls: list[dict[str, Any]] = []
+    last_token: str | None = None
+
+    def __init__(self, token: str | None = None) -> None:
+        FakeHfApi.last_token = token
+
+    def model_info(self, repo_id: str, *, revision: str | None = None) -> Any:
+        FakeHfApi.model_info_calls.append({"repo_id": repo_id, "revision": revision})
+        if FakeHfApi.raise_on_model_info is not None:
+            raise FakeHfApi.raise_on_model_info
+        import types
+
+        return types.SimpleNamespace(sha=FakeHfApi.remote_sha)
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.remote_sha = None
+        cls.raise_on_model_info = None
+        cls.model_info_calls = []
+        cls.last_token = None
+
+
 def install_fake_loader(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -132,7 +343,10 @@ def install_fake_loader(
 
     The engine does ``from mlx_audio.stt import load`` *inside*
     ``_ensure_model_loaded``, so we patch the attribute on the real
-    ``mlx_audio.stt`` module; the lazy import then resolves to our fake.
+    ``mlx_audio.stt`` module; the lazy import then resolves to our fake. The
+    plugin-side snapshot resolution (``huggingface_hub.snapshot_download``) is
+    faked alongside it, backed by :class:`FakeSnapshot`, so no test ever
+    touches the network.
 
     Args:
         monkeypatch: The pytest monkeypatch fixture.
@@ -142,8 +356,25 @@ def install_fake_loader(
     Returns:
         The installed :class:`FakeLoader` (inspect ``load_calls`` / ``model``).
     """
+    import huggingface_hub
     import mlx_audio.stt as stt
 
+    from std_mlx_audio import engine as engine_module
+
+    FakeSnapshot.reset()
+    FakeHfApi.reset()
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot_download)
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeHfApi)
+
+    def _fake_offline_probe(checkpoint_dir: str, companion_repo: str) -> bool:
+        # The real probe runs transformers against the checkpoint and the
+        # default cache; its own unit tests exercise that against real
+        # directories. Here the canned answer keeps engine-flow tests
+        # hermetic.
+        FakeSnapshot.offline_probe_calls.append((checkpoint_dir, companion_repo))
+        return FakeSnapshot.offline_tokenizer_result
+
+    monkeypatch.setattr(engine_module, "offline_tokenizer_loads", _fake_offline_probe)
     model = FakeMlxModel(output=output, output_fn=output_fn)
     loader = FakeLoader(model)
     monkeypatch.setattr(stt, "load", loader)

@@ -19,7 +19,11 @@ import numpy as np
 import pytest
 from standard_asr import RuntimeParams
 from standard_asr.audio.input import AudioArray
-from standard_asr.contract.exceptions import DiscoveryError, InvalidProviderParamError, TranscriptionError
+from standard_asr.contract.exceptions import (
+    DiscoveryError,
+    InvalidProviderParamError,
+    TranscriptionError,
+)
 from standard_asr.contract.params import ProviderParams
 
 from std_mlx_audio import (
@@ -31,10 +35,12 @@ from std_mlx_audio import (
 )
 
 from .conftest import (
+    FAKE_SNAPSHOT_DIR,
     FakeAlignedResult,
     FakeAlignedSentence,
     FakeAlignedToken,
     FakeLoader,
+    FakeSnapshot,
     FakeSTTOutput,
 )
 
@@ -61,14 +67,22 @@ def test_transcribe_loads_preset_repo(fake_loader: Callable[..., FakeLoader]) ->
     loader = fake_loader(output=FakeSTTOutput(text="hi", language=["English"]))
     engine = Qwen3Asr06B()
     engine.transcribe(_array_input(), RuntimeParams(language="en"))
-    assert loader.load_calls[0]["model_path"] == "mlx-community/Qwen3-ASR-0.6B-4bit"
+    # Resolution is plugin-side: the snapshot is downloaded by repo id and the
+    # loader receives the resolved LOCAL directory, never the repo id.
+    assert FakeSnapshot.last_download_kwargs["repo_id"] == "mlx-community/Qwen3-ASR-0.6B-4bit"
+    assert loader.load_calls[0]["model_path"] == FAKE_SNAPSHOT_DIR
 
 
-def test_model_path_override_wins(fake_loader: Callable[..., FakeLoader]) -> None:
+def test_model_path_override_wins(fake_loader: Callable[..., FakeLoader], tmp_path: Path) -> None:
+    # The artifact guard inspects the path before loading, so the override must
+    # be a real MLX checkpoint directory.
+    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "model.safetensors").write_bytes(b"\x00")
     loader = fake_loader(output=FakeSTTOutput(text="hi"))
-    engine = Qwen3Asr06B(model_path="/local/my-model")
+    engine = Qwen3Asr06B(model_path=str(tmp_path))
     engine.prepare()
-    assert loader.load_calls[0]["model_path"] == "/local/my-model"
+    assert loader.load_calls[0]["model_path"] == str(tmp_path)
+    assert FakeSnapshot.download_calls == 0
 
 
 def test_download_disabled_forces_local_only(
@@ -78,8 +92,13 @@ def test_download_disabled_forces_local_only(
     # UNSET variable defaults to enabled, so we must set it explicitly here).
     monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "0")
     loader = fake_loader(output=FakeSTTOutput(text="hi"))
+    FakeSnapshot.cached_path = FAKE_SNAPSHOT_DIR
     Qwen3Asr06B().prepare()
-    assert loader.load_calls[0]["local_files_only"] is True
+    # The plugin-side resolution stayed cache-only and the loader received the
+    # cached local directory; no online call was made.
+    assert FakeSnapshot.last_kwargs["local_files_only"] is True
+    assert FakeSnapshot.download_calls == 0
+    assert loader.load_calls[0]["model_path"] == FAKE_SNAPSHOT_DIR
 
 
 def test_local_files_only_config_forces_local(
@@ -88,8 +107,11 @@ def test_local_files_only_config_forces_local(
     # The config flag forces local-only even when downloads are globally allowed.
     monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "1")
     loader = fake_loader(output=FakeSTTOutput(text="hi"))
+    FakeSnapshot.cached_path = FAKE_SNAPSHOT_DIR
     Qwen3Asr06B(local_files_only=True).prepare()
-    assert loader.load_calls[0]["local_files_only"] is True
+    assert FakeSnapshot.last_kwargs["local_files_only"] is True
+    assert FakeSnapshot.download_calls == 0
+    assert loader.load_calls[0]["model_path"] == FAKE_SNAPSHOT_DIR
 
 
 def test_download_enabled_allows_network(
@@ -98,13 +120,19 @@ def test_download_enabled_allows_network(
     monkeypatch.setenv("STANDARD_ASR_ALLOW_DOWNLOAD", "1")
     loader = fake_loader(output=FakeSTTOutput(text="hi"))
     Qwen3Asr06B().prepare()
-    assert loader.load_calls[0]["local_files_only"] is False
+    assert FakeSnapshot.last_download_kwargs["local_files_only"] is False
+    assert loader.load_calls[0]["model_path"] == FAKE_SNAPSHOT_DIR
 
 
-def test_load_failure_raises_discovery_error(fake_loader: Callable[..., FakeLoader]) -> None:
+def test_load_failure_with_ready_snapshot_is_engine_fault(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # The snapshot is cached and complete; a loader failure is then an
+    # engine-execution fault (batch R7 mapping), never an artifact error.
     loader = fake_loader(output=FakeSTTOutput(text="hi"))
+    FakeSnapshot.cached_path = FAKE_SNAPSHOT_DIR
     loader.raise_on_load = RuntimeError("metal kaput")
-    with pytest.raises(DiscoveryError):
+    with pytest.raises(TranscriptionError, match="failed to load"):
         Qwen3Asr06B().prepare()
 
 
@@ -259,11 +287,11 @@ def test_wrong_provider_params_rejected(fake_loader: Callable[..., FakeLoader]) 
 # Config / env
 # --------------------------------------------------------------------------- #
 def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("STANDARD_ASR_MLX_AUDIO__DTYPE", "bfloat16")
+    monkeypatch.setenv("STANDARD_ASR_MLX_AUDIO__REVISION", "refs/pr/9")
     engine = WhisperTiny()
     cfg = engine.config
     assert isinstance(cfg, MlxAudioConfig)
-    assert cfg.dtype == "bfloat16"
+    assert cfg.revision == "refs/pr/9"
 
 
 def test_explicit_kwarg_beats_preset_default() -> None:

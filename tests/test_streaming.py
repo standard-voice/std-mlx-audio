@@ -17,8 +17,8 @@ from typing import Any
 
 from standard_asr import TranscriptionEvent
 from standard_asr.audio.format import AudioFormat
-from standard_asr.contract.capabilities import FinalityCap, ReconnectCap, StreamTimestampsCap
 from standard_asr.compliance import check_event_sequence
+from standard_asr.contract.capabilities import FinalityCap, ReconnectCap, StreamTimestampsCap
 
 from std_mlx_audio import ParakeetTdt06BV3, Qwen3Asr06B, WhisperTiny
 from std_mlx_audio.engine import MlxAudioASR
@@ -299,3 +299,86 @@ async def test_streaming_sliding_window_bounds_and_keeps_absolute_time(
     # Not 5s-batched: many partials over the 16s feed.
     assert len(partials) >= 8
     assert events[-1].type == "done"
+
+
+# --------------------------------------------------------------------------- #
+# Optional segment timestamps (the core schema allows a segment without times)
+# --------------------------------------------------------------------------- #
+def test_build_events_segment_without_end_never_settles(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # A segment with no end time cannot be proven settled: it stays in the
+    # partial tail (with honest None times) instead of being finalized on a
+    # timestamp the decode never produced.
+    import numpy as np
+    from standard_asr import RuntimeParams
+    from standard_asr.contract.results import Segment
+
+    from std_mlx_audio._streaming import MlxAudioStreamingSession
+
+    fake_loader(output=FakeSTTOutput(text="x"))
+    session = MlxAudioStreamingSession(
+        WhisperTiny(), RuntimeParams(), settle_margin_s=0.0, max_window_s=None
+    )
+    session._window = np.zeros(16000 * 10, dtype=np.float32)
+    events = session._build_events(
+        [Segment(text="no end yet", start=None, end=None)], cursor=10.0, final_pass=False
+    )
+    (partial,) = events
+    assert partial.type == "partial"
+    assert partial.start is None and partial.end is None
+    assert session._finalized_count == 0
+
+
+def test_build_events_window_cap_stops_at_segment_without_end(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # The bounded-window force-finalize stops at a segment whose end is
+    # unknown: finalizing it would leave its audio untrimmable (the trim
+    # anchor is the last settled end), and re-decoding that audio next pass
+    # would duplicate the finalized text as new segments. The bound degrades
+    # honestly (with a one-shot warning) instead.
+    import numpy as np
+    from standard_asr import RuntimeParams
+    from standard_asr.contract.results import Segment
+
+    from std_mlx_audio._streaming import MlxAudioStreamingSession
+
+    fake_loader(output=FakeSTTOutput(text="x"))
+    session = MlxAudioStreamingSession(
+        WhisperTiny(), RuntimeParams(), settle_margin_s=100.0, max_window_s=1.0
+    )
+    session._window = np.zeros(16000 * 10, dtype=np.float32)
+    segments = [Segment(text="a", start=None, end=None), Segment(text="b", start=0.0, end=9.5)]
+    session._build_events(segments, cursor=10.0, final_pass=False)
+    assert session._finalized_count == 0
+
+
+def test_build_events_window_cap_forces_ended_segments(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # The cap's actual work: segments too close to the frontier to settle are
+    # force-finalized (oldest first) until trimming bounds the window again.
+    import numpy as np
+    from standard_asr import RuntimeParams
+    from standard_asr.contract.results import Segment
+
+    from std_mlx_audio._streaming import MlxAudioStreamingSession
+
+    fake_loader(output=FakeSTTOutput(text="x"))
+    session = MlxAudioStreamingSession(
+        WhisperTiny(), RuntimeParams(), settle_margin_s=100.0, max_window_s=2.0
+    )
+    session._window = np.zeros(16000 * 10, dtype=np.float32)
+    segments = [
+        Segment(text="a", start=0.0, end=7.5),
+        Segment(text="b", start=7.5, end=9.0),
+        Segment(text="c", start=9.0, end=9.8),
+    ]
+    events = session._build_events(segments, cursor=10.0, final_pass=False)
+    # Trimming to 9.0 leaves a 1.0 s window (within the 2.0 s cap), so the
+    # first two segments were force-finalized and the third stays partial.
+    finals = [e for e in events if e.type == "final"]
+    assert [e.text for e in finals] == ["a", "b"]
+    assert session._finalized_count == 2
+    assert session._window.size == 16000  # 1.0 s left after the trim

@@ -79,6 +79,36 @@ This pulls `mlx-audio[stt]` (which pulls `mlx`, `mlx-lm`, `transformers`) and
 Hub on first use (set `STANDARD_ASR_ALLOW_DOWNLOAD=1` if your environment disables
 downloads). Once published to PyPI this becomes `uv pip install std-mlx-audio`.
 
+**Artifact lifecycle.** `standard-asr status mlx-audio/<model>`
+reports whether the preset's snapshot is cached and provably complete (a
+sharded checkpoint is ready only when every shard is present -- named by the
+safetensors index, or by the shards' own `-NNNNN-of-NNNNN` names when the
+index has not arrived yet). Non-weight files enter the ready closure on two
+verified axes. Files a loader reads by one fixed name and silently corrupts
+without (the MMS base weights and CTC vocab, the SenseVoice bpe and
+normalization stats, the FireRed dict and cmvn, the Moonshine tokenizer,
+the Cohere tokenizer config) gate every checkpoint, an operator
+`model_path` included. Files whose absence provably breaks inference for
+the preset's own repo layout (the Whisper and Qwen3 processor configs, the
+GLM, Granite NAR, and tekken tokenizers, the Canary SentencePiece model)
+gate only the Hub snapshot: the flexible upstream loaders accept
+alternative local layouts an exact-name check would wrongly reject. Each
+declared file is verified as a single point of failure against the
+installed loader, by per-file ablation. VibeVoice's tokenizer lives in a
+separate Hub repo its upstream loader fetches at load time; the preset
+models it as a companion, so status requires it cached, `pull` acquires
+it, and a load under a no-download policy refuses instead of letting the
+fetch bypass the policy. `standard-asr pull` acquires or repairs the
+snapshot without loading or priming a model.
+`pull --refresh` re-resolves a mutable revision and verifies against the
+source that the re-resolution happened: the downloader alone silently falls
+back to the local cache when the source is unreachable, and a refresh fails
+rather than report the stale cache as fresh (a pinned 40-hex commit is
+immutable and a no-op). The implicit first-use load re-verifies completeness
+after its online resolution for the same reason, so the non-strict loader
+never receives a fragment. With `local_files_only=true` the engine refuses
+every network transfer, including a refresh.
+
 ## Use
 
 ### CLI (no code)

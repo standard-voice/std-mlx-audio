@@ -8,8 +8,8 @@ Two pydantic models:
 * :class:`MlxAudioConfig` — init configuration (spec IC.1). The model is selected
   by the entry-point preset (spec IC.7), never a field here. Standard
   "relevant-only" axes (download root) come from the standard mixin so the
-  auto-UI renders them; engine-specific init knobs (``dtype``, ``quantization``
-  hint) are declared directly. There is no device field: MLX always runs on the
+  auto-UI renders them; engine-specific init knobs (``revision``, the
+  streaming window) are declared directly. There is no device field: MLX always runs on the
   Apple-Silicon GPU/Metal (no CPU/GPU choice to expose), so declaring a
   ``DeviceConfigMixin`` would advertise a knob that does not exist (spec IC.5 —
   a field present means it applies).
@@ -25,19 +25,13 @@ from __future__ import annotations
 from typing import Literal
 
 from pydantic import Field, SecretStr
+from standard_asr.contract.params import ProviderParams
 from standard_asr.engine import (
     BaseConfig,
     DownloadConfigMixin,
     LanguageConfigMixin,
     secret_field,
 )
-from standard_asr.contract.params import ProviderParams
-
-#: MLX compute dtypes we let the loader request. ``"auto"`` keeps the dtype
-#: baked into the (often pre-quantized) checkpoint — the right default, since the
-#: mlx-community repos ship already quantized (4bit/8bit) and re-casting them is
-#: usually wrong. ``float16`` / ``bfloat16`` / ``float32`` force a cast.
-MlxDtype = Literal["auto", "float16", "bfloat16", "float32"]
 
 
 class MlxAudioConfig(
@@ -70,9 +64,6 @@ class MlxAudioConfig(
         model_path: Optional LOCAL MLX checkpoint directory overriding the
             preset's model (spec IC.7 weights/path). The model is chosen by the
             preset, not by this field; ``None`` loads the preset's Hub repo.
-        dtype: MLX compute dtype. ``"auto"`` (default) keeps the checkpoint's
-            baked-in dtype (correct for the pre-quantized mlx-community repos);
-            the others force a cast.
         local_files_only: Never download; require a cached/local model.
         revision: Optional Hugging Face model revision (branch/tag/commit).
         hf_token: Optional Hugging Face access token for gated/private model
@@ -89,17 +80,11 @@ class MlxAudioConfig(
 
     model_path: str | None = Field(
         default=None,
+        min_length=1,
         description=(
             "Optional local MLX checkpoint directory overriding the preset's "
             "model (spec IC.7 weights/path). The model is selected by the "
             "entry-point preset, not by this field; None loads the preset's repo."
-        ),
-    )
-    dtype: MlxDtype = Field(
-        default="auto",
-        description=(
-            "MLX compute dtype. 'auto' keeps the checkpoint's baked-in dtype "
-            "(correct for pre-quantized repos); others force a cast."
         ),
     )
     local_files_only: bool = Field(default=False, description="Disable downloads when True.")
@@ -212,4 +197,4 @@ class MlxAudioParams(ProviderParams):
     context: str | None = None
 
 
-__all__ = ["MlxAudioConfig", "MlxAudioParams", "MlxDtype"]
+__all__ = ["MlxAudioConfig", "MlxAudioParams"]

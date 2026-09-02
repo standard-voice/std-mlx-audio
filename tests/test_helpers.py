@@ -17,7 +17,7 @@ from std_mlx_audio._streaming import (  # pyright: ignore[reportPrivateUsage]
 from std_mlx_audio.backends import WhisperBackend
 from std_mlx_audio.engine import _disable_tqdm_monitor_thread  # pyright: ignore[reportPrivateUsage]
 
-from .conftest import FakeLoader, FakeSTTOutput
+from .conftest import FakeLoader, FakeSnapshot, FakeSTTOutput
 
 
 # --------------------------------------------------------------------------- #
@@ -117,12 +117,17 @@ def test_disable_tqdm_monitor_swallows_errors(monkeypatch: pytest.MonkeyPatch) -
 # --------------------------------------------------------------------------- #
 # Engine revision passthrough + bytes input
 # --------------------------------------------------------------------------- #
-def test_revision_forwarded_to_loader(fake_loader: Callable[..., FakeLoader]) -> None:
+def test_revision_forwarded_to_snapshot_resolution(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
     from std_mlx_audio import Qwen3Asr06B
 
     loader = fake_loader(output=FakeSTTOutput(text="hi"))
     Qwen3Asr06B(revision="refs/pr/1").prepare()
-    assert loader.load_calls[0]["revision"] == "refs/pr/1"
+    # The revision is consumed by the plugin-side snapshot resolution; load()
+    # receives a local path, for which a revision is meaningless.
+    assert FakeSnapshot.last_download_kwargs["revision"] == "refs/pr/1"
+    assert "revision" not in loader.load_calls[0]
 
 
 def test_source_for_rejects_empty_prepared() -> None:

@@ -1536,8 +1536,8 @@ wheels = [
 
 [[package]]
 name = "standard-asr"
-version = "0.1.1"
-source = { git = "https://github.com/standard-voice/standard_asr.git?rev=main#bf3d7940fe2304118614d0a7d3b95f4556a685c0" }
+version = "0.2.0.dev0"
+source = { git = "https://github.com/standard-voice/standard_asr.git?rev=main#e763c4c483a8034bf6ee8cac13b1b65cd614a7de" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -1549,6 +1549,7 @@ name = "std-mlx-audio"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "huggingface-hub" },
     { name = "mlx-audio", extra = ["stt"] },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -1566,6 +1567,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub", specifier = ">=0.23" },
     { name = "mlx-audio", extras = ["stt"], specifier = ">=0.4.4,<0.5" },
     { name = "numpy", specifier = ">=1.26.4" },
     { name = "standard-asr", git = "https://github.com/standard-voice/standard_asr.git?rev=main" },
