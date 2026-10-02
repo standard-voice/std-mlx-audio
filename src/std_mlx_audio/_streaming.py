@@ -60,6 +60,7 @@ from standard_asr.contract.language import effective_language
 
 from . import backends
 from ._config import MlxAudioConfig, MlxAudioParams
+from ._guidance import echoes_prompt
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from standard_asr.contract.results import Segment
@@ -207,6 +208,7 @@ class MlxAudioStreamingSession(TranscriptionSession):
             want_words=want_words,
             params=mlx_params,
             config=config,
+            prompt=self._params.prompt,
         )
         model = cast(Any, engine.model)
         source = backends.to_mlx_array(np.ascontiguousarray(audio, dtype=np.float32))
@@ -214,6 +216,11 @@ class MlxAudioStreamingSession(TranscriptionSession):
         result = backend.to_result(
             native, duration=backends.waveform_duration(audio), want_words=want_words
         )
+        # A window with no speech can come back as the prompt itself (see _guidance).
+        if echoes_prompt(
+            result.text, gen_kwargs.get("system_prompt", gen_kwargs.get("initial_prompt"))
+        ):
+            return []
         return list(result.segments or [])
 
     async def _produce(self) -> AsyncIterator[TranscriptionEvent]:

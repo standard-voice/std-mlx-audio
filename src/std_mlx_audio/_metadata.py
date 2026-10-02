@@ -95,17 +95,30 @@ class MlxAudioProperties(BaseProperties):
 # Qwen3-ASR emits chunk-level segment timing on every run but NO per-word
 # timing, so it declares "segment" only (declaring "word" would be dishonest;
 # omitting "segment" would falsely reject the cheapest always-satisfiable
-# request — spec TR.3). It exposes a full LLM sampler via provider params, but
-# the portable `prompt` maps to a Qwen chat slot we expose as the
-# Qwen-specific `system_prompt` provider param instead (a free-text decode prompt
-# has no portable Whisper-`initial_prompt`-equivalent here), so batch `guidance`
-# is left unsupported (fail-closed) rather than mis-mapped.
+# request — spec TR.3). It exposes a full LLM sampler via provider params.
+#
+# Its context is the portable `prompt` (spec §5.3): the official package's
+# `transcribe(context=...)` puts the text in the system turn of the chat
+# template (QwenLM/Qwen3-ASR, qwen_asr/inference/qwen3_asr.py, `_build_messages`),
+# which is the slot mlx-audio fills from `system_prompt`. The technical report
+# trains the model to use it as background knowledge and not to follow
+# instructions in it. Measured on Qwen3-ASR 0.6B 4-bit (M5 Max, 2026-10-01): a
+# 47-character term list fixed misheard names ("GZO" -> "Jezo") at no measurable
+# cost; 837 tokens of context added ~0.05 s to a 3 s window and 3353 tokens
+# ~0.2 s, while recognition got no better past a few hundred characters.
+# `max_tokens` is the standard's conservative count (one per CJK character), with
+# headroom under what was measured. A window with no speech can come back as the
+# prompt itself; `_guidance.echoes_prompt` drops that.
+_QWEN_GUIDANCE = GuidanceCaps(
+    prompt=PromptCap(supported=True, constraints=PromptConstraints(max_tokens=1000))
+)
 _QWEN_WORD_TS = WordTimestampsCap(supported=True, granularities=["segment"])
 
 _QWEN_CAPABILITIES = DeclaredCapabilities(
     batch=BatchCapabilities(
         language=LanguageCaps(runtime_override=FlagCap(supported=True)),
         word_timestamps=_QWEN_WORD_TS,
+        guidance=_QWEN_GUIDANCE,
     ),
     # Windowed streaming (re-decode strategy; Qwen3-ASR has no native streaming).
     # Honest consequences of re-decoding the whole window each pass:
@@ -119,6 +132,7 @@ _QWEN_CAPABILITIES = DeclaredCapabilities(
     streaming=StreamingCapabilities(
         language=LanguageCaps(runtime_override=FlagCap(supported=True)),
         word_timestamps=_QWEN_WORD_TS,
+        guidance=StreamingGuidanceCaps(prompt=_QWEN_GUIDANCE.prompt),
         emits_partials=FlagCap(supported=True),
         re_segments=FlagCap(supported=False),
         word_stability=FlagCap(supported=False),

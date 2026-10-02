@@ -56,7 +56,7 @@ three families are genuinely heterogeneous:
 | Native return | `STTOutput` | `STTOutput` | `AlignedResult` (different type!) |
 | Language arg | English **name** (`"Chinese"`) | ISO **code** (`"ja"`) | **none** (fixed-language) |
 | Word timing | no (segment only) | yes (when asked) | yes (always, token-level) |
-| Guidance | `system_prompt` (chat slot) | `initial_prompt` | none |
+| Guidance | portable `prompt` as its context (the system turn, `system_prompt`) | portable `prompt` as `initial_prompt` | none |
 | Sampler | full LLM sampler | temperature schedule | none |
 | Runtime language override | yes | yes | **no** |
 
@@ -88,9 +88,9 @@ the presets are not interchangeable. So the design splits into two layers:
    pipeline.
 
 3. **`_metadata.py` — per-family Properties + Capabilities.** Each family
-   declares its *own* honest, fail-closed capabilities: Qwen3-ASR declares only
-   `word_timestamps=["segment"]`; Whisper declares `["word","segment"]` + prompt
-   guidance; Parakeet declares `["word","segment"]` but
+   declares its *own* honest, fail-closed capabilities: Qwen3-ASR declares
+   `word_timestamps=["segment"]` + prompt guidance (its context); Whisper declares
+   `["word","segment"]` + prompt guidance; Parakeet declares `["word","segment"]` but
    `language.runtime_override=false` (a fixed-language model). This is the
    protocol carrying a *family*: same engine_id, different per-model capabilities,
    discovered without instantiation.

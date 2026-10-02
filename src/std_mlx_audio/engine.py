@@ -90,6 +90,7 @@ from ._artifacts import (
     status_requirement,
 )
 from ._config import MlxAudioConfig, MlxAudioParams
+from ._guidance import echoes_prompt
 from ._metadata import (
     _PARAKEET_CAPABILITIES,
     _QWEN_CAPABILITIES,
@@ -706,13 +707,20 @@ class MlxAudioASR(EngineBase):
             want_words=want_words,
             params=mlx_params,
             config=config,
+            prompt=params.prompt,
         )
         model = cast(Any, self._model)
         try:
             native = model.generate(backends.adapt_audio_source(backend, source), **gen_kwargs)
         except Exception as exc:
             raise TranscriptionError(f"MLX transcription failed: {type(exc).__name__}.") from exc
-        return backend.to_result(native, duration=duration, want_words=want_words)
+        result = backend.to_result(native, duration=duration, want_words=want_words)
+        # Audio with no speech can come back as the prompt itself (see _guidance).
+        if echoes_prompt(
+            result.text, gen_kwargs.get("system_prompt", gen_kwargs.get("initial_prompt"))
+        ):
+            return TranscriptionResult(text="", duration=duration)
+        return result
 
     def _source_for(self, prepared: PreparedAudio) -> tuple[Any, float | None]:
         """Map negotiated audio onto the source mlx-audio accepts (+ duration).

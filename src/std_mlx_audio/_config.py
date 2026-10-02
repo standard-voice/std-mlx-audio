@@ -154,10 +154,9 @@ class MlxAudioParams(ProviderParams):
         max_tokens: Hard cap on generated tokens for the autoregressive backends
             (Qwen3-ASR). Guards against runaway decoding on long/degenerate
             audio.
-        system_prompt: Optional system prompt for the Qwen3-ASR decoder (e.g. to
-            bias domain/formatting). Distinct from the portable ``prompt`` (which
-            maps to Whisper's ``initial_prompt``); kept here because it is a
-            Qwen-specific chat-template slot with no portable equivalent.
+        system_prompt: The system turn of the Qwen3-ASR chat template, verbatim.
+            The portable ``prompt`` fills the same slot (it's Qwen3-ASR's
+            context); when both are given, this one wins.
         chunk_duration: Max seconds of audio per decode chunk for the chunking
             backends (Qwen3-ASR default 1200s = 20 min; Whisper/Parakeet have
             their own internal windowing). Long files are split and concatenated.

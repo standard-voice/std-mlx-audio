@@ -101,6 +101,7 @@ class ModelBackend(Protocol):
         want_words: bool,
         params: MlxAudioParams,
         config: MlxAudioConfig,
+        prompt: str | None = None,
     ) -> dict[str, Any]:
         """Build the keyword arguments for this family's ``model.generate``.
 
@@ -110,6 +111,10 @@ class ModelBackend(Protocol):
             want_words: Whether word-level timestamps were requested.
             params: The engine-specific decoding knobs.
             config: The engine init config.
+            prompt: The portable guidance ``prompt``, already gated by the
+                standard layer: only a model that declares
+                ``<mode>.guidance.prompt`` is ever given one, and a backend
+                that declares it MUST pass it to the model.
 
         Returns:
             Keyword arguments for ``model.generate(audio, **kwargs)``.
@@ -156,6 +161,7 @@ class Qwen3AsrBackend:
         want_words: bool,
         params: MlxAudioParams,
         config: MlxAudioConfig,
+        prompt: str | None = None,
     ) -> dict[str, Any]:
         """Build Qwen3-ASR ``generate`` kwargs (English-name language + sampler).
 
@@ -164,6 +170,7 @@ class Qwen3AsrBackend:
             want_words: Ignored (Qwen3-ASR has no word-timestamp mode).
             params: Engine-specific decoding knobs.
             config: Engine init config (unused here; kept for protocol symmetry).
+            prompt: The portable guidance prompt, used as Qwen3-ASR's context.
 
         Returns:
             Keyword arguments for ``Qwen3ASR.generate``.
@@ -185,8 +192,14 @@ class Qwen3AsrBackend:
             name = languages.to_qwen_name(resolved_language)
             if name is not None:
                 kwargs["language"] = name
+        # Qwen3-ASR's context is the system turn of its chat template, which is
+        # where the official package puts `context` (spec §5.3: Qwen3 `context`
+        # is the portable `prompt`). The Qwen-specific `system_prompt` provider
+        # param, when given, is the more specific request and wins.
         if params.system_prompt is not None:
             kwargs["system_prompt"] = params.system_prompt
+        elif prompt is not None:
+            kwargs["system_prompt"] = prompt
         return kwargs
 
     def to_result(
@@ -243,6 +256,7 @@ class WhisperBackend:
         want_words: bool,
         params: MlxAudioParams,
         config: MlxAudioConfig,
+        prompt: str | None = None,
     ) -> dict[str, Any]:
         """Build Whisper ``generate`` kwargs (ISO code language + timestamps).
 
@@ -251,6 +265,7 @@ class WhisperBackend:
             want_words: Whether to request word-level timestamps.
             params: Engine-specific decoding knobs.
             config: Engine init config (unused; kept for protocol symmetry).
+            prompt: The portable guidance prompt, passed as ``initial_prompt``.
 
         Returns:
             Keyword arguments for ``Whisper.generate``.
@@ -267,6 +282,9 @@ class WhisperBackend:
             code = languages.to_whisper_code(resolved_language)
             if code is not None:
                 kwargs["language"] = code
+        # Whisper declares guidance.prompt; its native slot is `initial_prompt`.
+        if prompt is not None:
+            kwargs["initial_prompt"] = prompt
         return kwargs
 
     def to_result(
@@ -345,6 +363,7 @@ class AlignedResultBackend:
         want_words: bool,
         params: MlxAudioParams,
         config: MlxAudioConfig,
+        prompt: str | None = None,
     ) -> dict[str, Any]:
         """Build the aligned-output ``generate`` kwargs (none).
 
@@ -357,11 +376,12 @@ class AlignedResultBackend:
             want_words: Ignored (always produces token timing).
             params: Ignored (no exposed knobs).
             config: Ignored.
+            prompt: Ignored (these models declare no guidance).
 
         Returns:
             An empty kwargs dict.
         """
-        del resolved_language, want_words, params, config
+        del resolved_language, want_words, params, config, prompt
         return {}
 
     def to_result(
@@ -504,6 +524,7 @@ class GenericSttBackend:
         want_words: bool,
         params: MlxAudioParams,
         config: MlxAudioConfig,
+        prompt: str | None = None,
     ) -> dict[str, Any]:
         """Build the family's ``generate`` kwargs from the spec + provider params.
 
@@ -516,11 +537,12 @@ class GenericSttBackend:
             want_words: Ignored (no STTOutput family emits word timing).
             params: Engine-specific decoding knobs.
             config: Engine init config (unused; kept for protocol symmetry).
+            prompt: Ignored (no STTOutput family here declares guidance).
 
         Returns:
             Keyword arguments for the family's ``model.generate``.
         """
-        del want_words, config
+        del want_words, config, prompt
         spec = self.spec
         kwargs: dict[str, Any] = {}
         if spec.language_kwarg is not None and resolved_language is not None:
