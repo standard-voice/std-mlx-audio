@@ -3,7 +3,8 @@
 
 """Streaming-path tests for the windowed MLX session.
 
-Runs entirely against the injected fake loader (no weights, no MLX). The fake's
+Runs entirely against the injected fake loader: no weights are loaded, though
+``mlx_audio`` and MLX are imported (see ``conftest.py``). The fake's
 ``output_fn`` returns segments based on how much audio has accumulated, so we can
 simulate the window growing across re-decodes and assert the partial -> final
 progression plus the spec event-sequence contract. Covers all three families
@@ -12,9 +13,11 @@ since the session dispatches to the bound backend.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
+import pytest
 from standard_asr import TranscriptionEvent
 from standard_asr.audio.format import AudioFormat
 from standard_asr.compliance import check_event_sequence
@@ -29,6 +32,9 @@ from .conftest import (
     FakeAlignedToken,
     FakeLoader,
     FakeSTTOutput,
+    VirtualTimeLoop,
+    on_virtual_clock,
+    run_virtual,
     silent_pcm,
 )
 
@@ -70,18 +76,43 @@ def test_parakeet_streaming_no_language_override() -> None:
 # --------------------------------------------------------------------------- #
 # Live windowed run — Qwen3-ASR (STTOutput chunk segments)
 # --------------------------------------------------------------------------- #
-async def _drive(engine: MlxAudioASR) -> tuple[list[TranscriptionEvent], Any]:
-    """Feed ~12s of audio in 1s chunks; collect events + the reduced result."""
-    events: list[TranscriptionEvent] = []
-    chunk = silent_pcm(1.0)
-    async with engine.start_transcription(audio_format=_FMT) as session:
-        session.feed([chunk] * 12)
-        async for event in session:
-            events.append(event)
-    return events, session.result()
+def _drive_live(
+    engine: MlxAudioASR, chunks: list[bytes], *, chunk_s: float = 1.0, params: Any = None
+) -> tuple[list[TranscriptionEvent], Any]:
+    """Send ``chunks`` live (one per ``chunk_s``, on virtual time); collect events.
+
+    Returns:
+        The events and the reduced result.
+    """
+
+    async def main(loop: VirtualTimeLoop) -> tuple[list[TranscriptionEvent], Any]:
+        events: list[TranscriptionEvent] = []
+        session = on_virtual_clock(
+            engine.start_transcription(audio_format=_FMT, params=params), loop
+        )
+        async with session:
+
+            async def feeder() -> None:
+                for i, chunk in enumerate(chunks):
+                    await asyncio.sleep(max(0.0, (i + 1) * chunk_s - loop.time()))
+                    await session.send_audio(chunk)
+                await session.end_audio()
+
+            task = asyncio.ensure_future(feeder())
+            async for event in session:
+                events.append(event)
+            await task
+        return events, session.result()
+
+    return run_virtual(main)
 
 
-async def test_qwen_streaming_emits_partials_then_finals(
+def _drive(engine: MlxAudioASR) -> tuple[list[TranscriptionEvent], Any]:
+    """Send ~12s of audio live in 1s chunks; collect events + the reduced result."""
+    return _drive_live(engine, [silent_pcm(1.0)] * 12)
+
+
+def test_qwen_streaming_emits_partials_then_finals(
     fake_loader: Callable[..., FakeLoader],
 ) -> None:
     def output_fn(audio: Any, _kwargs: dict[str, Any]) -> FakeSTTOutput:
@@ -93,14 +124,15 @@ async def test_qwen_streaming_emits_partials_then_finals(
         return FakeSTTOutput(text="".join(s["text"] for s in segs), segments=segs)
 
     fake_loader(output_fn=output_fn)
-    events, result = await _drive(Qwen3Asr06B())
+    events, result = _drive(Qwen3Asr06B())
 
     types = [e.type for e in events]
     assert "partial" in types
     assert "final" in types
     assert types[-1] == "done"
-    # Recorded stream obeys the segment/event-order contract.
-    report = check_event_sequence([e for e in events if e.type != "progress"])
+    # Recorded stream obeys the segment/event-order contract and does not exceed
+    # what the engine declares (progress events included: they carry the cursor).
+    report = check_event_sequence(events, capabilities=Qwen3Asr06B.declared_capabilities)
     assert report.passed, [i.message for i in report.issues]
     assert "First chunk." in result.text
 
@@ -108,7 +140,7 @@ async def test_qwen_streaming_emits_partials_then_finals(
 # --------------------------------------------------------------------------- #
 # Live windowed run — Parakeet (AlignedResult; different return type)
 # --------------------------------------------------------------------------- #
-async def test_parakeet_streaming_dispatches_to_backend(
+def test_parakeet_streaming_dispatches_to_backend(
     fake_loader: Callable[..., FakeLoader],
 ) -> None:
     def output_fn(audio: Any, _kwargs: dict[str, Any]) -> FakeAlignedResult:
@@ -133,21 +165,23 @@ async def test_parakeet_streaming_dispatches_to_backend(
         return FakeAlignedResult(text="".join(s.text for s in sents), sentences=sents)
 
     fake_loader(output_fn=output_fn)
-    events, result = await _drive(ParakeetTdt06BV3())
+    events, result = _drive(ParakeetTdt06BV3())
     assert events[-1].type == "done"
     assert any(e.type == "final" for e in events)
     assert "First sentence." in result.text
+    report = check_event_sequence(events, capabilities=ParakeetTdt06BV3.declared_capabilities)
+    assert report.passed, [i.message for i in report.issues]
 
 
 # --------------------------------------------------------------------------- #
 # Edge cases
 # --------------------------------------------------------------------------- #
-async def test_streaming_silence_only_emits_progress_and_done(
+def test_streaming_silence_only_emits_progress_and_done(
     fake_loader: Callable[..., FakeLoader],
 ) -> None:
     # Empty transcript on every decode => only progress + done, no partial/final.
     fake_loader(output=FakeSTTOutput(text="", segments=[]))
-    events, _ = await _drive(WhisperTiny())
+    events, _ = _drive(WhisperTiny())
     assert events[-1].type == "done"
     assert all(e.type in ("progress", "done") for e in events)
 
@@ -165,7 +199,7 @@ async def test_streaming_decode_error_surfaces_error_event(
     assert any(e.type == "error" for e in events)
 
 
-async def test_streaming_tail_carries_words_when_requested(
+def test_streaming_tail_carries_words_when_requested(
     fake_loader: Callable[..., FakeLoader],
 ) -> None:
     # word_timestamps=word => the moving partial tail must carry word data too.
@@ -190,16 +224,16 @@ async def test_streaming_tail_carries_words_when_requested(
         )
 
     fake_loader(output_fn=output_fn)
-    events: list[TranscriptionEvent] = []
-    async with WhisperTiny().start_transcription(
-        audio_format=_FMT, params=RuntimeParams(language="en", word_timestamps="word")
-    ) as session:
-        session.feed([silent_pcm(1.0)] * 7)
-        async for event in session:
-            events.append(event)
+    events, _ = _drive_live(
+        WhisperTiny(),
+        [silent_pcm(1.0)] * 7,
+        params=RuntimeParams(language="en", word_timestamps="word"),
+    )
     partials = [e for e in events if e.type == "partial"]
     assert partials, "expected at least one partial"
     assert any(e.words for e in partials), "partial tail should carry words"
+    report = check_event_sequence(events, capabilities=WhisperTiny.declared_capabilities)
+    assert report.passed, [i.message for i in report.issues]
 
 
 async def test_streaming_whole_input_path(fake_loader: Callable[..., FakeLoader]) -> None:
@@ -236,17 +270,32 @@ def test_streaming_config_knobs_default_and_override() -> None:
     cfg = MlxAudioConfig(engine="mlx-audio")
     # Defaults are the snappier (lower-latency) values.
     assert (cfg.redecode_interval_s, cfg.settle_margin_s, cfg.max_window_s) == (1.5, 2.0, 30.0)
+    assert cfg.commit_pause_s is None
 
     # --set overrides (constructor kwargs) reach the constructed session.
     session = WhisperTiny(
-        redecode_interval_s=0.7, settle_margin_s=1.0, max_window_s=4.0
+        redecode_interval_s=0.7, settle_margin_s=1.0, max_window_s=4.0, commit_pause_s=0.6
     ).start_transcription(audio_format=_FMT)
     assert session._redecode_interval_s == 0.7  # type: ignore[attr-defined]
     assert session._settle_margin_s == 1.0  # type: ignore[attr-defined]
-    assert session._max_window_s == 4.0  # type: ignore[attr-defined]
+    assert session._cap == 4 * 16000  # type: ignore[attr-defined]  # the cap in samples
+    assert session._inbox_limit == 2 * 4 * 16000  # type: ignore[attr-defined]  # in bytes
+    assert session._commit_pause_s == 0.6  # type: ignore[attr-defined]
 
 
-async def test_streaming_sliding_window_bounds_and_keeps_absolute_time(
+def test_streaming_knobs_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The application tunes streaming through these variables; they must keep
+    # their names.
+    monkeypatch.setenv("STANDARD_ASR_MLX_AUDIO__REDECODE_INTERVAL_S", "0.3")
+    monkeypatch.setenv("STANDARD_ASR_MLX_AUDIO__SETTLE_MARGIN_S", "0.4")
+    monkeypatch.setenv("STANDARD_ASR_MLX_AUDIO__COMMIT_PAUSE_S", "0.8")
+    session = Qwen3Asr06B().start_transcription(audio_format=_FMT)
+    assert session._redecode_interval_s == 0.3  # type: ignore[attr-defined]
+    assert session._settle_margin_s == 0.4  # type: ignore[attr-defined]
+    assert session._commit_pause_s == 0.8  # type: ignore[attr-defined]
+
+
+def test_streaming_sliding_window_bounds_and_keeps_absolute_time(
     fake_loader: Callable[..., FakeLoader],
 ) -> None:
     """A decoder that tiles its (relative-timed) window into 1s segments.
@@ -266,13 +315,8 @@ async def test_streaming_sliding_window_bounds_and_keeps_absolute_time(
         return FakeSTTOutput(text="".join(s["text"] for s in segs), segments=segs)
 
     loader = fake_loader(output_fn=output_fn)
-    events: list[TranscriptionEvent] = []
-    async with WhisperTiny(
-        redecode_interval_s=1.0, settle_margin_s=1.0, max_window_s=4.0
-    ).start_transcription(audio_format=_FMT) as session:
-        session.feed([silent_pcm(1.0)] * 16)
-        async for event in session:
-            events.append(event)
+    engine = WhisperTiny(redecode_interval_s=1.0, settle_margin_s=1.0, max_window_s=4.0)
+    events, _ = _drive_live(engine, [silent_pcm(1.0)] * 16)
 
     finals = [e for e in events if e.type == "final"]
     partials = [e for e in events if e.type == "partial"]
@@ -314,30 +358,30 @@ def test_build_events_segment_without_end_never_settles(
     from standard_asr import RuntimeParams
     from standard_asr.contract.results import Segment
 
-    from std_mlx_audio._streaming import MlxAudioStreamingSession
+    from std_mlx_audio._streaming import MlxAudioStreamingSession, _clamp
 
     fake_loader(output=FakeSTTOutput(text="x"))
     session = MlxAudioStreamingSession(
         WhisperTiny(), RuntimeParams(), settle_margin_s=0.0, max_window_s=None
     )
     session._window = np.zeros(16000 * 10, dtype=np.float32)
-    events = session._build_events(
-        [Segment(text="no end yet", start=None, end=None)], cursor=10.0, final_pass=False
-    )
+    segments = _clamp([Segment(text="no end yet", start=None, end=None)], 16000 * 10)
+    events = session._build_events(segments)
     (partial,) = events
     assert partial.type == "partial"
     assert partial.start is None and partial.end is None
     assert session._finalized_count == 0
+    (final,) = session._finalize_all(segments, 16000 * 10)
+    assert final.type == "final"
+    assert final.start is None and final.end is None
 
 
-def test_build_events_window_cap_stops_at_segment_without_end(
+async def test_cap_boundary_stops_at_segment_without_end(
     fake_loader: Callable[..., FakeLoader],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The bounded-window force-finalize stops at a segment whose end is
-    # unknown: finalizing it would leave its audio untrimmable (the trim
-    # anchor is the last settled end), and re-decoding that audio next pass
-    # would duplicate the finalized text as new segments. The bound degrades
-    # honestly (with a one-shot warning) instead.
+    # An unknown end cannot anchor a cut. The cap must fall back to decoding
+    # a bounded head on its own, without committing text past the unknown end.
     import numpy as np
     from standard_asr import RuntimeParams
     from standard_asr.contract.results import Segment
@@ -346,19 +390,23 @@ def test_build_events_window_cap_stops_at_segment_without_end(
 
     fake_loader(output=FakeSTTOutput(text="x"))
     session = MlxAudioStreamingSession(
-        WhisperTiny(), RuntimeParams(), settle_margin_s=100.0, max_window_s=1.0
+        WhisperTiny(), RuntimeParams(), settle_margin_s=100.0, max_window_s=10.0
     )
     session._window = np.zeros(16000 * 10, dtype=np.float32)
     segments = [Segment(text="a", start=None, end=None), Segment(text="b", start=0.0, end=9.5)]
-    session._build_events(segments, cursor=10.0, final_pass=False)
+    monkeypatch.setattr(session, "_decode", lambda *_args, **_kwargs: segments)
+    assert await session._commit_settled_prefix(16000 * 10, want_words=False) is None
     assert session._finalized_count == 0
+    assert session._window.size == 16000 * 10
+    (partial,) = session._build_events(segments)
+    assert partial.start is None and partial.end is None
 
 
-def test_build_events_window_cap_forces_ended_segments(
+async def test_cap_commits_at_the_last_inner_boundary(
     fake_loader: Callable[..., FakeLoader],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The cap's actual work: segments too close to the frontier to settle are
-    # force-finalized (oldest first) until trimming bounds the window again.
+    # With no settled segment, the cap commits through the last inner boundary.
     import numpy as np
     from standard_asr import RuntimeParams
     from standard_asr.contract.results import Segment
@@ -367,17 +415,18 @@ def test_build_events_window_cap_forces_ended_segments(
 
     fake_loader(output=FakeSTTOutput(text="x"))
     session = MlxAudioStreamingSession(
-        WhisperTiny(), RuntimeParams(), settle_margin_s=100.0, max_window_s=2.0
+        WhisperTiny(), RuntimeParams(), settle_margin_s=100.0, max_window_s=10.0
     )
     session._window = np.zeros(16000 * 10, dtype=np.float32)
     segments = [
         Segment(text="a", start=0.0, end=7.5),
         Segment(text="b", start=7.5, end=9.0),
-        Segment(text="c", start=9.0, end=9.8),
+        Segment(text="c", start=9.0, end=10.0),
     ]
-    events = session._build_events(segments, cursor=10.0, final_pass=False)
-    # Trimming to 9.0 leaves a 1.0 s window (within the 2.0 s cap), so the
-    # first two segments were force-finalized and the third stays partial.
+    monkeypatch.setattr(session, "_decode", lambda *_args, **_kwargs: segments)
+    events = await session._commit_settled_prefix(16000 * 10, want_words=False)
+    assert events is not None
+    # Trimming to 9.0 leaves the last second for the next decode.
     finals = [e for e in events if e.type == "final"]
     assert [e.text for e in finals] == ["a", "b"]
     assert session._finalized_count == 2

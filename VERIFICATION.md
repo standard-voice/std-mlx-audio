@@ -4,6 +4,12 @@ This document records the **real, local inference** verification of `std-mlx-aud
 on Apple Silicon, plus the protocol-compliance and test-suite results. Everything
 below is reproducible with the exact commands shown.
 
+> **Revisions.** §1–§4b and §6 are historical: they were recorded on 2026-06-14 to
+> 2026-06-16, up to commit `42f6607`, before the streaming rework (intake task,
+> quiet-point commits, bounded buffers), and have not been re-run since. The
+> streaming event counts in §3 and §4 describe the session of that time. §5 and
+> the notes describe the current code.
+
 ## Environment
 
 | Item | Value |
@@ -160,14 +166,17 @@ knowing before first use:
 ## 5. Test suite
 
 ```bash
-uv run pytest          # 113 tests, 99% (only pre-existing _streaming.py lines)
+uv run pytest          # runs the whole unit suite with coverage
 uv run ruff check src/ tests/
 uv run ruff format --check src/ tests/
-uv run pyright src/    # strict: 0 errors
+uv run pyright src/    # strict
 ```
 
 The unit suite **mocks the MLX model** (a fake `mlx_audio.stt.load`) and never
-downloads weights or requires MLX at test time; it covers all backend adapters
+downloads or loads weights. It does import `mlx_audio` and MLX (the fixtures
+patch `mlx_audio.stt.load`), so it needs them installed; it has been run only
+on an Apple-Silicon Mac. Its streaming tests run on a virtual-time event loop. It
+covers all backend adapters
 (Qwen3-ASR, Whisper, the aligned-output backend, and the generic `STTOutput`
 backend across its language/timing/translation/list-input variants), the
 batch/streaming engine paths, the loaded-model family check, the `model_type`
@@ -201,8 +210,10 @@ streaming-capable models work (all but `cohere-asr`).
 
 ## Notes / honest caveats
 
-- **Streaming is a windowed re-decode**, not a native low-latency recognizer
-  (none of these MLX backends expose incremental decoding in mlx-audio). The
+- **Streaming is a windowed re-decode**, not a native low-latency recognizer:
+  the plugin decodes every family through mlx-audio's batch `generate` (some
+  upstream models also have streaming entry points, such as Nemotron's
+  cache-aware `stream_generate`; the plugin does not use them today). The
   capabilities are declared to match exactly that: `word_stability=false`,
   `re_segments=false`, `reconnect=unsupported`, `finality=final`,
   `timestamps=post_align`. See `docs/STANDARD_ASR_FINDINGS.md`.
@@ -218,11 +229,11 @@ streaming-capable models work (all but `cohere-asr`).
   and raises a `DiscoveryError` otherwise. A `model_path` override pointing at a
   different family fails loudly instead of being run through the wrong adapter
   (which would silently produce a wrong transcript).
-- **Text-only families are batch only.** The windowed streaming strategy settles
-  on real segment/token timing; families that emit no real timing (SenseVoice,
-  Voxtral, Canary, Qwen2-Audio, Granite Speech, Moonshine, MMS, FireRedASR2,
-  VibeVoice, Voxtral-Realtime) declare `streaming` unsupported rather than emit a
-  degenerate stream. The timing-bearing families (Cohere, Fun-ASR, GLM-ASR) and
+- **Text-only families are batch only.** The windowed streaming session builds
+  its events from the segments a decode returns; families that emit no real
+  timing (SenseVoice, Voxtral, Canary, Qwen2-Audio, Granite Speech, Moonshine,
+  MMS, FireRedASR2, VibeVoice, Voxtral-Realtime) declare `streaming` unsupported
+  rather than emit a degenerate stream. The timing-bearing families (Cohere, Fun-ASR, GLM-ASR) and
   the aligned families (Parakeet, Nemotron) stream via re-decode like Qwen3-ASR.
 - Larger models download on first run: `Qwen3-ASR-1.7B-8bit` (~3.4 GB) and
   `whisper-large-v3-turbo` (OpenAI repo) are heavier; the 0.6B Qwen, Parakeet
