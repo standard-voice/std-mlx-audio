@@ -137,6 +137,25 @@ class ModelBackend(Protocol):
         """
         ...
 
+    def single_segment_span(self, params: MlxAudioParams) -> float | None:
+        """Return the longest audio this family returns as one spanning segment.
+
+        Some families split their output only at fixed internal chunks (Qwen3-ASR
+        at ``chunk_duration``): audio up to that length always comes back as one
+        segment from its start to its end, with no boundary inside. Others split
+        at what they hear (sentences, pauses), whatever the length. The streaming
+        session uses this to decide, before any decode, whether a window can
+        contain a segment boundary (:func:`has_inner_boundaries`).
+
+        Args:
+            params: The engine-specific decoding knobs (some set the chunk).
+
+        Returns:
+            That length in seconds, or ``None`` for a family that splits at
+            content boundaries.
+        """
+        ...
+
 
 # --------------------------------------------------------------------------- #
 # Qwen3-ASR
@@ -153,6 +172,22 @@ class Qwen3AsrBackend:
 
     model_types: tuple[str, ...] = ("qwen3_asr", "mega_asr")
     audio_as_list: bool = False
+
+    def single_segment_span(self, params: MlxAudioParams) -> float | None:
+        """Return the effective chunk: mlx-audio returns one segment per chunk.
+
+        mlx-audio's splitter (``split_audio_into_chunks`` in
+        ``mlx_audio/stt/models/qwen3_asr/qwen3_asr.py``) advances at least one
+        second per chunk and pads shorter input to a second, so a chunk is never
+        shorter than one second, whatever ``chunk_duration`` says.
+
+        Args:
+            params: The engine-specific decoding knobs.
+
+        Returns:
+            ``max(chunk_duration, 1.0)`` in seconds.
+        """
+        return max(params.chunk_duration, 1.0)
 
     def generate_kwargs(
         self,
@@ -248,6 +283,18 @@ class WhisperBackend:
 
     model_types: tuple[str, ...] = ("whisper",)
     audio_as_list: bool = False
+
+    def single_segment_span(self, params: MlxAudioParams) -> float | None:
+        """Return ``None``: Whisper splits segments at what it hears.
+
+        Args:
+            params: Unused.
+
+        Returns:
+            ``None``.
+        """
+        del params
+        return None
 
     def generate_kwargs(
         self,
@@ -346,6 +393,18 @@ class AlignedResultBackend:
     """
 
     audio_as_list: bool = False
+
+    def single_segment_span(self, params: MlxAudioParams) -> float | None:
+        """Return ``None``: these families split into sentences.
+
+        Args:
+            params: Unused.
+
+        Returns:
+            ``None``.
+        """
+        del params
+        return None
 
     def __init__(self, *, model_types: tuple[str, ...]) -> None:
         """Bind the aligned-output adapter to one family's ``model_type``(s).
@@ -471,6 +530,11 @@ class SttFamilySpec:
             ``STTOutput.segments`` (parsed structured/diarization JSON) while
             ``STTOutput.text`` carries the raw JSON. When set, the result text is
             rebuilt by joining the segments' text (VibeVoice-ASR).
+        single_segment_span_s: For a family with ``segment_timing``, the
+            internal chunk length up to which mlx-audio returns one segment
+            spanning the whole input (Fun-ASR 1200 s, GLM-ASR 30 s, Cohere 35 s:
+            mlx-audio's defaults, which the plugin does not change), or ``None``
+            for a family that splits at content boundaries.
         forward: ``(generate_kwarg, provider_field)`` pairs to forward from
             :class:`MlxAudioParams` when the provider value is not ``None`` (e.g.
             ``("hotwords", "hotwords")``). Only knobs the family's ``generate``
@@ -487,6 +551,7 @@ class SttFamilySpec:
     wants_path: bool = False
     default_prompt: str | None = None
     text_from_segments: bool = False
+    single_segment_span_s: float | None = None
     forward: tuple[tuple[str, str], ...] = ()
 
 
@@ -516,6 +581,18 @@ class GenericSttBackend:
         self.model_types: tuple[str, ...] = spec.model_types
         self.audio_as_list: bool = spec.audio_as_list
         self.wants_path: bool = spec.wants_path
+
+    def single_segment_span(self, params: MlxAudioParams) -> float | None:
+        """Return the spec's ``single_segment_span_s``.
+
+        Args:
+            params: Unused (the generic families' chunk length is not a knob).
+
+        Returns:
+            The span in seconds, or ``None`` for content boundaries.
+        """
+        del params
+        return self.spec.single_segment_span_s
 
     def generate_kwargs(
         self,
@@ -626,6 +703,33 @@ class GenericSttBackend:
 # --------------------------------------------------------------------------- #
 # Shared conversion helpers (pure)
 # --------------------------------------------------------------------------- #
+def has_inner_boundaries(
+    backend: ModelBackend, params: MlxAudioParams, window_s: float | None
+) -> bool:
+    """Whether decoding ``window_s`` of audio can return a boundary inside it.
+
+    This is the one rule the streaming session uses for a backend's segment
+    boundaries: it is decided from the family and its configuration, never from
+    one decode's output (a short window of Whisper can come back as one segment
+    and still have boundaries in a longer one).
+
+    Args:
+        backend: The bound backend.
+        params: The engine-specific decoding knobs.
+        window_s: The longest window the session decodes, or ``None`` (no cap).
+
+    Returns:
+        ``True`` for a family that splits at content boundaries; for a family that
+        splits only at fixed internal chunks, ``True`` only when that chunk is
+        shorter than ``window_s`` (with no cap, ``False``: such a family is
+        treated as having no boundaries, and pauses drive its commits).
+    """
+    span = backend.single_segment_span(params)
+    if span is None:
+        return True
+    return window_s is not None and span < window_s
+
+
 def waveform_duration(audio: NDArray[np.float32]) -> float:
     """Return the duration of a 16 kHz mono waveform in seconds.
 

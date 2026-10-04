@@ -443,3 +443,33 @@ def test_adapt_audio_source_wraps_only_for_list_families() -> None:
     sentinel = object()
     assert adapt_audio_source(list_backend, sentinel) == [sentinel]
     assert adapt_audio_source(plain_backend, sentinel) is sentinel
+
+
+def test_single_segment_span_and_the_boundary_rule() -> None:
+    from std_mlx_audio import CohereAsr, FunAsrNano, GlmAsrNano, MlxAudioParams
+    from std_mlx_audio.backends import has_inner_boundaries
+
+    params = MlxAudioParams()
+    qwen = Qwen3AsrBackend()
+    assert qwen.single_segment_span(params) == 1200.0
+    assert qwen.single_segment_span(MlxAudioParams(chunk_duration=4.0)) == 4.0
+    # mlx-audio's splitter advances at least one second and pads to a second.
+    assert qwen.single_segment_span(MlxAudioParams(chunk_duration=0.1)) == 1.0
+    assert WhisperBackend().single_segment_span(params) is None
+    assert AlignedResultBackend(model_types=("parakeet",)).single_segment_span(params) is None
+    assert FunAsrNano.backend.single_segment_span(params) == 1200.0
+    assert GlmAsrNano.backend.single_segment_span(params) == 30.0
+    # Cohere decodes without VAD by default: one segment up to its 35 s clip.
+    assert CohereAsr.backend.single_segment_span(params) == 35.0
+    # Content boundaries: always. Fixed chunks: only when a chunk is shorter than
+    # the window; with no cap, never.
+    assert has_inner_boundaries(WhisperBackend(), params, None) is True
+    assert has_inner_boundaries(qwen, params, 30.0) is False
+    assert has_inner_boundaries(qwen, MlxAudioParams(chunk_duration=4.0), 30.0) is True
+    assert has_inner_boundaries(qwen, MlxAudioParams(chunk_duration=4.0), None) is False
+    assert has_inner_boundaries(GlmAsrNano.backend, params, 30.0) is False
+    assert has_inner_boundaries(CohereAsr.backend, params, 30.0) is False
+    assert has_inner_boundaries(CohereAsr.backend, params, 40.0) is True
+    # The review's two subsecond cases: 0.5 s with chunk 0.1, 0.8 s with chunk 0.3.
+    assert has_inner_boundaries(qwen, MlxAudioParams(chunk_duration=0.1), 0.5) is False
+    assert has_inner_boundaries(qwen, MlxAudioParams(chunk_duration=0.3), 0.8) is False

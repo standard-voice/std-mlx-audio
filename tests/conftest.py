@@ -3,19 +3,22 @@
 
 """Shared fakes for the std-mlx-audio test suite.
 
-CRITICAL: these tests NEVER load a real MLX model or download weights, and they
-do not require Apple Silicon. The engine imports ``mlx_audio.stt.load`` lazily
-inside ``_ensure_model_loaded``; we monkeypatch that symbol to return a fake
-model whose ``generate`` yields a controllable native output of the right SHAPE
-for each backend family (``STTOutput``-like for Qwen3-ASR / Whisper,
-``AlignedResult``-like for Parakeet). This exercises the real adapter logic
-(language mapping, output normalization, streaming windowing) against fakes.
+CRITICAL: these tests NEVER load a real MLX model or download weights. They do
+import ``mlx_audio`` and MLX, so those must be installed; the suite has been run
+only on Apple Silicon (see VERIFICATION.md, section 5). The engine imports
+``mlx_audio.stt.load`` lazily inside ``_ensure_model_loaded``; we monkeypatch
+that symbol to return a fake model whose ``generate`` yields a controllable
+native output of the right SHAPE for each backend family (``STTOutput``-like
+for Qwen3-ASR / Whisper, ``AlignedResult``-like for Parakeet). This exercises
+the real adapter logic (language mapping, output normalization, streaming
+windowing) against fakes.
 Real-inference verification is a separate, opt-in script
 (``scripts/verify_inference.py``), not part of this suite.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -408,3 +411,133 @@ def float_array(seconds: float, sample_rate: int = 16000) -> np.ndarray:
     n = int(seconds * sample_rate)
     t = np.linspace(0.0, seconds, n, endpoint=False, dtype=np.float32)
     return (0.1 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
+
+
+# --------------------------------------------------------------------------- #
+# Virtual time
+# --------------------------------------------------------------------------- #
+#: Virtual time one loop turn takes when nothing else moves the clock.
+_TURN_S = 1e-6
+
+
+class VirtualTimeLoop(asyncio.SelectorEventLoop):
+    """An event loop whose clock is virtual: idle waits jump instead of sleeping.
+
+    When the loop would block waiting for its next timer, the clock jumps to that
+    timer. Blocking work (a fake decode, simulated work by another session) is
+    modeled by :meth:`advance`, which moves the clock without yielding. Waits,
+    blocking work, and (through :func:`on_virtual_clock`) the session's own
+    deadlines therefore run on one clock, at no real cost, so a test can drive
+    minutes of live audio in milliseconds.
+
+    Like a real loop, a turn in which nothing else moves the clock takes a
+    microsecond (``_TURN_S``). The loop fails a test that cannot make progress:
+    nothing scheduled at all (a deadlock), or ``_SPIN_BUDGET`` turns in a row in
+    which nothing but that microsecond moved the clock (a busy loop).
+    """
+
+    _SPIN_BUDGET = 200_000
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._now = 0.0
+        self._idle = 0
+        self._seen = 0.0
+        real_select = self._selector.select  # type: ignore[attr-defined]
+
+        def select(timeout: float | None = None) -> Any:
+            if timeout is None:
+                raise RuntimeError("virtual loop deadlocked: nothing scheduled or ready")
+            if timeout > 0:
+                self._now += timeout
+            # Only an actual move of the clock counts as progress: a callback that
+            # "advances" by zero and yields again is still a spin.
+            if self._now != self._seen:
+                self._seen = self._now
+                self._idle = 0
+            else:
+                # A loop turn on a real clock takes some microseconds. Without
+                # that, a deadline computed as "a hair from now" (a timeout of
+                # ~1e-16 s) would fire and re-arm forever at the same instant.
+                self._now += _TURN_S
+                self._seen = self._now
+                self._idle += 1
+                if self._idle > self._SPIN_BUDGET:
+                    ready = [
+                        repr(getattr(h._callback, "__self__", h))[:300]  # type: ignore[attr-defined]
+                        for h in list(self._ready)[:3]  # type: ignore[attr-defined]
+                    ]
+                    raise RuntimeError(
+                        f"virtual loop spins: callbacks run but time never moves: {ready}"
+                    )
+            return real_select(0)
+
+        self._selector.select = select  # type: ignore[attr-defined]
+
+    def time(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        """Move the clock forward as if the thread were busy for ``seconds``."""
+        self._now += seconds
+
+
+def on_virtual_clock(session: Any, loop: VirtualTimeLoop) -> Any:
+    """Put a session's own deadline clock on the virtual loop's clock.
+
+    The base session reads ``time.monotonic`` for ``done_timeout``,
+    ``max_idle`` and ``max_session_seconds``; the library's test hook
+    ``_replace_reserved_attr`` swaps it (and re-anchors the activity clock).
+
+    Returns:
+        The session.
+    """
+    session._replace_reserved_attr("_monotonic", loop.time)
+    session._replace_reserved_attr("_last_audio_activity", loop.time())
+    return session
+
+
+def run_virtual(main: Callable[[VirtualTimeLoop], Any]) -> Any:
+    """Run ``main(loop)`` (a coroutine function) to completion on virtual time.
+
+    Fails if any task is still pending when ``main`` returns (after letting
+    cancelled tasks finish), and shuts down async generators before closing.
+    """
+    loop = VirtualTimeLoop()
+
+    async def checked() -> Any:
+        result = await main(loop)
+        current = asyncio.current_task()
+        left: list[asyncio.Task[Any]] = []
+        for _ in range(50):  # let cancelled tasks and generator finalizers finish
+            await asyncio.sleep(0)
+            left = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+            if not left:
+                break
+        assert not left, f"tasks left running: {left}"
+        return result
+
+    task = loop.create_task(checked())
+    failed = True
+    try:
+        result = loop.run_until_complete(task)
+        failed = False
+        return result
+    finally:
+        # A failed run (an assertion, a deadlock, a spin) must still clean up:
+        # cancel every task left on the loop and let it finish, then close. After
+        # a failure, a cleanup error never replaces the original exception.
+        loop._idle = 0
+        loop._SPIN_BUDGET = 10**9
+        try:
+            left = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            for t in left:
+                t.cancel()
+            if left:
+                loop.run_until_complete(asyncio.gather(*left, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            if not failed:
+                raise
+        finally:
+            loop.close()

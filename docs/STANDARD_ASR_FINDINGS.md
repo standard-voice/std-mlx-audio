@@ -158,9 +158,71 @@ clamping is in one small helper.
 "does this model do word timestamps?" a one-line capability summary (like
 `models list` has) would help. Minor; the JSON is correct and complete.
 
+## 8. [High] [std-asr] A streaming session fell behind for good on long input, and the library gives an adapter no way to see how much audio is waiting
+
+*Added 2026-10-02.*
+
+**What happened.** The session decoded its window after every
+`redecode_interval_s` of consumed audio. With an application that set the
+interval to 0.3 s, Qwen3-ASR 1.7B needed more than 0.3 s per decode once the
+window passed about 12 s, so the session lost ground with every decode: 131 to
+172 s behind after 291 s of speech on an M5 Max (three runs). Separately,
+Qwen3-ASR returns one segment spanning its whole input, so no segment ever
+settled; only the 30 s cap committed audio, and it committed the whole window,
+including the audio just heard, at an arbitrary sample. Every one of those cuts
+damaged the text next to it (a lost or doubled word, or a false sentence break).
+
+**Resolution (plugin).** A task owned by the session reads `audio_chunks()` into
+a bounded inbox as chunks arrive (one `max_window_s` of audio; while it is full
+the task reads nothing more, so the library's queue still pushes back on the
+client; because a chunk is read whole, the inbox can overshoot the bound by one
+chunk), and each decode takes everything in the inbox, so a slow decode is
+followed by one that covers the backlog (the interval is now a lower bound).
+Bounded heads are committed until the window is under the cap, so no decode
+covers more than `max_window_s`. Backends that return segment boundaries still
+commit at them; for Qwen3-ASR at its default `chunk_duration`, audio is committed
+in pauses found in the window's energy profile (at a pause when `commit_pause_s`
+is set, or before the cap) instead of at the cap's sample. Positions are integer
+samples. See `_streaming.py` and `docs/DESIGN.md` §4.
+
+Earlier versions of this fix were reviewed twice. The first inferred the backlog
+from the clock (chunks read without time passing had queued during a decode),
+which broke in three ways: time another session spent on the same event loop
+looked like idle time, so the lag grew without bound again (560 s after 240 s of
+audio in a simulated schedule); audio read during the wait could stay undecoded
+while the client sent nothing; and the cap bounded neither the window nor the
+decode when much audio arrived at once. The second owned an intake but did not
+bound its buffer, which removed the library's backpressure.
+
+**Why it's a finding for Standard ASR.** The only input surface,
+`TranscriptionSession.audio_chunks`, yields one chunk at a time. An adapter that
+needs to know how much audio is waiting has to take it out of the library's
+queue: run its own intake task beside the producer, keep the audio in a buffer
+of its own (which it must bound, or the library's backpressure stops reaching
+the client), and handle that task's cancellation and errors (the base session
+gives a subclass no place to own such a task beyond `_produce` and `_close`).
+What the library lacks is a way to see how much audio is waiting without taking
+it out of the queue: a pending-sample count, or a non-blocking "everything that
+has arrived" read, would let a re-decode adapter take the backlog while the
+library keeps buffering and backpressure. The spec also does not ask a streaming
+engine to keep up with real-time input, or to say so when it falls behind; a
+compliance probe that reports decode cost against audio position would have
+caught this. Finally, with the old pacing, a session that fell far behind made
+the reference server stop answering WebSocket keepalive pings and the connection
+dropped (observed twice; the cause is not confirmed).
+
+A smaller, related point: Qwen3-ASR declares the `"segment"` word-timestamp
+granularity because it can always return its one input-spanning segment (spec
+TR.3). That declaration is true but tells an application nothing about sentence
+timing. `check_event_sequence(..., capabilities=...)` checks only that a stream
+does not exceed its declaration, so it cannot flag this; whether such a model
+should declare `"segment"` is a protocol question.
+
+**Deadlines.** A deadline guarantee (`max_idle`, `max_session_seconds`) needs enforcement in the library and isolation of the engine's work from the event loop; this adapter, which decodes inline, cannot guarantee the library's deadlines through its pacing or a different queue size. The library checks deadlines only in the consumer's loop (`max_session_seconds` on every received event, `max_idle` only when the wait for the next event times out), so a plugin that decodes inline (as MLX requires, see item 4) delays them by several decodes, depending on queue size and scheduling (`docs/DESIGN.md` §4).
+
 ---
 
-## 8. [High] Several family loaders degrade SILENTLY when non-weight assets are missing [not std-asr]
+## 9. [High] Several family loaders degrade SILENTLY when non-weight assets are missing [not std-asr]
 
 The `post_load_hook` of several families loads its tokenizer or
 normalization assets with `if path.exists()` (or `try/except: pass`) and the
@@ -187,7 +249,7 @@ by-products).
 
 ---
 
-## 9. [Med] `DEFAULT_ALLOW_PATTERNS` omits SenseVoice's `am.mvn`; VibeVoice silently Hub-fetches its tokenizer [not std-asr]
+## 10. [Med] `DEFAULT_ALLOW_PATTERNS` omits SenseVoice's `am.mvn`; VibeVoice silently Hub-fetches its tokenizer [not std-asr]
 
 Two acquisition gaps in upstream defaults. First, SenseVoice's feature
 normalization stats live in `am.mvn`, its config carries no fallback, and no

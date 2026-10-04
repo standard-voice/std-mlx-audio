@@ -96,14 +96,21 @@ class MlxAudioConfig(
     # --- Windowed-streaming knobs (see ``_streaming.py``) --------------------- #
     # These tune the re-decode-the-window streaming strategy. The MLX backends are
     # batch decoders, so "streaming" is synthesized by re-running the model over a
-    # sliding window; these control its latency / compute / stability trade-off.
+    # window of not-yet-committed audio; these control its latency / compute /
+    # stability trade-off.
     redecode_interval_s: float = Field(
         default=1.5,
         gt=0.0,
         description=(
-            "Streaming: seconds of new audio to accumulate before each re-decode. "
-            "Smaller = snappier partials but more compute (the window is re-decoded "
-            "more often)."
+            "Streaming: minimum seconds of new audio between two re-decodes of the "
+            "window. A lower bound, not a fixed cadence: each decode takes all the "
+            "audio that has arrived, so after a slow decode the next one covers more "
+            "than this; less audio is decoded once it has waited this long. This is "
+            "the one setting for how often the window is decoded (there is no rest "
+            "between passes). Smaller = snappier partials but more compute. The "
+            "session keeps up only while its sustained end-to-end capacity (every "
+            "decode, counting the window decoded again on every pass, plus settling "
+            "and other work on the event loop) beats the rate at which audio arrives."
         ),
     )
     settle_margin_s: float = Field(
@@ -111,17 +118,46 @@ class MlxAudioConfig(
         ge=0.0,
         description=(
             "Streaming: a segment is finalized (and its audio dropped from the "
-            "window) only once it ends at least this many seconds behind the decode "
-            "frontier. Smaller = text settles sooner but is likelier to still change."
+            "window) once it ends at least this many seconds before the end of the "
+            "decoded audio. Smaller = text settles sooner but is likelier to still "
+            "change. Qwen3-ASR returns one segment per chunk_duration (1200 s by "
+            "default), which in a shorter window never ends before the window does, "
+            "so there this has no effect, except that 0 finalizes the whole window "
+            "on every decode; such a model's commits come from the window cap, "
+            "pauses (commit_pause_s), and the end of the input."
         ),
     )
     max_window_s: float | None = Field(
         default=30.0,
         gt=0.0,
         description=(
-            "Streaming: hard cap on the sliding window length in seconds. Bounds "
-            "per-decode cost under long, sparsely-segmented speech by force-"
-            "finalizing leading segments. None disables the cap."
+            "Streaming: cap on the window length in seconds; no decode covers more "
+            "than this, and it also bounds the audio waiting to be decoded (the cap "
+            "plus the one chunk that crossed it; the float32 window, at most twice "
+            "the cap, and the byte copy a decode pass takes out of that audio are "
+            "separate buffers; these bound the session's buffers, not "
+            "the process's memory). When the "
+            "window reaches it, bounded heads are committed until less than the cap "
+            "remains: at the decoder's segment boundaries for a model that returns "
+            "them inside a window this long, otherwise in the longest pause of the "
+            "last ten seconds before the cap (at the least loud point if there is "
+            "none). Must be at least 0.02 s. None disables the cap: the window then "
+            "grows without limit until a settled segment, a pause, or the end of "
+            "the input commits it (waiting audio stays bounded at 30 s plus one "
+            "chunk)."
+        ),
+    )
+    commit_pause_s: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Streaming: when set, a pause of at least this many seconds after speech "
+            "commits the audio before it right away (decoded once and finalized), "
+            "without waiting for the window cap. Only for a model that returns no "
+            "segment boundaries inside the window (Qwen3-ASR at its default "
+            "chunk_duration). Keeps decodes short and delivers a final soon after "
+            "the speaker pauses, at the cost of more seams. None commits at settled "
+            "segments, the window cap, and the end of the input."
         ),
     )
 

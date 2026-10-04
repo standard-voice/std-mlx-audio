@@ -880,6 +880,7 @@ class MlxAudioASR(EngineBase):
             redecode_interval_s=config.redecode_interval_s,
             settle_margin_s=config.settle_margin_s,
             max_window_s=config.max_window_s,
+            commit_pause_s=config.commit_pause_s,
         )
         if prepared_audio is not None:
             session.feed(_prepared_to_pcm(prepared_audio))
@@ -1152,6 +1153,11 @@ class CohereAsr(MlxAudioASR):
             model_types=("cohere_asr",),
             language_kwarg="language",
             segment_timing=True,
+            # Cohere.generate defaults to vad=False (mlx_audio/stt/models/
+            # cohere_asr/cohere_asr.py) and the plugin does not turn VAD on, so
+            # it returns one segment for input up to the clip limit:
+            # max_audio_clip_s = 35.0 in mlx_audio/stt/models/cohere_asr/config.py.
+            single_segment_span_s=35.0,
         )
     )
     properties: ClassVar[BaseProperties] = stt_properties(
@@ -1183,6 +1189,7 @@ class FunAsrNano(MlxAudioASR):
             model_types=("fun_asr_nano",),
             language_kwarg="language",
             segment_timing=True,
+            single_segment_span_s=1200.0,
             forward=(("hotwords", "hotwords"), ("itn", "use_itn")),
         )
     )
@@ -1337,7 +1344,7 @@ class GlmAsrNano(MlxAudioASR):
     # repo ships no slow-layout fallback (per-file ablation, round-9 review).
     required_snapshot_files: ClassVar[tuple[str, ...]] = ("tokenizer.json",)
     backend: ClassVar[ModelBackend] = GenericSttBackend(
-        SttFamilySpec(model_types=("glmasr",), segment_timing=True)
+        SttFamilySpec(model_types=("glmasr",), segment_timing=True, single_segment_span_s=30.0)
     )
     properties: ClassVar[BaseProperties] = stt_properties(
         model_name="glm-asr-nano",
