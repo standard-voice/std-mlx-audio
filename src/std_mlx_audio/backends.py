@@ -986,8 +986,8 @@ def _sttoutput_extra(native: Any) -> dict[str, Any]:
 
     Surfaces the token-accounting / throughput stats mlx-audio reports on its
     ``STTOutput`` (shared across Qwen3-ASR and the generic generative families;
-    spec TR.1: engine-specific values belong in ``result.extra``, never
-    ``metadata``). Fields a given family does not populate are simply absent.
+    spec TR.1: engine-specific values belong in ``result.extra``). Fields a
+    given family does not populate are simply absent.
 
     Args:
         native: The ``STTOutput``.

@@ -284,8 +284,8 @@ same line drawn for mixed-up weights).
 - **Fail-closed capabilities + instantiation-free discovery** — declaring
   per-model capabilities and having `models show` / the registry read them
   without constructing the engine is exactly right for a multi-model engine.
-- **Honest streaming model** — `stable_until` / `finality` / `re_segments` /
-  `reconnect` let me describe a windowed re-decode *truthfully* instead of
+- **Honest streaming model** — `stable_until` (now `stable_text`) / `finality` /
+  `re_segments` / `reconnect` let me describe a windowed re-decode *truthfully* instead of
   pretending it's a native incremental recognizer. The `check_event_sequence`
   helper validated my event stream in tests.
 - **Strict result models** — rejecting inverted/NaN spans caught real backend

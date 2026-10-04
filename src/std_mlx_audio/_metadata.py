@@ -122,8 +122,8 @@ _QWEN_CAPABILITIES = DeclaredCapabilities(
     ),
     # Windowed streaming (re-decode strategy; Qwen3-ASR has no native streaming).
     # Honest consequences of re-decoding the whole window each pass:
-    #   * emits_partials = True, word_stability = False (any earlier text may be
-    #     rewritten -> stable_until=0), re_segments = False (never `supersede`),
+    #   * emits_partials = True, partial_stability = False (any earlier text may be
+    #     rewritten -> stable_text=""), re_segments = False (never `supersede`),
     #   * reconnect unsupported (local in-process model), finality = final
     #     (a settled sentence won't change, but we make no post-processing
     #     immutability promise so not `closed`),
@@ -135,7 +135,7 @@ _QWEN_CAPABILITIES = DeclaredCapabilities(
         guidance=StreamingGuidanceCaps(prompt=_QWEN_GUIDANCE.prompt),
         emits_partials=FlagCap(supported=True),
         re_segments=FlagCap(supported=False),
-        word_stability=FlagCap(supported=False),
+        partial_stability=FlagCap(supported=False),
         reconnect=ReconnectCap(mode="unsupported"),
         finality_level=FinalityCap(mode="final"),
         timestamps=StreamTimestampsCap(mode="post_align"),
@@ -194,7 +194,7 @@ _WHISPER_CAPABILITIES = DeclaredCapabilities(
         guidance=StreamingGuidanceCaps(prompt=_WHISPER_GUIDANCE.prompt),
         emits_partials=FlagCap(supported=True),
         re_segments=FlagCap(supported=False),
-        word_stability=FlagCap(supported=False),
+        partial_stability=FlagCap(supported=False),
         reconnect=ReconnectCap(mode="unsupported"),
         finality_level=FinalityCap(mode="final"),
         timestamps=StreamTimestampsCap(mode="post_align"),
@@ -248,7 +248,7 @@ _PARAKEET_CAPABILITIES = DeclaredCapabilities(
         word_timestamps=_PARAKEET_WORD_TS,
         emits_partials=FlagCap(supported=True),
         re_segments=FlagCap(supported=False),
-        word_stability=FlagCap(supported=False),
+        partial_stability=FlagCap(supported=False),
         reconnect=ReconnectCap(mode="unsupported"),
         finality_level=FinalityCap(mode="final"),
         timestamps=StreamTimestampsCap(mode="post_align"),
@@ -323,7 +323,7 @@ def stt_capabilities(
             word_timestamps=word_timestamps,
             emits_partials=FlagCap(supported=True),
             re_segments=FlagCap(supported=False),
-            word_stability=FlagCap(supported=False),
+            partial_stability=FlagCap(supported=False),
             reconnect=ReconnectCap(mode="unsupported"),
             finality_level=FinalityCap(mode="final"),
             timestamps=StreamTimestampsCap(mode="post_align"),

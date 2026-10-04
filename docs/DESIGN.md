@@ -129,7 +129,8 @@ a batch engine): accumulate fed PCM in a window of not-yet-committed audio,
 periodically re-decode the whole window via the bound backend, commit the front
 of the window as `final` events, and emit the rest as one moving `partial`. The
 declared streaming capabilities match exactly: `emits_partials=true`,
-`word_stability=false` (`stable_until=0` always), `re_segments=false`,
+`partial_stability=false` (every `partial` has an empty `stable_text`, because the
+next pass may rewrite any text not yet finalized), `re_segments=false`,
 `reconnect=unsupported`, `finality=final`, `timestamps=post_align`.
 
 **Intake.** A task owned by the session reads the fed audio into an inbox as it

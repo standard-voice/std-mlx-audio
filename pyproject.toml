@@ -56,7 +56,9 @@ dependencies = [
     # The protocol this plugin implements. Pinned to the main branch until
     # standard-asr cuts its first PyPI release; swap to a version specifier at
     # that point. This plugin needs the protocol 0.2 artifact lifecycle, which
-    # `main` carries since standard_asr#69; `uv.lock` pins the exact revision.
+    # `main` carries since standard_asr#69, and the stable-text change
+    # (`stable_text`, `partial_stability`), which `main` carries since
+    # standard_asr#107; `uv.lock` pins the exact revision.
     "standard-asr @ git+https://github.com/standard-voice/standard_asr.git@main",
 ]
 

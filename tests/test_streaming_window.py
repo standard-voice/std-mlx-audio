@@ -14,9 +14,11 @@ transport. A few tests at the end run on a real event loop.
 
 Sessions built by the ``_session`` helper run with ``strict_lifecycle=True``,
 and the drive helpers require them to end with no recorded diagnostics, so the
-runtime guard cannot quietly repair an invalid stream. Two ``done_timeout``
-tests build their sessions with the library defaults, and one test expects the
-``partial_sample_dropped`` diagnostic.
+runtime guard cannot quietly repair an invalid stream. The ``_session`` helper
+also binds the engine's streaming capabilities, as ``start_transcription``
+does, so an event that goes beyond what the engine declares ends the session
+too. Two ``done_timeout`` tests build their sessions with the library defaults,
+and one test expects the ``partial_sample_dropped`` diagnostic.
 
 The default fake decoder behaves like Qwen3-ASR: one segment spanning whatever
 audio it is given (no text for silence), so no segment ever settles. Whisper-
@@ -122,9 +124,14 @@ def _session(engine: Any = None, **knobs: Any) -> MlxAudioStreamingSession:
         **knobs,
     }
     params = kwargs.pop("params", RuntimeParams())
-    return MlxAudioStreamingSession(
-        engine if engine is not None else Qwen3Asr06B(), params, strict_lifecycle=True, **kwargs
+    engine = engine if engine is not None else Qwen3Asr06B()
+    session = MlxAudioStreamingSession(engine, params, strict_lifecycle=True, **kwargs)
+    # A session built directly is not checked against the capabilities until
+    # they are bound; start_transcription binds them through the same call.
+    session._bind_streaming_capabilities(  # pyright: ignore[reportPrivateUsage]
+        engine.effective_capabilities.streaming
     )
+    return session
 
 
 class _PartialLedger:

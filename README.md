@@ -173,7 +173,8 @@ asyncio.run(main())
 > crossed it, so a client that sends faster than that is held back by the
 > library's queue; this bounds the session's own buffers, not the process's
 > memory.
-> A `partial` may be rewritten until its audio is committed (`stable_until=0`).
+> A `partial` may be rewritten until its audio is committed, so its
+> `stable_text` is always empty.
 > Audio is committed (emitted as `final` and dropped from the window) at a
 > settled segment boundary, for models that return segment boundaries (such as
 > Whisper and Parakeet). Qwen3-ASR returns one segment per `chunk_duration`
