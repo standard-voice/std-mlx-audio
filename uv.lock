@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.13'",
@@ -1537,7 +1537,7 @@ wheels = [
 [[package]]
 name = "standard-asr"
 version = "0.2.0.dev0"
-source = { git = "https://github.com/standard-voice/standard_asr.git?rev=main#e763c4c483a8034bf6ee8cac13b1b65cd614a7de" }
+source = { git = "https://github.com/standard-voice/standard_asr.git?rev=main#97bfdb28134c114088ec335596aa6bca53f9204f" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
