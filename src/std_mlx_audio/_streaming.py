@@ -102,8 +102,9 @@ no cap heads are committed, and it still produces partials.
 Honesty
 -------
 The model re-decodes the window each pass and may rewrite ANY not-yet-finalized
-text, so ``stable_until=0`` on every ``partial`` (``word_stability=false``). We
-never emit ``supersede`` (``re_segments=false``). Segment ids are synthesized
+text, so every ``partial`` leaves ``stable_text`` out, which makes it ``""``
+(``partial_stability=false``). We never emit ``supersede``
+(``re_segments=false``). Segment ids are synthesized
 deterministically and monotonically (``seg-0`` ...). Every commit is a seam: the
 next window is decoded without the earlier text, so a word that straddles a cut
 can be lost or doubled, and a cut in a mid-sentence pause can make the model end
@@ -976,7 +977,6 @@ class MlxAudioStreamingSession(TranscriptionSession):
         event = TranscriptionEvent.final(
             segment_id=f"seg-{self._finalized_count}",
             text=seg.text,
-            stable_until=0,
             start=_rebase(origin, seg.start),
             end=_rebase(origin, seg.end),
             words=self._shift_words(seg.words, origin),
@@ -1031,8 +1031,8 @@ class MlxAudioStreamingSession(TranscriptionSession):
         ``partial``, with one exception: when the open partial still shows text,
         one ``partial`` with empty text clears it. When nothing is left to emit,
         a ``progress`` event carries the cursor. Finalized audio is then dropped
-        from the front of the window (the slide). ``stable_until`` is always 0
-        (the model may still rewrite the tail).
+        from the front of the window (the slide). The ``partial`` carries no
+        stable text (the model may still rewrite the tail).
 
         Args:
             segments: Standard ASR ``Segment`` objects from this decode (window-
@@ -1071,7 +1071,6 @@ class MlxAudioStreamingSession(TranscriptionSession):
                 TranscriptionEvent.partial(
                     segment_id=f"seg-{self._finalized_count}",
                     text=tail_text,
-                    stable_until=0,
                     start=tail_start,
                     end=tail_end,
                     words=self._shift_words(tail_words, origin),
@@ -1087,7 +1086,6 @@ class MlxAudioStreamingSession(TranscriptionSession):
                 TranscriptionEvent.partial(
                     segment_id=f"seg-{self._finalized_count}",
                     text="",
-                    stable_until=0,
                     audio_processed_until=_seconds(self._processed),
                 )
             )

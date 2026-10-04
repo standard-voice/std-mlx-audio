@@ -78,9 +78,10 @@ STANDARD_ASR_ALLOW_DOWNLOAD=1 \
   QN3 ASR", through to "…now is the time to put the design into test. Complete.")
 
 **STREAMING** (windowed re-decode, 1 s chunks fed live): 11 `partial` → 1 `final`
-→ `done`; partials show the text growing and `stable_until = 0` (honest — the
-re-decode may rewrite any earlier text). Reduced stream text matches the batch
-transcript.
+→ `done`; partials show the text growing and carry no stable text (honest — the
+re-decode may rewrite any earlier text). The run used standard-asr 0.1.0, which
+reported this as `stable_until = 0`; the current library reports an empty
+`stable_text`. Reduced stream text matches the batch transcript.
 
 ## 4. Multi-model proof — a second (and third) family runs
 
@@ -180,9 +181,10 @@ covers all backend adapters
 (Qwen3-ASR, Whisper, the aligned-output backend, and the generic `STTOutput`
 backend across its language/timing/translation/list-input variants), the
 batch/streaming engine paths, the loaded-model family check, the `model_type`
-load override, config/env, the download policy, language mapping, and the
-streaming event-sequence contract (`check_event_sequence`). Real inference is the
-separate, opt-in `scripts/verify_inference.py` above.
+load override, config/env, the download policy, the artifact status report,
+language mapping, the streaming event-sequence contract (`check_event_sequence`),
+and the session's check of each event against the declared streaming
+capabilities. Real inference is the separate, opt-in `scripts/verify_inference.py` above.
 
 ## 6. Full functional audit + fixes (2026-06-16)
 
@@ -214,7 +216,7 @@ streaming-capable models work (all but `cohere-asr`).
   the plugin decodes every family through mlx-audio's batch `generate` (some
   upstream models also have streaming entry points, such as Nemotron's
   cache-aware `stream_generate`; the plugin does not use them today). The
-  capabilities are declared to match exactly that: `word_stability=false`,
+  capabilities are declared to match exactly that: `partial_stability=false`,
   `re_segments=false`, `reconnect=unsupported`, `finality=final`,
   `timestamps=post_align`. See `docs/STANDARD_ASR_FINDINGS.md`.
 - **MLX is thread-bound**: the streaming decode runs inline on the event-loop

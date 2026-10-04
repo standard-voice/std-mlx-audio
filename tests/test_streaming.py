@@ -55,7 +55,7 @@ def test_streaming_capabilities_are_conservative() -> None:
         assert caps.supports("streaming_output") is True
         assert caps.supports("streaming.emits_partials") is True
         # Windowed re-decode => no stability, no supersede, no reconnect.
-        assert caps.supports("streaming.word_stability") is False
+        assert caps.supports("streaming.partial_stability") is False
         assert caps.supports("streaming.re_segments") is False
         assert isinstance(caps.node_at("streaming.reconnect"), ReconnectCap)
         assert caps.node_at("streaming.reconnect").mode == "unsupported"  # type: ignore[union-attr]

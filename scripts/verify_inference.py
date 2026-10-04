@@ -103,7 +103,7 @@ async def run_streaming(model_key: str, audio_path: str) -> None:
             if event.type == "partial":
                 partials += 1
                 print(
-                    f"  partial[{event.segment_id}] (su={event.stable_until}): "
+                    f"  partial[{event.segment_id}] (stable={event.stable_text!r}): "
                     f"{(event.text or '').strip()[:80]}"
                 )
             elif event.type == "final":
