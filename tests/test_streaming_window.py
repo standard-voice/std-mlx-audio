@@ -2229,3 +2229,92 @@ def test_the_ledger_catches_a_producer_that_skips_the_final_pass(
     monkeypatch.setattr(MlxAudioStreamingSession, "_produce", mutant)
     with pytest.raises(AssertionError, match=r"delivered done with \['seg-0'\] still open"):
         run_virtual(main)
+
+
+# --------------------------------------------------------------------------- #
+# Seams: the reduced transcript is the finals' texts concatenated (spec TR.1)
+# --------------------------------------------------------------------------- #
+def _said(text: str, *, chunk_language: bool = True) -> Callable[[Any, Any], FakeSTTOutput]:
+    """Output that says ``text`` for any audio with sound in it.
+
+    The decode echoes the requested ``language`` kwarg, as mlx-audio's Qwen3-ASR
+    and Cohere-ASR do; with ``chunk_language`` the chunk dict carries it too
+    (Qwen3-ASR), without it only ``STTOutput.language`` does (Cohere-ASR).
+    """
+
+    def output_fn(audio: Any, kwargs: Any) -> FakeSTTOutput:
+        samples = np.asarray(audio)
+        if not np.any(np.abs(samples) > 1e-3):
+            return FakeSTTOutput(text="", segments=[])
+        secs = samples.size / _RATE
+        segment: dict[str, Any] = {"text": text, "start": 0.0, "end": secs}
+        if chunk_language:
+            segment["language"] = kwargs.get("language")
+        return FakeSTTOutput(text=text, segments=[segment], language=kwargs.get("language"))
+
+    return output_fn
+
+
+def _two_utterances(engine: Any, params: Any = None) -> tuple[list[str], str]:
+    """Stream two utterances a pause apart; return the final texts and the result text."""
+
+    async def main(loop: VirtualTimeLoop) -> tuple[list[str], str]:
+        session = _session(
+            engine,
+            redecode_interval_s=0.5,
+            max_window_s=10.0,
+            commit_pause_s=0.5,
+            params=params or RuntimeParams(),
+        )
+        audio = np.concatenate([_tone(2.0), _silence(1.0), _tone(2.0)])
+        timed = await _drive(loop, session, _chunks(audio))
+        finals = [e.text for e in _events(timed) if e.type == "final" and e.text]
+        return finals, session.result().text
+
+    return run_virtual(main)
+
+
+def test_qwen_english_seam_gets_the_chunk_space(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # Each commit is decoded on its own, so the space mlx-audio puts between two
+    # chunks is not in the second decode; the backend adds it at the seam.
+    loader = fake_loader(output_fn=_said("Hi."))
+    finals, text = _two_utterances(Qwen3Asr06B(), RuntimeParams(language="en"))
+    assert loader.model.generate_calls[0]["language"] == "English"
+    assert finals == ["Hi.", " Hi."]
+    assert text == "Hi. Hi."
+
+
+def test_qwen_chinese_seam_gets_no_separator(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # The chunk reports "Chinese", a language written without spaces.
+    fake_loader(output_fn=_said("你好。"))
+    finals, text = _two_utterances(Qwen3Asr06B(), RuntimeParams(language="zh"))
+    assert finals == ["你好。", "你好。"]
+    assert text == "你好。你好。"
+
+
+def test_a_seam_in_an_unknown_language_gets_the_family_separator(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # Auto-detect with no language reported anywhere: Qwen3-ASR's own " ".
+    fake_loader(output_fn=_said("你好。"))
+    finals, text = _two_utterances(Qwen3Asr06B())
+    assert finals == ["你好。", " 你好。"]
+    assert text == "你好。 你好。"
+
+
+def test_cohere_chinese_seam_joins_with_nothing(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # Cohere-ASR's own join uses no separator for Chinese and Japanese.
+    from std_mlx_audio import CohereAsr
+
+    fake_loader(output_fn=_said("你好。", chunk_language=False))
+    finals, text = _two_utterances(
+        CohereAsr(model_path=FAKE_SNAPSHOT_DIR), RuntimeParams(language="zh")
+    )
+    assert finals == ["你好。", "你好。"]
+    assert text == "你好。你好。"
