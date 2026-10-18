@@ -388,10 +388,10 @@ class Qwen3AsrBackend:
         ``STTOutput.language`` is a list of names. Each segment after the first
         gets the space mlx-audio puts between two chunks (:attr:`chunk_join`),
         except a chunk in Chinese, Cantonese, or Japanese, which gets none, so
-        ``text`` is the segment texts concatenated. ``words`` is always ``None`` (Qwen3-ASR emits no word timing;
-        declaring ``want_words`` cannot change that, and the standard layer
-        would have rejected a ``"word"`` request as incompatible before we got
-        here).
+        ``text`` is the segment texts concatenated. ``words`` is always ``None``
+        (Qwen3-ASR emits no word timing; declaring ``want_words`` cannot change
+        that, and the standard layer would have rejected a ``"word"`` request as
+        incompatible before we got here).
 
         Args:
             native: The ``STTOutput`` from ``Qwen3ASR.generate``.
@@ -1069,14 +1069,31 @@ def _text_of(segments: list[Segment], native: Any) -> str:
 def _chunk_languages(
     raw: list[dict[str, Any]], language: Any, resolved_language: str | None
 ) -> list[str | None]:
-    """Return each chunk's language as an ISO-639 primary subtag, or ``None``.
+    """Return the language of each chunk as an ISO-639 primary subtag, or ``None``.
 
-    The first source that names a language wins: the chunk dict's own
-    ``language`` (Qwen3-ASR, Fun-ASR), then the decode's ``STTOutput.language``
-    when it is a string (Cohere-ASR), then the language the request asked for
-    (GLM-ASR reports none). mlx-audio reports names such as ``"Chinese"`` or
-    ISO codes; :func:`~std_mlx_audio.languages.from_backend_language` maps
-    both.
+    No family reports a language per chunk. The signal is one language for the
+    whole decode, carried on every chunk. It is the one the request asked for,
+    else the one Qwen3-ASR detects, else none. The first source that names one
+    wins: the chunk dict's own ``language`` key, then ``STTOutput.language``
+    when it is a string, then the request's language. Where each family writes
+    it, in mlx-audio 0.4.4:
+
+    * Qwen3-ASR writes ``language`` into every chunk dict. Given none, it
+      detects one on the first chunk, decodes the later chunks with it, and
+      writes that name into every chunk dict. The name is ``"English"`` when
+      the first chunk's output has no language tag (``qwen3_asr.py`` lines
+      852-862 and 1167-1179).
+    * Fun-ASR writes the request's ``language`` kwarg into every chunk dict,
+      ``None`` in auto mode (``fun_asr_nano.py`` line 628).
+    * GLM-ASR writes no ``language`` key and leaves ``STTOutput.language``
+      unset (``glmasr.py`` lines 812-818 and 831), so only the request can
+      name one.
+    * Cohere-ASR writes no key either; its ``STTOutput.language`` is the
+      request's ``language`` kwarg, which ``generate`` defaults to ``"en"``
+      (``cohere_asr.py`` lines 1132 and 1190).
+
+    mlx-audio reports names such as ``"Chinese"`` or ISO codes;
+    :func:`~std_mlx_audio.languages.from_backend_language` maps both.
 
     Args:
         raw: The chunk dicts, one per chunk.

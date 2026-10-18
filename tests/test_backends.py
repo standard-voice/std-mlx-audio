@@ -519,13 +519,17 @@ class TestSegmentTextWhitespace:
         result = Qwen3AsrBackend().to_result(native, duration=3.0, want_words=False)
         assert result.text == "a  b" == native.text
 
-    def test_qwen_space_between_chinese_chunks_is_mlx_audios(self) -> None:
-        # mlx-audio puts the space between two chunks in every language; the
-        # plugin keeps it rather than guessing a language rule (an open question).
+    def test_qwen_chunks_of_unknown_language_keep_mlx_audios_space(self) -> None:
+        # No source names a language: the chunk dicts have no "language" key,
+        # STTOutput.language is a list (_chunk_languages reads it only as a
+        # string), and the request resolved none. The fallback is the family's
+        # own separator, mlx-audio's space, here between two Chinese chunks.
         native = FakeSTTOutput(
             text="今天天气 很好。", segments=_chunks("今天天气", "很好。"), language=["Chinese"] * 2
         )
-        result = Qwen3AsrBackend().to_result(native, duration=2.0, want_words=False)
+        result = Qwen3AsrBackend().to_result(
+            native, duration=2.0, want_words=False, resolved_language=None
+        )
         assert result.text == "今天天气 很好。" == native.text
 
     def test_qwen_text_is_never_stripped(self) -> None:

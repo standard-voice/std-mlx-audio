@@ -219,17 +219,17 @@ def to_iso_subtag(bcp47_tag: str) -> str:
     return _primary_subtag(bcp47_tag)
 
 
-#: Languages written without spaces between words, for which the plugin puts
-#: no separator between two chunks or at a streaming seam
-#: (``ChunkJoin.separator_before`` in ``backends.py``).
-#: The list and the rule follow mlx-audio's own Cohere-ASR join, which uses
-#: ``""`` instead of ``" "`` for these languages (``NO_SPACE_LANGS`` in
+#: The languages for which the plugin puts no separator before a chunk's text,
+#: between two chunks of one decode and at a streaming seam alike
+#: (``ChunkJoin.separator_before`` in ``backends.py``). The set is mlx-audio's
+#: own Cohere-ASR list, which joins chunks of these languages with ``""``
+#: instead of ``" "`` (``NO_SPACE_LANGS`` in
 #: ``mlx_audio/stt/models/cohere_asr/cohere_asr.py``, mlx-audio 0.4.4 line 17),
-#: plus Cantonese (``yue``), which Qwen3-ASR detects and which is written in
-#: Chinese characters without spaces too. The languages here that Cohere-ASR
+#: plus Cantonese (``yue``), which Qwen3-ASR detects and which shares Chinese
+#: writing. It copies that list, not a rule about writing systems: Thai, also
+#: written without spaces, is not in it. The languages here that Cohere-ASR
 #: supports are exactly mlx-audio's list, so Cohere's batch join is unchanged.
-#: Entries are primary
-#: subtags as :func:`from_backend_language` returns them.
+#: Entries are primary subtags as :func:`from_backend_language` returns them.
 NO_SPACE_LANGUAGES: frozenset[str] = frozenset({"ja", "yue", "zh"})
 
 

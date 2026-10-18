@@ -1165,10 +1165,13 @@ class CohereAsr(MlxAudioASR):
             # max_audio_clip_s = 35.0 in mlx_audio/stt/models/cohere_asr/config.py.
             single_segment_span_s=35.0,
             # join_chunk_texts in mlx_audio/stt/models/cohere_asr/cohere_asr.py
-            # (mlx-audio 0.4.4 lines 17 and 669-674): stripped chunk texts, empty
-            # ones left out, joined with "" for ja/zh and " " otherwise. The
-            # plugin's NO_SPACE_LANGUAGES rule gives the same join, because its
-            # languages that Cohere supports are exactly ja and zh.
+            # (mlx-audio 0.4.4 lines 17 and 669-674): the chunk texts, stripped,
+            # empty ones left out, joined with "" for ja/zh and " " otherwise.
+            # The plugin's skip_empty skips only "" and relies on line 966, which
+            # strips every chunk text before the segments and the join see it,
+            # so the strip in the join is a no-op. The plugin's
+            # NO_SPACE_LANGUAGES rule gives the same join, because its languages
+            # that Cohere supports are exactly ja and zh.
             chunk_join=ChunkJoin(separator=" ", skip_empty=True),
         )
     )
@@ -1204,7 +1207,9 @@ class FunAsrNano(MlxAudioASR):
             single_segment_span_s=1200.0,
             # FunASRNano.generate in mlx_audio/stt/models/fun_asr_nano/
             # fun_asr_nano.py (mlx-audio 0.4.4 line 639):
-            # " ".join(t for t in texts if t).
+            # " ".join(t for t in texts if t).strip(). The strip is a no-op:
+            # _normalise_text_for_join (lines 341-342) has already stripped
+            # every chunk text (line 539).
             chunk_join=ChunkJoin(separator=" ", skip_empty=True),
             forward=(("hotwords", "hotwords"), ("itn", "use_itn")),
         )
@@ -1365,7 +1370,10 @@ class GlmAsrNano(MlxAudioASR):
             segment_timing=True,
             single_segment_span_s=30.0,
             # GLMASR.generate in mlx_audio/stt/models/glmasr/glmasr.py (mlx-audio
-            # 0.4.4 line 829): " ".join(all_texts) over every chunk.
+            # 0.4.4 lines 829 and 832): " ".join(all_texts) over every chunk,
+            # then full_text.strip(). The plugin does not copy the strip: the
+            # segments keep the chunk texts' characters, and the text is their
+            # concatenation (test_glm_keeps_a_chunk_edge_space_mlx_audio_strips).
             chunk_join=ChunkJoin(separator=" "),
         )
     )
