@@ -18,7 +18,9 @@ from standard_asr.contract.params import WordTimestampGranularity
 
 from std_mlx_audio import MlxAudioConfig, MlxAudioParams
 from std_mlx_audio.backends import (  # pyright: ignore[reportPrivateUsage]
+    TURN_SEPARATOR,
     AlignedResultBackend,
+    ChunkJoin,
     GenericSttBackend,
     Qwen3AsrBackend,
     SttFamilySpec,
@@ -409,20 +411,29 @@ class TestGenericSttBackend:
     def test_to_result_segments_when_real_timing(self) -> None:
         backend = GenericSttBackend(
             SttFamilySpec(
-                model_types=("cohere_asr",), language_kwarg="language", segment_timing=True
+                model_types=("cohere_asr",),
+                language_kwarg="language",
+                segment_timing=True,
+                chunk_join=ChunkJoin(),
             )
         )
         native = FakeSTTOutput(
             text="a b",
             segments=[
                 {"text": "a", "start": 0.0, "end": 0.5},
-                {"text": " b", "start": 0.5, "end": 1.0},
+                {"text": "b", "start": 0.5, "end": 1.0},
             ],
         )
         result = backend.to_result(native, duration=1.0, want_words=False)
         assert result.segments is not None and len(result.segments) == 2
         assert result.segments[1].start == 0.5 and result.segments[1].end == 1.0
         assert result.segments[0].words is None  # never word timing on STTOutput families
+        assert [s.text for s in result.segments] == ["a", " b"]
+        assert result.text == "a b"
+
+    def test_a_timed_spec_without_a_chunk_join_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="chunk_join"):
+            SttFamilySpec(model_types=("glmasr",), segment_timing=True)
 
     def test_to_result_detected_language_when_reported(self) -> None:
         backend = GenericSttBackend(
@@ -473,3 +484,279 @@ def test_single_segment_span_and_the_boundary_rule() -> None:
     # The review's two subsecond cases: 0.5 s with chunk 0.1, 0.8 s with chunk 0.3.
     assert has_inner_boundaries(qwen, MlxAudioParams(chunk_duration=0.1), 0.5) is False
     assert has_inner_boundaries(qwen, MlxAudioParams(chunk_duration=0.3), 0.8) is False
+
+
+# --------------------------------------------------------------------------- #
+# Segment text and whitespace (spec TR.1): text is the segment texts
+# concatenated, and every character is mlx-audio's, plus the separator
+# mlx-audio itself puts between two chunks.
+# --------------------------------------------------------------------------- #
+def _texts(result: object) -> list[str]:
+    segments = getattr(result, "segments", None)
+    assert segments is not None
+    return [segment.text for segment in segments]
+
+
+def _chunks(*texts: str) -> list[dict[str, object]]:
+    return [{"text": text, "start": float(i), "end": float(i + 1)} for i, text in enumerate(texts)]
+
+
+class TestSegmentTextWhitespace:
+    def test_qwen_space_between_chunks_moves_onto_the_next_segment(self) -> None:
+        # mlx-audio: full text = " ".join(chunk texts); segments carry each chunk alone.
+        native = FakeSTTOutput(
+            text="Hello world. How are you?",
+            segments=_chunks("Hello world.", "How are you?"),
+            language=["English", "English"],
+        )
+        result = Qwen3AsrBackend().to_result(native, duration=2.0, want_words=False)
+        assert _texts(result) == ["Hello world.", " How are you?"]
+        assert result.text == native.text
+
+    def test_qwen_keeps_its_space_after_an_empty_chunk(self) -> None:
+        # " ".join does not skip an empty chunk, so mlx-audio's text has two spaces.
+        native = FakeSTTOutput(text=" ".join(["a", "", "b"]), segments=_chunks("a", "", "b"))
+        result = Qwen3AsrBackend().to_result(native, duration=3.0, want_words=False)
+        assert result.text == "a  b" == native.text
+
+    def test_qwen_space_between_chinese_chunks_is_mlx_audios(self) -> None:
+        # mlx-audio puts the space between two chunks in every language; the
+        # plugin keeps it rather than guessing a language rule (an open question).
+        native = FakeSTTOutput(
+            text="今天天气 很好。", segments=_chunks("今天天气", "很好。"), language=["Chinese"] * 2
+        )
+        result = Qwen3AsrBackend().to_result(native, duration=2.0, want_words=False)
+        assert result.text == "今天天气 很好。" == native.text
+
+    def test_qwen_text_is_never_stripped(self) -> None:
+        native = FakeSTTOutput(text=" hi ", segments=_chunks(" hi "))
+        result = Qwen3AsrBackend().to_result(native, duration=1.0, want_words=False)
+        assert result.text == " hi "
+
+    def test_qwen_after_earlier_text_in_an_unknown_language_starts_with_its_space(
+        self,
+    ) -> None:
+        native = FakeSTTOutput(text="", segments=_chunks("", "Next."))
+        result = Qwen3AsrBackend().to_result(
+            native, duration=2.0, want_words=False, follows_text=True
+        )
+        # One space before the first text, not one per chunk.
+        assert _texts(result) == ["", " Next."]
+
+    @pytest.mark.parametrize(
+        ("chunk_language", "expected"),
+        [
+            ("English", " Next."),
+            ("Chinese", "Next."),
+            ("Cantonese", "Next."),
+            ("Japanese", "Next."),
+            (None, " Next."),
+        ],
+    )
+    def test_qwen_seam_separator_follows_the_chunks_language(
+        self, chunk_language: str | None, expected: str
+    ) -> None:
+        segments = [{"text": "Next.", "start": 0.0, "end": 1.0, "language": chunk_language}]
+        native = FakeSTTOutput(text="Next.", segments=segments, language=[chunk_language])
+        result = Qwen3AsrBackend().to_result(
+            native, duration=1.0, want_words=False, follows_text=True
+        )
+        assert _texts(result) == [expected]
+
+    def test_chinese_chunks_join_with_nothing_at_a_seam_and_inside_a_decode(
+        self,
+    ) -> None:
+        # mlx-audio puts " " between two Chinese chunks; the plugin puts nothing
+        # there, inside a decode and at a seam alike.
+        segments = [
+            {"text": "今天", "start": 0.0, "end": 1.0, "language": "Chinese"},
+            {"text": "很好。", "start": 1.0, "end": 2.0, "language": "Chinese"},
+        ]
+        native = FakeSTTOutput(text="今天 很好。", segments=segments, language=["Chinese"] * 2)
+        result = Qwen3AsrBackend().to_result(
+            native, duration=2.0, want_words=False, follows_text=True
+        )
+        assert _texts(result) == ["今天", "很好。"]
+
+    def test_unknown_language_seams_use_the_family_separator(self) -> None:
+        from std_mlx_audio import FunAsrNano, GlmAsrNano
+
+        # GLM-ASR reports no language; an auto-detecting Fun-ASR reports None.
+        glm = FakeSTTOutput(text="好。", segments=_chunks("好。"))
+        fun = FakeSTTOutput(
+            text="好。",
+            segments=[{"text": "好。", "start": 0.0, "end": 1.0, "language": None}],
+        )
+        for backend, native in ((GlmAsrNano.backend, glm), (FunAsrNano.backend, fun)):
+            result = backend.to_result(native, duration=1.0, want_words=False, follows_text=True)
+            assert _texts(result) == [" 好。"]
+
+    def test_requested_language_decides_a_chunk_that_reports_none(self) -> None:
+        from std_mlx_audio import GlmAsrNano
+
+        # GLM-ASR reports no language, so the request's language decides the
+        # separator between two chunks, in batch and at a seam.
+        native = FakeSTTOutput(text="今天 很好。", segments=_chunks("今天", "很好。"))
+        backend = GlmAsrNano.backend
+        for language, expected in (("zh-Hant", ["今天", "很好。"]), (None, ["今天", " 很好。"])):
+            result = backend.to_result(
+                native, duration=2.0, want_words=False, resolved_language=language
+            )
+            assert _texts(result) == expected
+        result = backend.to_result(
+            FakeSTTOutput(text="好。", segments=_chunks("好。")),
+            duration=1.0,
+            want_words=False,
+            follows_text=True,
+            resolved_language="zh",
+        )
+        assert _texts(result) == ["好。"]
+
+    def test_cohere_seam_uses_the_decode_language(self) -> None:
+        from std_mlx_audio import CohereAsr
+
+        for language, expected in (("ja", "はい。"), ("en", " Yes.")):
+            native = FakeSTTOutput(
+                text=expected.strip(), segments=_chunks(expected.strip()), language=language
+            )
+            result = CohereAsr.backend.to_result(
+                native, duration=1.0, want_words=False, follows_text=True
+            )
+            assert _texts(result) == [expected]
+
+    def test_qwen_without_text_has_no_seam_space(self) -> None:
+        native = FakeSTTOutput(text="", segments=_chunks(""))
+        result = Qwen3AsrBackend().to_result(
+            native, duration=1.0, want_words=False, follows_text=True
+        )
+        assert result.text == ""
+
+    def test_whisper_segments_carry_their_own_leading_space(self) -> None:
+        # mlx-audio decodes each segment's tokens; English segments start with " ".
+        native = FakeSTTOutput(
+            text=" Hello world. How are you?",
+            language="en",
+            segments=_chunks(" Hello world.", " How are you?"),
+        )
+        for follows_text in (False, True):
+            result = WhisperBackend().to_result(
+                native, duration=2.0, want_words=False, follows_text=follows_text
+            )
+            assert _texts(result) == [" Hello world.", " How are you?"]
+            assert result.text == native.text  # leading space kept
+
+    def test_whisper_chinese_segments_join_with_nothing(self) -> None:
+        native = FakeSTTOutput(
+            text="你好。再见。", language="zh", segments=_chunks("你好。", "再见。")
+        )
+        result = WhisperBackend().to_result(native, duration=2.0, want_words=False)
+        assert result.text == "你好。再见。"
+
+    def test_aligned_text_is_the_sentences_without_mlx_audios_strip(self) -> None:
+        # mlx-audio: AlignedResult.text = "".join(sentence texts).strip(); a sentence
+        # starts with the space its first token carries.
+        sentences = [
+            FakeAlignedSentence(
+                text=" Hello world.",
+                start=0.0,
+                end=1.0,
+                tokens=[
+                    FakeAlignedToken(text=" Hello", start=0.0, end=0.5),
+                    FakeAlignedToken(text=" world.", start=0.5, end=1.0),
+                ],
+            ),
+            FakeAlignedSentence(
+                text=" Bye.",
+                start=1.0,
+                end=1.5,
+                tokens=[FakeAlignedToken(text=" Bye.", start=1.0, end=1.5)],
+            ),
+        ]
+        native = FakeAlignedResult(text="Hello world. Bye.", sentences=sentences)
+        result = AlignedResultBackend(model_types=("parakeet",)).to_result(
+            native, duration=1.5, want_words=True, follows_text=True
+        )
+        assert _texts(result) == [" Hello world.", " Bye."]
+        assert result.text == " Hello world. Bye."
+
+    def test_fun_asr_leaves_empty_chunks_out_of_the_join(self) -> None:
+        from std_mlx_audio import FunAsrNano
+
+        native = FakeSTTOutput(text="a b", segments=_chunks("a", "", "b"))
+        result = FunAsrNano.backend.to_result(native, duration=3.0, want_words=False)
+        assert _texts(result) == ["a", "", " b"]
+        assert result.text == native.text
+
+    def test_glm_keeps_a_chunk_edge_space_mlx_audio_strips(self) -> None:
+        # mlx-audio: (" ".join(all_texts)).strip(); the segments are the unstripped
+        # chunk texts, and the plugin keeps their characters.
+        from std_mlx_audio import GlmAsrNano
+
+        native = FakeSTTOutput(text="a  b", segments=_chunks(" a", "", "b"))
+        result = GlmAsrNano.backend.to_result(native, duration=3.0, want_words=False)
+        assert _texts(result) == [" a", " ", " b"]
+        assert result.text == " a  b"
+
+    @pytest.mark.parametrize(
+        ("language", "texts"),
+        [
+            ("en", ["Hello.", "", "Bye."]),
+            ("zh", ["你好。", "", "再见。"]),
+            ("ja", ["こんにちは。", "さようなら。"]),
+        ],
+    )
+    def test_cohere_text_matches_mlx_audios_own_join(self, language: str, texts: list[str]) -> None:
+        cohere = pytest.importorskip("mlx_audio.stt.models.cohere_asr.cohere_asr")
+        from std_mlx_audio import CohereAsr
+
+        expected = cohere.join_chunk_texts(texts, language=language)
+        native = FakeSTTOutput(text=expected, segments=_chunks(*texts), language=language)
+        result = CohereAsr.backend.to_result(native, duration=3.0, want_words=False)
+        assert result.text == expected
+
+    def test_cohere_no_space_languages_match_mlx_audio(self) -> None:
+        cohere = pytest.importorskip("mlx_audio.stt.models.cohere_asr.cohere_asr")
+        from std_mlx_audio.languages import COHERE_LANGUAGES, NO_SPACE_LANGUAGES
+
+        # The plugin's no-space languages that Cohere supports must be exactly
+        # mlx-audio's own list, so the Cohere batch join stays mlx-audio's.
+        supported = NO_SPACE_LANGUAGES.intersection(COHERE_LANGUAGES)
+        assert supported == frozenset(cohere.NO_SPACE_LANGS)
+
+    def test_text_only_family_keeps_mlx_audios_text_verbatim(self) -> None:
+        backend = GenericSttBackend(SttFamilySpec(model_types=("moonshine",)))
+        result = backend.to_result(FakeSTTOutput(text=" hello. "), duration=1.0, want_words=False)
+        assert result.text == " hello. "
+        assert result.segments is None
+
+    def test_vibevoice_turns_join_with_a_line_break_kept_verbatim(self) -> None:
+        from std_mlx_audio import VibeVoiceAsr
+
+        native = FakeSTTOutput(
+            text='[{"Content": "..."}]',
+            segments=[
+                {"start": 0.0, "end": 1.0, "speaker_id": 0, "text": "你好。"},
+                {"start": 1.0, "end": 2.0, "speaker_id": 1, "text": ""},
+                {"start": 2.0, "end": 3.0, "speaker_id": 1, "text": "我很好。 "},
+            ],
+        )
+        result = VibeVoiceAsr.backend.to_result(native, duration=3.0, want_words=False)
+        assert TURN_SEPARATOR == "\n"
+        assert result.text == "你好。\n我很好。 "
+        assert result.segments is None
+
+    def test_vibevoice_without_parsed_turns_keeps_the_raw_text(self) -> None:
+        from std_mlx_audio import VibeVoiceAsr
+
+        native = FakeSTTOutput(text="not json", segments=[])
+        result = VibeVoiceAsr.backend.to_result(native, duration=1.0, want_words=False)
+        assert result.text == "not json"
+
+    def test_every_timed_preset_names_its_chunk_join(self) -> None:
+        import std_mlx_audio
+
+        for name in std_mlx_audio.__all__:
+            cls = getattr(std_mlx_audio, name)
+            backend = getattr(cls, "backend", None)
+            if isinstance(backend, GenericSttBackend) and backend.spec.segment_timing:
+                assert backend.spec.chunk_join is not None, name

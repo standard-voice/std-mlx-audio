@@ -108,6 +108,7 @@ from ._metadata import (
 )
 from .backends import (
     AlignedResultBackend,
+    ChunkJoin,
     GenericSttBackend,
     ModelBackend,
     Qwen3AsrBackend,
@@ -714,7 +715,12 @@ class MlxAudioASR(EngineBase):
             native = model.generate(backends.adapt_audio_source(backend, source), **gen_kwargs)
         except Exception as exc:
             raise TranscriptionError(f"MLX transcription failed: {type(exc).__name__}.") from exc
-        result = backend.to_result(native, duration=duration, want_words=want_words)
+        result = backend.to_result(
+            native,
+            duration=duration,
+            want_words=want_words,
+            resolved_language=resolved_language,
+        )
         # Audio with no speech can come back as the prompt itself (see _guidance).
         if echoes_prompt(
             result.text, gen_kwargs.get("system_prompt", gen_kwargs.get("initial_prompt"))
@@ -1158,6 +1164,12 @@ class CohereAsr(MlxAudioASR):
             # it returns one segment for input up to the clip limit:
             # max_audio_clip_s = 35.0 in mlx_audio/stt/models/cohere_asr/config.py.
             single_segment_span_s=35.0,
+            # join_chunk_texts in mlx_audio/stt/models/cohere_asr/cohere_asr.py
+            # (mlx-audio 0.4.4 lines 17 and 669-674): stripped chunk texts, empty
+            # ones left out, joined with "" for ja/zh and " " otherwise. The
+            # plugin's NO_SPACE_LANGUAGES rule gives the same join, because its
+            # languages that Cohere supports are exactly ja and zh.
+            chunk_join=ChunkJoin(separator=" ", skip_empty=True),
         )
     )
     properties: ClassVar[BaseProperties] = stt_properties(
@@ -1190,6 +1202,10 @@ class FunAsrNano(MlxAudioASR):
             language_kwarg="language",
             segment_timing=True,
             single_segment_span_s=1200.0,
+            # FunASRNano.generate in mlx_audio/stt/models/fun_asr_nano/
+            # fun_asr_nano.py (mlx-audio 0.4.4 line 639):
+            # " ".join(t for t in texts if t).
+            chunk_join=ChunkJoin(separator=" ", skip_empty=True),
             forward=(("hotwords", "hotwords"), ("itn", "use_itn")),
         )
     )
@@ -1344,7 +1360,14 @@ class GlmAsrNano(MlxAudioASR):
     # repo ships no slow-layout fallback (per-file ablation, round-9 review).
     required_snapshot_files: ClassVar[tuple[str, ...]] = ("tokenizer.json",)
     backend: ClassVar[ModelBackend] = GenericSttBackend(
-        SttFamilySpec(model_types=("glmasr",), segment_timing=True, single_segment_span_s=30.0)
+        SttFamilySpec(
+            model_types=("glmasr",),
+            segment_timing=True,
+            single_segment_span_s=30.0,
+            # GLMASR.generate in mlx_audio/stt/models/glmasr/glmasr.py (mlx-audio
+            # 0.4.4 line 829): " ".join(all_texts) over every chunk.
+            chunk_join=ChunkJoin(separator=" "),
+        )
     )
     properties: ClassVar[BaseProperties] = stt_properties(
         model_name="glm-asr-nano",

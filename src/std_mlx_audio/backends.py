@@ -34,7 +34,7 @@ unit-testable against tiny fakes without MLX or downloads.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast
 
 from standard_asr.contract.params import WordTimestampGranularity
 from standard_asr.contract.results import Segment, TranscriptionResult, Word
@@ -52,6 +52,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: All MLX STT backends here consume 16 kHz mono audio (the standard layer
 #: resamples to our native rate before us).
 SAMPLE_RATE = 16000
+
+#: What the plugin puts between two speaker turns of a ``text_from_segments``
+#: family (VibeVoice-ASR). mlx-audio returns the turns only as parsed JSON
+#: items, with no transcript that joins them, so the separator is the plugin's
+#: choice. A line break reads right in every language: a space would put a
+#: space after a Chinese full stop, and no separator would run two English
+#: sentences together.
+TURN_SEPARATOR = "\n"
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -72,6 +80,104 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return cast("list[Any]", value)
     return []
+
+
+@dataclass(frozen=True)
+class ChunkJoin:
+    """How mlx-audio joins a chunked family's chunk texts into its full text.
+
+    Qwen3-ASR, GLM-ASR, Fun-ASR, and Cohere-ASR split long input into chunks,
+    return one segment per chunk carrying that chunk's text alone, and build
+    ``STTOutput.text`` by joining the chunk texts with a separator. The
+    separator belongs to the transcript, so the plugin puts it at the start of
+    the segment that follows it, and the segment texts concatenated are the
+    transcript. Each family's values copy that family's own join in mlx-audio;
+    the family's ``ChunkJoin`` names the source line.
+
+    One rule overrides mlx-audio's join, in batch and at a streaming seam
+    alike (see :meth:`separator_before`): no separator goes before a chunk in
+    a language of :data:`~std_mlx_audio.languages.NO_SPACE_LANGUAGES`.
+    mlx-audio's Cohere-ASR join applies that rule; its Qwen3-ASR, GLM-ASR, and
+    Fun-ASR joins put a space between two Chinese chunks, which inserts a
+    space into the transcript. For those families the batch text therefore
+    differs from ``STTOutput.text`` at a chunk boundary in such a language. A
+    streaming seam needs the same decision because mlx-audio never sees the
+    text on both sides of it.
+
+    Attributes:
+        separator: What mlx-audio puts between two chunk texts.
+        skip_empty: Whether mlx-audio leaves a chunk with no text out of the
+            join (no separator before or after it). ``False`` means a plain
+            ``separator.join(texts)``, which puts a separator after an empty
+            chunk too.
+    """
+
+    separator: str = " "
+    skip_empty: bool = False
+
+    def separator_before(self, chunk_language: str | None) -> str:
+        """Return the separator that goes before a chunk's text.
+
+        It is used between two chunks of one decode and at a streaming seam,
+        before the first text of a later window.
+
+        Args:
+            chunk_language: The chunk's language as an ISO-639 primary subtag
+                (see :func:`_chunk_languages`), or ``None`` when neither the
+                chunk, the decode, nor the request names one.
+
+        Returns:
+            ``""`` if the chunk's language is one of
+            :data:`~std_mlx_audio.languages.NO_SPACE_LANGUAGES`; otherwise
+            :attr:`separator`, which is also the answer when the chunk's
+            language is unknown.
+        """
+        if chunk_language in languages.NO_SPACE_LANGUAGES:
+            return ""
+        return self.separator
+
+    def texts(
+        self,
+        texts: list[str],
+        *,
+        chunk_languages: list[str | None],
+        follows_text: bool,
+    ) -> list[str]:
+        """Return the chunk texts, each with the separator that goes before it.
+
+        Args:
+            texts: The chunk texts, in order, exactly as mlx-audio returned them.
+            chunk_languages: Each chunk's language as an ISO-639 primary
+                subtag, or ``None`` where it is unknown, one per entry of
+                ``texts``.
+            follows_text: Whether text precedes the first chunk (a streaming
+                session's later window). The first chunk that has text then
+                starts with :meth:`separator_before`, and nothing is added
+                before it.
+
+        Returns:
+            The texts with separators added. Without ``follows_text``,
+            ``"".join(result)`` is mlx-audio's join of ``texts``, except that a
+            chunk in a language of
+            :data:`~std_mlx_audio.languages.NO_SPACE_LANGUAGES` gets no
+            separator before it.
+        """
+        out: list[str] = []
+        seam = follows_text  # the seam separator is due before the first text
+        owed = False  # a separator is due before the next text
+        for index, text in enumerate(texts):
+            if seam and text:
+                prefix = self.separator_before(chunk_languages[index])
+                seam = False
+            elif (owed and text) or (index > 0 and not self.skip_empty and not seam):
+                # A plain join puts the separator before every chunk after the
+                # first; a join that skips empty chunks, only before text.
+                prefix = self.separator_before(chunk_languages[index])
+            else:
+                prefix = ""
+            out.append(prefix + text)
+            owed = owed or bool(text)
+        return out
 
 
 class ModelBackend(Protocol):
@@ -122,15 +228,39 @@ class ModelBackend(Protocol):
         ...
 
     def to_result(
-        self, native: Any, *, duration: float | None, want_words: bool
+        self,
+        native: Any,
+        *,
+        duration: float | None,
+        want_words: bool,
+        follows_text: bool = False,
+        resolved_language: str | None = None,
     ) -> TranscriptionResult:
         """Map this family's native ``generate`` return onto a Standard result.
+
+        Every segment text carries the characters it adds to the transcript,
+        including the space that joins it to the segment before it, and
+        ``text`` is the segment texts concatenated (spec TR.1). Nothing is
+        stripped: the characters are the ones mlx-audio returned, plus, for a
+        family that splits its input into chunks, the separator mlx-audio
+        itself puts between two chunks (see :class:`ChunkJoin`).
 
         Args:
             native: The value returned by ``model.generate``.
             duration: Audio duration in seconds, if known (from the waveform).
             want_words: Whether word-level timestamps were requested (controls
                 the null semantics of ``words``: ``None`` = not requested).
+            follows_text: Whether this decode continues a transcript that
+                already has text: a streaming session's later window. A chunked
+                family then starts the first segment that has text with
+                :meth:`ChunkJoin.separator_before`: none for a language written
+                without spaces, the family's chunk separator otherwise. A
+                family whose segment texts carry their own leading space
+                (Whisper, Parakeet, Nemotron) ignores it.
+            resolved_language: The request's effective BCP-47 language, or
+                ``None`` for auto-detect. A chunked family uses it for a chunk
+                whose language the decode does not report (see
+                :class:`ChunkJoin`); other families ignore it.
 
         Returns:
             A constant-schema :class:`TranscriptionResult`.
@@ -172,6 +302,12 @@ class Qwen3AsrBackend:
 
     model_types: tuple[str, ...] = ("qwen3_asr", "mega_asr")
     audio_as_list: bool = False
+    #: mlx-audio builds the full text as ``" ".join(all_texts)`` over every
+    #: chunk, empty ones included (``Qwen3ASRModel.generate`` in
+    #: ``mlx_audio/stt/models/qwen3_asr/qwen3_asr.py``, mlx-audio 0.4.4 line
+    #: 1191), while each chunk's segment carries the chunk text alone. MegaASR
+    #: delegates to the same ``generate`` (``mega_asr.py``, ``Model.generate``).
+    chunk_join: ClassVar[ChunkJoin] = ChunkJoin(separator=" ")
 
     def single_segment_span(self, params: MlxAudioParams) -> float | None:
         """Return the effective chunk: mlx-audio returns one segment per chunk.
@@ -238,30 +374,48 @@ class Qwen3AsrBackend:
         return kwargs
 
     def to_result(
-        self, native: Any, *, duration: float | None, want_words: bool
+        self,
+        native: Any,
+        *,
+        duration: float | None,
+        want_words: bool,
+        follows_text: bool = False,
+        resolved_language: str | None = None,
     ) -> TranscriptionResult:
         """Map a Qwen3-ASR ``STTOutput`` onto a Standard result.
 
         ``STTOutput.segments`` are chunk dicts ``{text, language, start, end}``;
-        ``STTOutput.language`` is a list of names. ``words`` is always ``None``
-        (Qwen3-ASR emits no word timing — declaring ``want_words`` cannot change
-        that, and the standard layer would have rejected a ``"word"`` request as
-        incompatible before we got here).
+        ``STTOutput.language`` is a list of names. Each segment after the first
+        gets the space mlx-audio puts between two chunks (:attr:`chunk_join`),
+        except a chunk in Chinese, Cantonese, or Japanese, which gets none, so
+        ``text`` is the segment texts concatenated. ``words`` is always ``None`` (Qwen3-ASR emits no word timing;
+        declaring ``want_words`` cannot change that, and the standard layer
+        would have rejected a ``"word"`` request as incompatible before we got
+        here).
 
         Args:
             native: The ``STTOutput`` from ``Qwen3ASR.generate``.
             duration: Audio duration in seconds, if known.
             want_words: Ignored (no word timing available).
+            follows_text: Whether the transcript already has text before this
+                decode (see :meth:`ModelBackend.to_result`).
+            resolved_language: The request's effective language (see
+                :meth:`ModelBackend.to_result`).
 
         Returns:
             A constant-schema :class:`TranscriptionResult`.
         """
         del want_words
-        text: str = (getattr(native, "text", "") or "").strip()
-        segments = _segments_from_dicts(_as_list(getattr(native, "segments", None)))
+        segments = _segments_from_dicts(
+            _as_list(getattr(native, "segments", None)),
+            join=self.chunk_join,
+            language=getattr(native, "language", None),
+            follows_text=follows_text,
+            resolved_language=resolved_language,
+        )
         detected = _detected_from_qwen_language(getattr(native, "language", None))
         return TranscriptionResult(
-            text=text,
+            text=_text_of(segments, native),
             detected_language=detected,
             duration=duration,
             segments=segments or None,
@@ -335,7 +489,13 @@ class WhisperBackend:
         return kwargs
 
     def to_result(
-        self, native: Any, *, duration: float | None, want_words: bool
+        self,
+        native: Any,
+        *,
+        duration: float | None,
+        want_words: bool,
+        follows_text: bool = False,
+        resolved_language: str | None = None,
     ) -> TranscriptionResult:
         """Map a Whisper ``STTOutput`` onto a Standard result.
 
@@ -345,21 +505,31 @@ class WhisperBackend:
         ``want_words`` (spec TR.3 null semantics: ``words=None`` means "not
         requested").
 
+        Each segment text is mlx-audio's decode of that segment's tokens, which
+        starts with the space that joins it to the text before it (for a
+        language written with spaces). mlx-audio's full text is the decode of
+        all those tokens at once (``Whisper.generate`` in
+        ``mlx_audio/stt/models/whisper/whisper.py``, mlx-audio 0.4.4 lines
+        1005 and 1299), so ``text`` is the segment texts concatenated, leading
+        space included, and nothing is added at a streaming seam.
+
         Args:
             native: The ``STTOutput`` from ``Whisper.generate``.
             duration: Audio duration in seconds, if known.
             want_words: Whether word timestamps were requested.
+            follows_text: Ignored: the segment texts carry their own spaces.
+            resolved_language: Ignored, for the same reason.
 
         Returns:
             A constant-schema :class:`TranscriptionResult`.
         """
-        text: str = (getattr(native, "text", "") or "").strip()
+        del follows_text, resolved_language
         segments, words = _segments_from_whisper(
             _as_list(getattr(native, "segments", None)), want_words=want_words
         )
         detected = languages.from_backend_language(getattr(native, "language", None))
         return TranscriptionResult(
-            text=text,
+            text=_text_of(segments, native),
             detected_language=detected,
             duration=duration,
             segments=segments or None,
@@ -444,7 +614,13 @@ class AlignedResultBackend:
         return {}
 
     def to_result(
-        self, native: Any, *, duration: float | None, want_words: bool
+        self,
+        native: Any,
+        *,
+        duration: float | None,
+        want_words: bool,
+        follows_text: bool = False,
+        resolved_language: str | None = None,
     ) -> TranscriptionResult:
         """Map an ``AlignedResult`` onto a Standard result.
 
@@ -453,10 +629,22 @@ class AlignedResultBackend:
         RNN-T paths do not emit per-token confidence in mlx-audio). Word data is
         attached only when ``want_words`` (spec TR.3).
 
+        A sentence's text is its tokens' texts concatenated, and a token that
+        starts a word starts with a space (the tokenizer turns ``▁`` into
+        ``" "``). mlx-audio builds ``AlignedResult.text`` as the sentence texts
+        concatenated and then strips it (``sentences_to_result`` and
+        ``AlignedResult.__post_init__`` in ``mlx_audio/stt/models/nemo/
+        alignment.py``, mlx-audio 0.4.4 lines 74 and 37). ``text`` here is the
+        sentence texts concatenated without that strip, so it usually starts
+        with a space, as Whisper's does, and nothing is added at a streaming
+        seam.
+
         Args:
             native: The ``AlignedResult`` from the model's ``generate``.
             duration: Audio duration in seconds, if known.
             want_words: Whether word timestamps were requested.
+            follows_text: Ignored: the sentence texts carry their own spaces.
+            resolved_language: Ignored, for the same reason.
 
         Returns:
             A constant-schema :class:`TranscriptionResult`.
@@ -465,12 +653,12 @@ class AlignedResultBackend:
             These models do not report a detected language; ``detected_language``
             is left ``None`` (honesty over guessing).
         """
-        text: str = (getattr(native, "text", "") or "").strip()
+        del follows_text
         segments, words = _segments_from_aligned(
             _as_list(getattr(native, "sentences", None)), want_words=want_words
         )
         return TranscriptionResult(
-            text=text,
+            text=_text_of(segments, native),
             detected_language=None,
             duration=duration,
             segments=segments or None,
@@ -529,7 +717,11 @@ class SttFamilySpec:
         text_from_segments: Whether the family returns its transcript only inside
             ``STTOutput.segments`` (parsed structured/diarization JSON) while
             ``STTOutput.text`` carries the raw JSON. When set, the result text is
-            rebuilt by joining the segments' text (VibeVoice-ASR).
+            rebuilt from the segments' texts (VibeVoice-ASR; see
+            :data:`TURN_SEPARATOR`).
+        chunk_join: How mlx-audio joins the family's chunk texts into its full
+            text. Required with ``segment_timing`` (each segment is one chunk),
+            and unused without it.
         single_segment_span_s: For a family with ``segment_timing``, the
             internal chunk length up to which mlx-audio returns one segment
             spanning the whole input (Fun-ASR 1200 s, GLM-ASR 30 s, Cohere 35 s:
@@ -551,8 +743,23 @@ class SttFamilySpec:
     wants_path: bool = False
     default_prompt: str | None = None
     text_from_segments: bool = False
+    chunk_join: ChunkJoin | None = None
     single_segment_span_s: float | None = None
     forward: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        """Reject a timed family without a chunk join.
+
+        Raises:
+            ValueError: If ``segment_timing`` is set and ``chunk_join`` is not:
+                without it the segment texts would lack the separators that
+                mlx-audio's full text has between chunks.
+        """
+        if self.segment_timing and self.chunk_join is None:
+            raise ValueError(
+                f"SttFamilySpec for {self.model_types} sets segment_timing but no "
+                "chunk_join: name how mlx-audio joins this family's chunk texts."
+            )
 
 
 class GenericSttBackend:
@@ -646,20 +853,35 @@ class GenericSttBackend:
         return kwargs
 
     def to_result(
-        self, native: Any, *, duration: float | None, want_words: bool
+        self,
+        native: Any,
+        *,
+        duration: float | None,
+        want_words: bool,
+        follows_text: bool = False,
+        resolved_language: str | None = None,
     ) -> TranscriptionResult:
         """Map the family's ``STTOutput`` onto a Standard result.
 
         Emits segments only when the family produces real per-chunk timing
         (``spec.segment_timing``); otherwise returns text only — never a
-        fabricated span. Surfaces a detected language only when the family truly
-        detects one (``spec.reports_detected_language``). No STTOutput family
-        emits word timing, so ``words`` is always ``None``.
+        fabricated span. With segments, each segment after the first gets the
+        separator mlx-audio puts between two chunks (``spec.chunk_join``), and
+        ``text`` is the segment texts concatenated. Without segments, ``text``
+        is ``STTOutput.text`` exactly as mlx-audio returned it, or, for a
+        ``text_from_segments`` family, the parsed segment texts joined with
+        :data:`TURN_SEPARATOR`. Surfaces a detected language only when the
+        family truly detects one (``spec.reports_detected_language``). No
+        STTOutput family emits word timing, so ``words`` is always ``None``.
 
         Args:
             native: The ``STTOutput`` from the family's ``generate``.
             duration: Audio duration in seconds, if known.
             want_words: Ignored (no word timing available).
+            follows_text: Whether the transcript already has text before this
+                decode (see :meth:`ModelBackend.to_result`).
+            resolved_language: The request's effective language (see
+                :meth:`ModelBackend.to_result`).
 
         Returns:
             A constant-schema :class:`TranscriptionResult`.
@@ -667,24 +889,31 @@ class GenericSttBackend:
         del want_words
         spec = self.spec
         raw_segments = _as_list(getattr(native, "segments", None))
-        if spec.text_from_segments:
-            # The family emits its transcript only inside structured segments
-            # (VibeVoice: ``STTOutput.text`` is the raw diarization JSON, while
-            # ``segments`` are the parsed {start,end,text} dicts). Rebuild a clean
-            # transcript by joining the segment texts; fall back to the raw text
-            # only if parsing yielded nothing.
-            joined = " ".join(
-                str(d.get("text", "")).strip()
-                for d in raw_segments
-                if str(d.get("text", "")).strip()
-            ).strip()
-            text: str = joined or (getattr(native, "text", "") or "").strip()
-        else:
-            text = (getattr(native, "text", "") or "").strip()
         # Emitting segments is governed independently by ``segment_timing`` (only
         # families with real per-chunk timing declare it); a text-only family that
         # merely parses its transcript out of JSON does not gain segment spans.
-        segments = _segments_from_dicts(raw_segments) if spec.segment_timing else None
+        segments: list[Segment] | None = None
+        if spec.segment_timing:
+            assert spec.chunk_join is not None  # SttFamilySpec.__post_init__ requires it
+            segments = _segments_from_dicts(
+                raw_segments,
+                join=spec.chunk_join,
+                language=getattr(native, "language", None),
+                follows_text=follows_text,
+                resolved_language=resolved_language,
+            )
+        if segments:
+            text = "".join(segment.text for segment in segments)
+        elif spec.text_from_segments:
+            # The family emits its transcript only inside structured segments
+            # (VibeVoice: ``STTOutput.text`` is the raw diarization JSON, while
+            # ``segments`` are the parsed dicts, one per speaker turn). Rebuild
+            # the transcript from the turn texts, kept exactly as parsed; fall
+            # back to the raw text only if parsing yielded nothing.
+            turns = [str(d.get("text", "")) for d in raw_segments]
+            text = TURN_SEPARATOR.join(turn for turn in turns if turn) or _native_text(native)
+        else:
+            text = _native_text(native)
         detected = (
             from_backend_language(getattr(native, "language", None))
             if spec.reports_detected_language
@@ -806,19 +1035,100 @@ def _clamp_span(start: Any, end: Any) -> tuple[float, float]:
     return s, e
 
 
-def _segments_from_dicts(raw: list[dict[str, Any]]) -> list[Segment]:
-    """Convert chunk-level dict segments (Qwen3-ASR) into ``Segment`` objects.
+def _native_text(native: Any) -> str:
+    """Return ``native.text`` exactly as mlx-audio returned it (``""`` if absent).
 
     Args:
-        raw: A list of ``{text, start, end, ...}`` dicts.
+        native: The native ``generate`` return value.
 
     Returns:
-        A list of :class:`Segment` (word-less).
+        The text, unstripped.
     """
-    out: list[Segment] = []
+    return str(getattr(native, "text", "") or "")
+
+
+def _text_of(segments: list[Segment], native: Any) -> str:
+    """Return the result ``text`` for a family that emits segments.
+
+    With segments, the text is their texts concatenated (spec TR.1). Without
+    any, the result carries ``segments=None`` and the text stands alone, so it
+    is mlx-audio's own text.
+
+    Args:
+        segments: The converted segments (may be empty).
+        native: The native ``generate`` return value.
+
+    Returns:
+        The transcript text.
+    """
+    if segments:
+        return "".join(segment.text for segment in segments)
+    return _native_text(native)
+
+
+def _chunk_languages(
+    raw: list[dict[str, Any]], language: Any, resolved_language: str | None
+) -> list[str | None]:
+    """Return each chunk's language as an ISO-639 primary subtag, or ``None``.
+
+    The first source that names a language wins: the chunk dict's own
+    ``language`` (Qwen3-ASR, Fun-ASR), then the decode's ``STTOutput.language``
+    when it is a string (Cohere-ASR), then the language the request asked for
+    (GLM-ASR reports none). mlx-audio reports names such as ``"Chinese"`` or
+    ISO codes; :func:`~std_mlx_audio.languages.from_backend_language` maps
+    both.
+
+    Args:
+        raw: The chunk dicts, one per chunk.
+        language: The ``STTOutput.language`` of the decode.
+        resolved_language: The request's effective BCP-47 language, or
+            ``None`` for auto-detect.
+
+    Returns:
+        One subtag or ``None`` per chunk.
+    """
+    requested = languages.to_iso_subtag(resolved_language) if resolved_language else None
+    decode = languages.from_backend_language(language) if isinstance(language, str) else None
+    out: list[str | None] = []
     for item in raw:
+        own = item.get("language")
+        tag = languages.from_backend_language(own) if isinstance(own, str) else None
+        out.append(tag or decode or requested)
+    return out
+
+
+def _segments_from_dicts(
+    raw: list[dict[str, Any]],
+    *,
+    join: ChunkJoin,
+    language: Any,
+    follows_text: bool,
+    resolved_language: str | None = None,
+) -> list[Segment]:
+    """Convert chunk-level dict segments into ``Segment`` objects.
+
+    Args:
+        raw: A list of ``{text, start, end, ...}`` dicts, one per chunk.
+        join: How mlx-audio joins the chunk texts.
+        language: The ``STTOutput.language`` of the decode.
+        follows_text: Whether text precedes the first chunk (see
+            :meth:`ChunkJoin.texts`).
+        resolved_language: The request's effective BCP-47 language, or
+            ``None`` (see :func:`_chunk_languages`).
+
+    Returns:
+        A list of :class:`Segment` (word-less), each text carrying the
+        separator mlx-audio puts before that chunk.
+    """
+    texts = join.texts(
+        [str(item.get("text", "")) for item in raw],
+        chunk_languages=_chunk_languages(raw, language, resolved_language),
+        follows_text=follows_text,
+    )
+    out: list[Segment] = []
+    for item, text in zip(raw, texts, strict=True):
         start, end = _clamp_span(item.get("start", 0.0), item.get("end", 0.0))
-        out.append(Segment(start=start, end=end, text=str(item.get("text", "")), words=None))
+        out.append(Segment(start=start, end=end, text=text, words=None))
     return out
 
 
@@ -1024,7 +1334,9 @@ def map_word_timestamps(granularity: WordTimestampGranularity | None) -> bool:
 
 __all__ = [
     "SAMPLE_RATE",
+    "TURN_SEPARATOR",
     "AlignedResultBackend",
+    "ChunkJoin",
     "GenericSttBackend",
     "ModelBackend",
     "Qwen3AsrBackend",
