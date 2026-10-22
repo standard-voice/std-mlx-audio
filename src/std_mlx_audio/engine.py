@@ -478,7 +478,7 @@ class MlxAudioASR(EngineBase):
                     hint="Run 'standard-asr pull' while the source is reachable.",
                 ) from exc
         try:
-            self._model = load(model_source, **load_kwargs)
+            model = load(model_source, **load_kwargs)
         except Exception as exc:
             raise TranscriptionError(
                 f"mlx-audio failed to load the model at {model_source!r}: "
@@ -487,10 +487,14 @@ class MlxAudioASR(EngineBase):
                 "before, run 'standard-asr pull --refresh' to re-fetch any "
                 "files its snapshot lacks."
             ) from exc
-        self._verify_model_family()
-        self._prime_generation_thread()
+        # Publish the model only after the checks: a model of the wrong family
+        # left on the instance would make the next call skip the load and run
+        # it through the wrong backend.
+        self._verify_model_family(model)
+        self._prime_generation_thread(model)
+        self._model = model
 
-    def _prime_generation_thread(self) -> None:
+    def _prime_generation_thread(self, model: object) -> None:
         """Run one tiny generate on the loading thread (MLX thread affinity).
 
         mlx-audio's generate path materializes its Metal stream state lazily,
@@ -525,9 +529,8 @@ class MlxAudioASR(EngineBase):
             source = self._array_to_wav_tempfile(silence)
         else:
             source = backends.to_mlx_array(silence)
-        model = cast(Any, self._model)
         try:
-            model.generate(backends.adapt_audio_source(backend, source), **gen_kwargs)
+            cast(Any, model).generate(backends.adapt_audio_source(backend, source), **gen_kwargs)
         except Exception:
             _LOGGER.warning(
                 "Priming generate failed for %s; the first real generate should "
@@ -537,7 +540,7 @@ class MlxAudioASR(EngineBase):
                 exc_info=True,
             )
 
-    def _verify_model_family(self) -> None:
+    def _verify_model_family(self, model: object) -> None:
         """Assert the loaded model's family matches this preset's backend (spec IC.7).
 
         mlx-audio's ``load`` auto-detects the model family from the checkpoint's
@@ -551,7 +554,7 @@ class MlxAudioASR(EngineBase):
             DiscoveryError: If the loaded model's family is not one this preset's
                 backend declares in ``model_types``.
         """
-        family = _model_family(self._model)
+        family = _model_family(model)
         if family is None:
             # Could not introspect the model's module path (unexpected layout);
             # do not block a possibly-valid load on a check we cannot make.

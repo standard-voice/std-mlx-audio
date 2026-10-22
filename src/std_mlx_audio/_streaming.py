@@ -490,15 +490,14 @@ class MlxAudioStreamingSession(TranscriptionSession):
         return None if (resolved is None or resolved == "auto") else resolved
 
     def _decode(self, audio: NDArray[np.float32], *, want_words: bool) -> list[Segment]:
-        """Run a full backend decode over ``audio`` (blocking; main thread).
+        """Run a full backend decode over ``audio`` (blocking; event-loop thread).
 
-        IMPORTANT — MLX threading constraint: MLX arrays (incl. model weights)
-        are bound to the Metal stream of the thread they were created on, and a
-        stream cannot be used from another thread. The model is loaded on the
-        event-loop thread, so generation MUST run on that same thread — offloading
-        to ``asyncio.to_thread`` raises ``RuntimeError: There is no Stream(gpu, N)
-        in current thread``. We therefore decode inline (this blocks the loop for
-        the decode duration). See ``docs/STANDARD_ASR_FINDINGS.md``.
+        MLX ties arrays, model weights included, to the Metal stream of the
+        thread that created them. The engine primes a freshly loaded model on
+        the loading thread (``MlxAudioASR._prime_generation_thread``), and after
+        that a generate can run on any thread. The session still decodes
+        inline, which blocks the event loop for the decode. See
+        ``docs/STANDARD_ASR_FINDINGS.md``.
 
         Args:
             audio: The audio to decode, as a float32 array.
