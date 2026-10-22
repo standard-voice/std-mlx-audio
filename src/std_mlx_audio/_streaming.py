@@ -490,13 +490,12 @@ class MlxAudioStreamingSession(TranscriptionSession):
         return None if (resolved is None or resolved == "auto") else resolved
 
     def _decode(self, audio: NDArray[np.float32], *, want_words: bool) -> list[Segment]:
-        """Run a full backend decode over ``audio`` (blocking; event-loop thread).
+        """Run a full backend decode over ``audio`` (on the engine's MLX thread).
 
         MLX ties arrays, model weights included, to the Metal stream of the
-        thread that created them. The engine primes a freshly loaded model on
-        the loading thread (``MlxAudioASR._prime_generation_thread``), and after
-        that a generate can run on any thread. The session still decodes
-        inline, which blocks the event loop for the decode. See
+        thread that created them, so :meth:`_safe_decode` runs this on the
+        engine's MLX thread (``MlxAudioASR.run_on_mlx_thread``) and waits for
+        it, which blocks the event loop for the decode, as before. See
         ``docs/STANDARD_ASR_FINDINGS.md``.
 
         Args:
@@ -932,14 +931,13 @@ class MlxAudioStreamingSession(TranscriptionSession):
             The decoded segments, or a non-recoverable ``engine_error`` event.
         """
         # Yield once so other loop tasks (e.g. the audio pump) make progress
-        # before we block the loop on the inline MLX decode (see _decode: MLX is
-        # thread-bound, so we cannot offload to a worker thread).
+        # before the loop waits for the decode on the engine's MLX thread.
         await asyncio.sleep(0)
         # A failed intake ends the session before any more decode work (the base
         # turns the exception into the terminal error).
         self._raise_intake_failure()
         try:
-            return self._decode(audio, want_words=want_words)
+            return self._engine.run_on_mlx_thread(self._decode, audio, want_words=want_words)
         except Exception as exc:
             _LOGGER.exception("MLX streaming decode failed")
             return TranscriptionEvent.make_error(

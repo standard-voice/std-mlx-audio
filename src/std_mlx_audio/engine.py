@@ -30,9 +30,12 @@ types) lives entirely in the bound backend; this class is family-agnostic.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, TypeVar, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -128,6 +131,10 @@ from .languages import (
 
 _LOGGER = logging.getLogger(__name__)
 _SAMPLE_RATE = backends.SAMPLE_RATE
+
+
+#: The return type of a function run on an instance's MLX thread.
+_T = TypeVar("_T")
 
 
 class MlxAudioASR(EngineBase):
@@ -228,6 +235,44 @@ class MlxAudioASR(EngineBase):
         merged = {**type(self).default_config_overrides, **kwargs}
         self.config = MlxAudioConfig.from_env("mlx-audio", **merged)
         self._model: object | None = None
+        # The one thread that runs every MLX operation of this instance, and
+        # its identifier; both created on first use (see run_on_mlx_thread).
+        self._mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._mlx_thread: int | None = None
+
+    def run_on_mlx_thread(self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+        """Run ``fn`` on the one thread this instance gives to MLX, and wait for it.
+
+        MLX ties arrays, model weights included, to the thread that created
+        them, and a first generate on another thread can abort the process.
+        So the load, the priming, and every generate of an instance run on one
+        thread the instance owns, whichever thread calls the engine: a REST
+        worker, an event loop, or an application thread. Standard ASR
+        protocol IC.12 lets a plugin keep its native work on one thread while
+        its calls come from any thread. A call made on that thread runs
+        directly. The thread ends when the instance is collected.
+
+        Args:
+            fn: The function to run.
+            *args: Its positional arguments.
+            **kwargs: Its keyword arguments.
+
+        Returns:
+            What ``fn`` returns.
+
+        Raises:
+            Exception: Whatever ``fn`` raises.
+        """
+        if threading.get_ident() == self._mlx_thread:
+            return fn(*args, **kwargs)
+        if self._mlx_executor is None:
+            # No initializer: one bound to this instance would keep it, and
+            # its model, alive for as long as the thread lives.
+            self._mlx_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="std-mlx-audio"
+            )
+            self._mlx_thread = self._mlx_executor.submit(threading.get_ident).result()
+        return self._mlx_executor.submit(fn, *args, **kwargs).result()
 
     # ------------------------------------------------------------------ #
     # Lazy model loading
@@ -289,6 +334,14 @@ class MlxAudioASR(EngineBase):
         """
         if self._model is not None:
             return
+        self.run_on_mlx_thread(self._load_model, mode=mode)
+
+    def _load_model(self, *, mode: Mode) -> None:
+        """Load and check the model on the instance's MLX thread.
+
+        Args:
+            mode: The inference mode whose path is loading.
+        """
         # huggingface_hub (pulled in by mlx-audio) uses tqdm for download bars,
         # which spawns a persistent `tqdm_monitor` DAEMON thread on first use.
         # That thread is harmless at interpreter exit, but the standard
@@ -497,6 +550,11 @@ class MlxAudioASR(EngineBase):
     def _prime_generation_thread(self, model: object) -> None:
         """Run one tiny generate on the loading thread (MLX thread affinity).
 
+        Every MLX operation of the instance now runs on its own MLX thread
+        (:meth:`run_on_mlx_thread`), so thread affinity holds whether the
+        priming succeeds or not; the priming stays as a warm-up that compiles
+        the Metal kernels. The history below explains why it was added.
+
         mlx-audio's generate path materializes its Metal stream state lazily,
         the first time ``model.generate`` runs. If that first run happens on a
         different thread than the load, MLX aborts the whole process with an
@@ -685,6 +743,20 @@ class MlxAudioASR(EngineBase):
                 batch error contract (spec RT R7) requires an engine-execution
                 failure to surface as a portable ``TranscriptionError`` with the
                 native exception preserved as ``__cause__``.
+        """
+        return self.run_on_mlx_thread(self._transcribe_on_mlx_thread, prepared, params)
+
+    def _transcribe_on_mlx_thread(
+        self, prepared: PreparedAudio, params: RuntimeParams
+    ) -> TranscriptionResult:
+        """Run :meth:`_transcribe` on the instance's MLX thread.
+
+        Args:
+            prepared: Engine-ready audio.
+            params: Gated runtime parameters.
+
+        Returns:
+            A Standard ASR transcription result.
         """
         self._ensure_model_loaded()
         backend = type(self).backend
