@@ -14,11 +14,14 @@ since the session dispatches to the bound backend.
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import numpy as np
 import pytest
-from standard_asr import TranscriptionEvent
+from standard_asr import AudioArray, TranscriptionEvent
 from standard_asr.audio.format import AudioFormat
 from standard_asr.compliance import check_event_sequence
 from standard_asr.contract.capabilities import FinalityCap, ReconnectCap, StreamTimestampsCap
@@ -431,3 +434,31 @@ async def test_cap_commits_at_the_last_inner_boundary(
     assert [e.text for e in finals] == ["a", "b"]
     assert session._finalized_count == 2
     assert session._window.size == 16000  # 1.0 s left after the trim
+
+
+def test_every_mlx_operation_runs_on_the_instance_thread(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # A first generate on another thread than the load can abort the process.
+    # The instance runs every MLX operation on one thread it owns. So after a
+    # failed priming and a stream with no audio, which ends with done without
+    # a generate, batch calls from two other threads still reach the model
+    # on the loading thread.
+    loader = fake_loader(output=FakeSTTOutput(text="hi"))
+    loader.model.raise_on_prime = RuntimeError("rejects 0.1 s of silence")
+    engine = Qwen3Asr06B()
+
+    async def empty_stream() -> list[str]:
+        async with engine.start_transcription(audio_format=_FMT) as session:
+            session.feed([])
+            return [event.type async for event in session]
+
+    assert asyncio.run(empty_stream())[-1] == "done"
+    audio = AudioArray(np.zeros(1600, dtype=np.float32), 16000)
+    with ThreadPoolExecutor(1) as first, ThreadPoolExecutor(1) as second:
+        first.submit(engine.transcribe, audio).result()
+        second.submit(engine.transcribe, audio).result()
+    threads = {loader.load_thread, *loader.model.generate_threads}
+    assert len(threads) == 1
+    assert threads != {threading.get_ident()}
+    assert len(loader.model.generate_threads) == 3  # the priming and two batch calls
