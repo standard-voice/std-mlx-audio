@@ -34,6 +34,7 @@ from standard_asr.contract.capabilities import (
     PromptCap,
     PromptConstraints,
     ReconnectCap,
+    RuntimeOverrideCap,
     StreamingCapabilities,
     StreamingGuidanceCaps,
     StreamTimestampsCap,
@@ -116,7 +117,7 @@ _QWEN_WORD_TS = WordTimestampsCap(supported=True, granularities=["segment"])
 
 _QWEN_CAPABILITIES = DeclaredCapabilities(
     batch=BatchCapabilities(
-        language=LanguageCaps(runtime_override=FlagCap(supported=True)),
+        language=LanguageCaps(runtime_override=RuntimeOverrideCap(supported=True)),
         word_timestamps=_QWEN_WORD_TS,
         guidance=_QWEN_GUIDANCE,
     ),
@@ -130,7 +131,7 @@ _QWEN_CAPABILITIES = DeclaredCapabilities(
     #   * timestamps = post_align (mapped from per-window decode, not native
     #     frame-aligned streaming timestamps).
     streaming=StreamingCapabilities(
-        language=LanguageCaps(runtime_override=FlagCap(supported=True)),
+        language=LanguageCaps(runtime_override=RuntimeOverrideCap(supported=True)),
         word_timestamps=_QWEN_WORD_TS,
         guidance=StreamingGuidanceCaps(prompt=_QWEN_GUIDANCE.prompt),
         emits_partials=FlagCap(supported=True),
@@ -184,12 +185,12 @@ _WHISPER_GUIDANCE = GuidanceCaps(
 
 _WHISPER_CAPABILITIES = DeclaredCapabilities(
     batch=BatchCapabilities(
-        language=LanguageCaps(runtime_override=FlagCap(supported=True)),
+        language=LanguageCaps(runtime_override=RuntimeOverrideCap(supported=True)),
         word_timestamps=_WHISPER_WORD_TS,
         guidance=_WHISPER_GUIDANCE,
     ),
     streaming=StreamingCapabilities(
-        language=LanguageCaps(runtime_override=FlagCap(supported=True)),
+        language=LanguageCaps(runtime_override=RuntimeOverrideCap(supported=True)),
         word_timestamps=_WHISPER_WORD_TS,
         guidance=StreamingGuidanceCaps(prompt=_WHISPER_GUIDANCE.prompt),
         emits_partials=FlagCap(supported=True),
@@ -240,11 +241,11 @@ _PARAKEET_WORD_TS = WordTimestampsCap(supported=True, granularities=["word", "se
 
 _PARAKEET_CAPABILITIES = DeclaredCapabilities(
     batch=BatchCapabilities(
-        language=LanguageCaps(runtime_override=FlagCap(supported=False)),
+        language=LanguageCaps(runtime_override=RuntimeOverrideCap(supported=False)),
         word_timestamps=_PARAKEET_WORD_TS,
     ),
     streaming=StreamingCapabilities(
-        language=LanguageCaps(runtime_override=FlagCap(supported=False)),
+        language=LanguageCaps(runtime_override=RuntimeOverrideCap(supported=False)),
         word_timestamps=_PARAKEET_WORD_TS,
         emits_partials=FlagCap(supported=True),
         re_segments=FlagCap(supported=False),
@@ -312,7 +313,7 @@ def stt_capabilities(
     Returns:
         A fail-closed :class:`DeclaredCapabilities`.
     """
-    language = LanguageCaps(runtime_override=FlagCap(supported=runtime_override))
+    language = LanguageCaps(runtime_override=RuntimeOverrideCap(supported=runtime_override))
     batch = BatchCapabilities(language=language, word_timestamps=word_timestamps)
     if not streaming:
         return DeclaredCapabilities(batch=batch, self_resamples=FlagCap(supported=False))
