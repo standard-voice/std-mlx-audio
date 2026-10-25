@@ -279,7 +279,8 @@ def test_qwen2_audio_system_prompt_overrides_default(
 def test_vibevoice_text_rebuilt_from_segments(fake_loader: Callable[..., FakeLoader]) -> None:
     # VibeVoice returns its transcript inside STTOutput.segments (parsed from a
     # diarization JSON) while STTOutput.text is the raw JSON string; the result
-    # text must be the joined segment text, with no (undeclared) segments emitted.
+    # text must be the turn texts joined with a line break, with no (undeclared)
+    # segments emitted.
     raw_json = '[{"start":0.0,"end":1.0,"text":"hello"},{"start":1.0,"end":2.0,"text":"world"}]'
     fake_loader(
         output=FakeSTTOutput(
@@ -291,7 +292,7 @@ def test_vibevoice_text_rebuilt_from_segments(fake_loader: Callable[..., FakeLoa
         )
     )
     result = VibeVoiceAsr().transcribe(_array_input(), RuntimeParams())
-    assert result.text == "hello world"  # rebuilt from segments, not the raw JSON
+    assert result.text == "hello\nworld"  # rebuilt from segments, not the raw JSON
     assert result.segments is None  # declared text-only: segments are not emitted
 
 

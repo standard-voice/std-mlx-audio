@@ -35,7 +35,8 @@ Public surface:
 * Config / params models — :class:`MlxAudioConfig`, :class:`MlxAudioParams`.
 * Properties — :class:`MlxAudioProperties` (+ the original per-preset subclasses).
 * Backend adapters — :class:`Qwen3AsrBackend`, :class:`WhisperBackend`,
-  :class:`AlignedResultBackend`, :class:`GenericSttBackend` (+ :class:`SttFamilySpec`).
+  :class:`AlignedResultBackend`, :class:`GenericSttBackend` (+ :class:`SttFamilySpec`,
+  :class:`ChunkJoin`).
 * Entry-point factories — ``create_qwen3_asr_0_6b`` ... ``create_voxtral_realtime_4b``.
 """
 
@@ -53,6 +54,7 @@ from ._metadata import (
 from ._streaming import MlxAudioStreamingSession
 from .backends import (
     AlignedResultBackend,
+    ChunkJoin,
     GenericSttBackend,
     ModelBackend,
     Qwen3AsrBackend,
@@ -108,6 +110,7 @@ from .entrypoint import (
 __all__ = [
     "AlignedResultBackend",
     "Canary1BV2",
+    "ChunkJoin",
     "CohereAsr",
     "FireRedAsr2Aed",
     "FunAsrNano",
