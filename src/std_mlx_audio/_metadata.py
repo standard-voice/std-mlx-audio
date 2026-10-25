@@ -28,16 +28,16 @@ from standard_asr.contract.capabilities import (
     BatchCapabilities,
     Capabilities,
     FinalityCapability,
-    TraitFlagCapability,
     GuidanceCapabilities,
     LanguageCapabilities,
+    LanguageOverrideCapability,
     PromptCapability,
     PromptConstraints,
     ReconnectCapability,
-    LanguageOverrideCapability,
     StreamingCapabilities,
     StreamingGuidanceCapabilities,
     StreamTimestampsCapability,
+    TraitFlagCapability,
     WordTimestampsCapability,
 )
 from standard_asr.engine import BaseProperties, InputKind, SampleRateRange
@@ -313,7 +313,9 @@ def stt_capabilities(
     Returns:
         A fail-closed :class:`Capabilities`.
     """
-    language = LanguageCapabilities(runtime_override=LanguageOverrideCapability(supported=runtime_override))
+    language = LanguageCapabilities(
+        runtime_override=LanguageOverrideCapability(supported=runtime_override)
+    )
     batch = BatchCapabilities(language=language, word_timestamps=word_timestamps)
     if not streaming:
         return Capabilities(batch=batch, self_resamples=TraitFlagCapability(supported=False))

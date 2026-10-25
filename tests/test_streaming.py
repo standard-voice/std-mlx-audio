@@ -21,7 +21,11 @@ import pytest
 from standard_asr import TranscriptionEvent
 from standard_asr.audio.format import AudioFormat
 from standard_asr.compliance import check_event_sequence
-from standard_asr.contract.capabilities import FinalityCapability, ReconnectCapability, StreamTimestampsCapability
+from standard_asr.contract.capabilities import (
+    FinalityCapability,
+    ReconnectCapability,
+    StreamTimestampsCapability,
+)
 
 from std_mlx_audio import ParakeetTdt06BV3, Qwen3Asr06B, WhisperTiny
 from std_mlx_audio.engine import MlxAudioASR
