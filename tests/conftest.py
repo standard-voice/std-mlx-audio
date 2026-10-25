@@ -19,6 +19,7 @@ Real-inference verification is a separate, opt-in script
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,11 +88,14 @@ class FakeMlxModel:
         self.output = output
         self.output_fn = output_fn
         self.generate_calls: list[dict[str, Any]] = []
+        #: The thread of every generate, the priming included.
+        self.generate_threads: list[int] = []
         self.priming_call: dict[str, Any] | None = None
         self.raise_on_generate: BaseException | None = None
         self.raise_on_prime: BaseException | None = None
 
     def generate(self, audio: Any, **kwargs: Any) -> Any:
+        self.generate_threads.append(threading.get_ident())
         # The engine primes the generation thread with one silence generate
         # right after load (MlxAudioASR._prime_generation_thread, MLX stream
         # thread affinity), so the FIRST call on a freshly loaded model is
@@ -118,8 +122,11 @@ class FakeLoader:
         self.model = model
         self.load_calls: list[dict[str, Any]] = []
         self.raise_on_load: BaseException | None = None
+        #: The thread of the latest load.
+        self.load_thread: int | None = None
 
     def __call__(self, model_path: str, **kwargs: Any) -> FakeMlxModel:
+        self.load_thread = threading.get_ident()
         self.load_calls.append({"model_path": model_path, **kwargs})
         if self.raise_on_load is not None:
             raise self.raise_on_load
