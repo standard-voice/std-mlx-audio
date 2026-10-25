@@ -14,7 +14,7 @@ by binding each entry-point preset to a
 It subclasses :class:`EngineBase` and:
 
 * binds each preset's per-family :class:`~std_mlx_audio._metadata.MlxAudioProperties`
-  and fail-closed ``DeclaredCapabilities`` (built via the ``stt_properties`` /
+  and fail-closed ``Capabilities`` (built via the ``stt_properties`` /
   ``stt_capabilities`` factories, or the original per-family subclasses);
 * keeps ``__init__`` pure and loads weights lazily in
   :meth:`_ensure_model_loaded` (spec IC.9), then verifies the loaded model's
@@ -52,7 +52,7 @@ from standard_asr.contract.artifacts import (
     ArtifactReport,
     ArtifactRequirement,
 )
-from standard_asr.contract.capabilities import DeclaredCapabilities
+from standard_asr.contract.capabilities import Capabilities
 from standard_asr.contract.exceptions import (
     ArtifactAcquisitionError,
     ArtifactUnavailableError,
@@ -987,7 +987,7 @@ class Qwen3Asr06B(MlxAudioASR):
     required_snapshot_files: ClassVar[tuple[str, ...]] = _QWEN3_SNAPSHOT_FILES
     backend: ClassVar[ModelBackend] = Qwen3AsrBackend()
     properties: ClassVar[BaseProperties] = Qwen3Asr06BProperties()
-    declared_capabilities: ClassVar[DeclaredCapabilities] = _QWEN_CAPABILITIES
+    declared_capabilities: ClassVar[Capabilities] = _QWEN_CAPABILITIES
 
 
 class Qwen3Asr17B(MlxAudioASR):
@@ -997,7 +997,7 @@ class Qwen3Asr17B(MlxAudioASR):
     required_snapshot_files: ClassVar[tuple[str, ...]] = _QWEN3_SNAPSHOT_FILES
     backend: ClassVar[ModelBackend] = Qwen3AsrBackend()
     properties: ClassVar[BaseProperties] = Qwen3Asr17BProperties()
-    declared_capabilities: ClassVar[DeclaredCapabilities] = _QWEN_CAPABILITIES
+    declared_capabilities: ClassVar[Capabilities] = _QWEN_CAPABILITIES
 
 
 class ParakeetTdt06BV3(MlxAudioASR):
@@ -1013,7 +1013,7 @@ class ParakeetTdt06BV3(MlxAudioASR):
     hf_repo: ClassVar[str] = "mlx-community/parakeet-tdt-0.6b-v3"
     backend: ClassVar[ModelBackend] = AlignedResultBackend(model_types=("parakeet",))
     properties: ClassVar[BaseProperties] = ParakeetTdt06BV3Properties()
-    declared_capabilities: ClassVar[DeclaredCapabilities] = _PARAKEET_CAPABILITIES
+    declared_capabilities: ClassVar[Capabilities] = _PARAKEET_CAPABILITIES
     default_config_overrides: ClassVar[dict[str, Any]] = {"default_language": "en"}
 
 
@@ -1038,7 +1038,7 @@ class WhisperLargeV3Turbo(MlxAudioASR):
     required_snapshot_files: ClassVar[tuple[str, ...]] = ("preprocessor_config.json",)
     backend: ClassVar[ModelBackend] = WhisperBackend()
     properties: ClassVar[BaseProperties] = WhisperLargeV3TurboProperties()
-    declared_capabilities: ClassVar[DeclaredCapabilities] = _WHISPER_CAPABILITIES
+    declared_capabilities: ClassVar[Capabilities] = _WHISPER_CAPABILITIES
 
 
 class WhisperTiny(MlxAudioASR):
@@ -1055,7 +1055,7 @@ class WhisperTiny(MlxAudioASR):
     required_snapshot_files: ClassVar[tuple[str, ...]] = ("preprocessor_config.json",)
     backend: ClassVar[ModelBackend] = WhisperBackend()
     properties: ClassVar[BaseProperties] = WhisperTinyProperties()
-    declared_capabilities: ClassVar[DeclaredCapabilities] = _WHISPER_CAPABILITIES
+    declared_capabilities: ClassVar[Capabilities] = _WHISPER_CAPABILITIES
 
 
 # --------------------------------------------------------------------------- #
@@ -1078,7 +1078,7 @@ class NemotronAsrStreaming06B(MlxAudioASR):
         selectable=[],
         detectable=[],
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_WORD, runtime_override=False, streaming=True
     )
 
@@ -1122,7 +1122,7 @@ class SenseVoiceSmall(MlxAudioASR):
         selectable=SENSEVOICE_LANGUAGES,
         detectable=SENSEVOICE_DETECTABLE_LANGUAGES,
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=True, streaming=False
     )
 
@@ -1169,7 +1169,7 @@ class CohereAsr(MlxAudioASR):
         selectable=COHERE_LANGUAGES,
         detectable=[],
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_SEGMENT, runtime_override=True, streaming=True
     )
     default_config_overrides: ClassVar[dict[str, Any]] = {"default_language": "en"}
@@ -1202,7 +1202,7 @@ class FunAsrNano(MlxAudioASR):
         selectable=FUN_ASR_LANGUAGES,
         detectable=FUN_ASR_DETECTABLE_LANGUAGES,
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_SEGMENT, runtime_override=True, streaming=True
     )
 
@@ -1252,7 +1252,7 @@ class VoxtralMini3B(MlxAudioASR):
         selectable=VOXTRAL_LANGUAGES,
         detectable=[],
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=True, streaming=False
     )
     default_config_overrides: ClassVar[dict[str, Any]] = {"default_language": "en"}
@@ -1298,7 +1298,7 @@ class Canary1BV2(MlxAudioASR):
         selectable=CANARY_LANGUAGES,
         detectable=[],
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=True, streaming=False
     )
     default_config_overrides: ClassVar[dict[str, Any]] = {"default_language": "en"}
@@ -1331,7 +1331,7 @@ class Qwen2Audio7B(MlxAudioASR):
         selectable=[],
         detectable=[],
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
     )
 
@@ -1352,7 +1352,7 @@ class GlmAsrNano(MlxAudioASR):
         selectable=[],
         detectable=[],
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_SEGMENT, runtime_override=False, streaming=True
     )
 
@@ -1382,7 +1382,7 @@ class GraniteSpeech1B(MlxAudioASR):
         selectable=[],
         detectable=[],
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
     )
 
@@ -1414,7 +1414,7 @@ class GraniteSpeechNar2B(MlxAudioASR):
         detectable=[],
         array_only=True,
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
     )
 
@@ -1461,7 +1461,7 @@ class VibeVoiceAsr(MlxAudioASR):
         selectable=[],
         detectable=[],
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
     )
 
@@ -1482,7 +1482,7 @@ class MoonshineTiny(MlxAudioASR):
         selectable=[],
         detectable=[],
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
     )
 
@@ -1516,7 +1516,7 @@ class Mms1BAll(MlxAudioASR):
         selectable=[],
         detectable=[],
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
     )
     load_model_type: ClassVar[str | None] = "mms"
@@ -1549,7 +1549,7 @@ class FireRedAsr2Aed(MlxAudioASR):
         selectable=[],
         detectable=[],
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
     )
 
@@ -1579,7 +1579,7 @@ class VoxtralRealtime4B(MlxAudioASR):
         selectable=[],
         detectable=[],
     )
-    declared_capabilities: ClassVar[DeclaredCapabilities] = stt_capabilities(
+    declared_capabilities: ClassVar[Capabilities] = stt_capabilities(
         word_timestamps=_WORD_TS_NONE, runtime_override=False, streaming=False
     )
 
