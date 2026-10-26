@@ -14,7 +14,7 @@ This is the "one engine, many models" surface: a single engine_id
 guidance), Parakeet/Nemotron (word + segment timing; no runtime language
 selection), SenseVoice (language detection; batch only), Canary (speech
 translation), and the long tail of text-only families. The original three
-families keep bespoke ``Properties`` subclasses + ``DeclaredCapabilities``
+families keep bespoke ``Properties`` subclasses + ``Capabilities``
 constants; the rest are built from the :func:`stt_properties` /
 :func:`stt_capabilities` factories below (same honest, fail-closed shape). The
 engine class binds one Properties + Capabilities pair per preset.
@@ -26,18 +26,19 @@ from typing import Literal
 
 from standard_asr.contract.capabilities import (
     BatchCapabilities,
-    DeclaredCapabilities,
-    FinalityCap,
-    FlagCap,
-    GuidanceCaps,
-    LanguageCaps,
-    PromptCap,
+    Capabilities,
+    FinalityCapability,
+    GuidanceCapabilities,
+    LanguageCapabilities,
+    LanguageOverrideCapability,
+    PromptCapability,
     PromptConstraints,
-    ReconnectCap,
+    ReconnectCapability,
     StreamingCapabilities,
-    StreamingGuidanceCaps,
-    StreamTimestampsCap,
-    WordTimestampsCap,
+    StreamingGuidanceCapabilities,
+    StreamTimestampsCapability,
+    TraitFlagCapability,
+    WordTimestampsCapability,
 )
 from standard_asr.engine import BaseProperties, InputKind, SampleRateRange
 
@@ -109,14 +110,14 @@ class MlxAudioProperties(BaseProperties):
 # `max_tokens` is the standard's conservative count (one per CJK character), with
 # headroom under what was measured. A window with no speech can come back as the
 # prompt itself; `_guidance.echoes_prompt` drops that.
-_QWEN_GUIDANCE = GuidanceCaps(
-    prompt=PromptCap(supported=True, constraints=PromptConstraints(max_tokens=1000))
+_QWEN_GUIDANCE = GuidanceCapabilities(
+    prompt=PromptCapability(supported=True, constraints=PromptConstraints(max_tokens=1000))
 )
-_QWEN_WORD_TS = WordTimestampsCap(supported=True, granularities=["segment"])
+_QWEN_WORD_TS = WordTimestampsCapability(supported=True, granularities=["segment"])
 
-_QWEN_CAPABILITIES = DeclaredCapabilities(
+_QWEN_CAPABILITIES = Capabilities(
     batch=BatchCapabilities(
-        language=LanguageCaps(runtime_override=FlagCap(supported=True)),
+        language=LanguageCapabilities(runtime_override=LanguageOverrideCapability(supported=True)),
         word_timestamps=_QWEN_WORD_TS,
         guidance=_QWEN_GUIDANCE,
     ),
@@ -130,19 +131,19 @@ _QWEN_CAPABILITIES = DeclaredCapabilities(
     #   * timestamps = post_align (mapped from per-window decode, not native
     #     frame-aligned streaming timestamps).
     streaming=StreamingCapabilities(
-        language=LanguageCaps(runtime_override=FlagCap(supported=True)),
+        language=LanguageCapabilities(runtime_override=LanguageOverrideCapability(supported=True)),
         word_timestamps=_QWEN_WORD_TS,
-        guidance=StreamingGuidanceCaps(prompt=_QWEN_GUIDANCE.prompt),
-        emits_partials=FlagCap(supported=True),
-        re_segments=FlagCap(supported=False),
-        partial_stability=FlagCap(supported=False),
-        reconnect=ReconnectCap(mode="unsupported"),
-        finality_level=FinalityCap(mode="final"),
-        timestamps=StreamTimestampsCap(mode="post_align"),
+        guidance=StreamingGuidanceCapabilities(prompt=_QWEN_GUIDANCE.prompt),
+        emits_partials=TraitFlagCapability(supported=True),
+        re_segments=TraitFlagCapability(supported=False),
+        partial_stability=TraitFlagCapability(supported=False),
+        reconnect=ReconnectCapability(mode="unsupported"),
+        finality_level=FinalityCapability(mode="final"),
+        timestamps=StreamTimestampsCapability(mode="post_align"),
     ),
-    streaming_input=FlagCap(supported=True),
-    streaming_output=FlagCap(supported=True),
-    self_resamples=FlagCap(supported=False),
+    streaming_input=TraitFlagCapability(supported=True),
+    streaming_output=TraitFlagCapability(supported=True),
+    self_resamples=TraitFlagCapability(supported=False),
 )
 
 
@@ -177,31 +178,31 @@ class Qwen3Asr17BProperties(MlxAudioProperties):
 # asked, so it declares both "word" and "segment". It honors a free-text
 # `initial_prompt`, so batch guidance.prompt is supported (conservative token
 # cap; Whisper truncates an over-long prompt silently otherwise).
-_WHISPER_WORD_TS = WordTimestampsCap(supported=True, granularities=["word", "segment"])
-_WHISPER_GUIDANCE = GuidanceCaps(
-    prompt=PromptCap(supported=True, constraints=PromptConstraints(max_tokens=200)),
+_WHISPER_WORD_TS = WordTimestampsCapability(supported=True, granularities=["word", "segment"])
+_WHISPER_GUIDANCE = GuidanceCapabilities(
+    prompt=PromptCapability(supported=True, constraints=PromptConstraints(max_tokens=200)),
 )
 
-_WHISPER_CAPABILITIES = DeclaredCapabilities(
+_WHISPER_CAPABILITIES = Capabilities(
     batch=BatchCapabilities(
-        language=LanguageCaps(runtime_override=FlagCap(supported=True)),
+        language=LanguageCapabilities(runtime_override=LanguageOverrideCapability(supported=True)),
         word_timestamps=_WHISPER_WORD_TS,
         guidance=_WHISPER_GUIDANCE,
     ),
     streaming=StreamingCapabilities(
-        language=LanguageCaps(runtime_override=FlagCap(supported=True)),
+        language=LanguageCapabilities(runtime_override=LanguageOverrideCapability(supported=True)),
         word_timestamps=_WHISPER_WORD_TS,
-        guidance=StreamingGuidanceCaps(prompt=_WHISPER_GUIDANCE.prompt),
-        emits_partials=FlagCap(supported=True),
-        re_segments=FlagCap(supported=False),
-        partial_stability=FlagCap(supported=False),
-        reconnect=ReconnectCap(mode="unsupported"),
-        finality_level=FinalityCap(mode="final"),
-        timestamps=StreamTimestampsCap(mode="post_align"),
+        guidance=StreamingGuidanceCapabilities(prompt=_WHISPER_GUIDANCE.prompt),
+        emits_partials=TraitFlagCapability(supported=True),
+        re_segments=TraitFlagCapability(supported=False),
+        partial_stability=TraitFlagCapability(supported=False),
+        reconnect=ReconnectCapability(mode="unsupported"),
+        finality_level=FinalityCapability(mode="final"),
+        timestamps=StreamTimestampsCapability(mode="post_align"),
     ),
-    streaming_input=FlagCap(supported=True),
-    streaming_output=FlagCap(supported=True),
-    self_resamples=FlagCap(supported=False),
+    streaming_input=TraitFlagCapability(supported=True),
+    streaming_output=TraitFlagCapability(supported=True),
+    self_resamples=TraitFlagCapability(supported=False),
 )
 
 
@@ -236,26 +237,26 @@ class WhisperTinyProperties(MlxAudioProperties):
 # language.runtime_override is fail-closed FALSE — the standard layer will reject
 # a per-request `language` override as unsupported rather than silently ignoring
 # it. This is the honest declaration for a model whose language is not selectable.
-_PARAKEET_WORD_TS = WordTimestampsCap(supported=True, granularities=["word", "segment"])
+_PARAKEET_WORD_TS = WordTimestampsCapability(supported=True, granularities=["word", "segment"])
 
-_PARAKEET_CAPABILITIES = DeclaredCapabilities(
+_PARAKEET_CAPABILITIES = Capabilities(
     batch=BatchCapabilities(
-        language=LanguageCaps(runtime_override=FlagCap(supported=False)),
+        language=LanguageCapabilities(runtime_override=LanguageOverrideCapability(supported=False)),
         word_timestamps=_PARAKEET_WORD_TS,
     ),
     streaming=StreamingCapabilities(
-        language=LanguageCaps(runtime_override=FlagCap(supported=False)),
+        language=LanguageCapabilities(runtime_override=LanguageOverrideCapability(supported=False)),
         word_timestamps=_PARAKEET_WORD_TS,
-        emits_partials=FlagCap(supported=True),
-        re_segments=FlagCap(supported=False),
-        partial_stability=FlagCap(supported=False),
-        reconnect=ReconnectCap(mode="unsupported"),
-        finality_level=FinalityCap(mode="final"),
-        timestamps=StreamTimestampsCap(mode="post_align"),
+        emits_partials=TraitFlagCapability(supported=True),
+        re_segments=TraitFlagCapability(supported=False),
+        partial_stability=TraitFlagCapability(supported=False),
+        reconnect=ReconnectCapability(mode="unsupported"),
+        finality_level=FinalityCapability(mode="final"),
+        timestamps=StreamTimestampsCapability(mode="post_align"),
     ),
-    streaming_input=FlagCap(supported=True),
-    streaming_output=FlagCap(supported=True),
-    self_resamples=FlagCap(supported=False),
+    streaming_input=TraitFlagCapability(supported=True),
+    streaming_output=TraitFlagCapability(supported=True),
+    self_resamples=TraitFlagCapability(supported=False),
 )
 
 
@@ -290,15 +291,15 @@ class ParakeetTdt06BV3Properties(MlxAudioProperties):
 #     streaming it cannot deliver would be dishonest; see ``_streaming.py``).
 
 #: Word-timestamp capability templates reused across the generic families.
-_WORD_TS_NONE = WordTimestampsCap(supported=False)
-_WORD_TS_SEGMENT = WordTimestampsCap(supported=True, granularities=["segment"])
-_WORD_TS_WORD = WordTimestampsCap(supported=True, granularities=["word", "segment"])
+_WORD_TS_NONE = WordTimestampsCapability(supported=False)
+_WORD_TS_SEGMENT = WordTimestampsCapability(supported=True, granularities=["segment"])
+_WORD_TS_WORD = WordTimestampsCapability(supported=True, granularities=["word", "segment"])
 
 
 def stt_capabilities(
-    *, word_timestamps: WordTimestampsCap, runtime_override: bool, streaming: bool
-) -> DeclaredCapabilities:
-    """Build a family's :class:`DeclaredCapabilities` from three honest axes.
+    *, word_timestamps: WordTimestampsCapability, runtime_override: bool, streaming: bool
+) -> Capabilities:
+    """Build a family's :class:`Capabilities` from three honest axes.
 
     Args:
         word_timestamps: The timestamp capability the family genuinely delivers
@@ -310,27 +311,29 @@ def stt_capabilities(
             (``streaming=None``; streaming flags left unsupported).
 
     Returns:
-        A fail-closed :class:`DeclaredCapabilities`.
+        A fail-closed :class:`Capabilities`.
     """
-    language = LanguageCaps(runtime_override=FlagCap(supported=runtime_override))
+    language = LanguageCapabilities(
+        runtime_override=LanguageOverrideCapability(supported=runtime_override)
+    )
     batch = BatchCapabilities(language=language, word_timestamps=word_timestamps)
     if not streaming:
-        return DeclaredCapabilities(batch=batch, self_resamples=FlagCap(supported=False))
-    return DeclaredCapabilities(
+        return Capabilities(batch=batch, self_resamples=TraitFlagCapability(supported=False))
+    return Capabilities(
         batch=batch,
         streaming=StreamingCapabilities(
             language=language,
             word_timestamps=word_timestamps,
-            emits_partials=FlagCap(supported=True),
-            re_segments=FlagCap(supported=False),
-            partial_stability=FlagCap(supported=False),
-            reconnect=ReconnectCap(mode="unsupported"),
-            finality_level=FinalityCap(mode="final"),
-            timestamps=StreamTimestampsCap(mode="post_align"),
+            emits_partials=TraitFlagCapability(supported=True),
+            re_segments=TraitFlagCapability(supported=False),
+            partial_stability=TraitFlagCapability(supported=False),
+            reconnect=ReconnectCapability(mode="unsupported"),
+            finality_level=FinalityCapability(mode="final"),
+            timestamps=StreamTimestampsCapability(mode="post_align"),
         ),
-        streaming_input=FlagCap(supported=True),
-        streaming_output=FlagCap(supported=True),
-        self_resamples=FlagCap(supported=False),
+        streaming_input=TraitFlagCapability(supported=True),
+        streaming_output=TraitFlagCapability(supported=True),
+        self_resamples=TraitFlagCapability(supported=False),
     )
 
 

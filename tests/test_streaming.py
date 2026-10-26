@@ -21,7 +21,11 @@ import pytest
 from standard_asr import TranscriptionEvent
 from standard_asr.audio.format import AudioFormat
 from standard_asr.compliance import check_event_sequence
-from standard_asr.contract.capabilities import FinalityCap, ReconnectCap, StreamTimestampsCap
+from standard_asr.contract.capabilities import (
+    FinalityCapability,
+    ReconnectCapability,
+    StreamTimestampsCapability,
+)
 
 from std_mlx_audio import ParakeetTdt06BV3, Qwen3Asr06B, WhisperTiny
 from std_mlx_audio.engine import MlxAudioASR
@@ -57,11 +61,11 @@ def test_streaming_capabilities_are_conservative() -> None:
         # Windowed re-decode => no stability, no supersede, no reconnect.
         assert caps.supports("streaming.partial_stability") is False
         assert caps.supports("streaming.re_segments") is False
-        assert isinstance(caps.node_at("streaming.reconnect"), ReconnectCap)
+        assert isinstance(caps.node_at("streaming.reconnect"), ReconnectCapability)
         assert caps.node_at("streaming.reconnect").mode == "unsupported"  # type: ignore[union-attr]
-        assert isinstance(caps.node_at("streaming.finality_level"), FinalityCap)
+        assert isinstance(caps.node_at("streaming.finality_level"), FinalityCapability)
         assert caps.node_at("streaming.finality_level").mode == "final"  # type: ignore[union-attr]
-        assert isinstance(caps.node_at("streaming.timestamps"), StreamTimestampsCap)
+        assert isinstance(caps.node_at("streaming.timestamps"), StreamTimestampsCapability)
         assert caps.node_at("streaming.timestamps").mode == "post_align"  # type: ignore[union-attr]
 
 
