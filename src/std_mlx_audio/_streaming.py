@@ -109,6 +109,18 @@ deterministically and monotonically (``seg-0`` ...). Every commit is a seam: the
 next window is decoded without the earlier text, so a word that straddles a cut
 can be lost or doubled, and a cut in a mid-sentence pause can make the model end
 the head with a period. Cutting in pauses makes word damage rare, not impossible.
+The reduced transcript is the ``final`` texts concatenated, so the text after a
+seam has to carry the separator that joins it to the text before. mlx-audio
+never sees both sides of a seam, so the plugin decides it, following mlx-audio's
+Cohere-ASR join: no separator when the window's first text is in Chinese,
+Cantonese, or Japanese (``languages.NO_SPACE_LANGUAGES``), and otherwise the
+separator the family puts between two chunks of one decode (a space for
+Qwen3-ASR, GLM-ASR, Fun-ASR, and Cohere-ASR). The language is the request's,
+else the one Qwen3-ASR detects once per decode, on its first chunk; no family
+reports one per chunk (``backends._chunk_languages``). When no source names
+one (GLM-ASR and an auto-detecting Fun-ASR report none), the family's
+separator is used. Whisper, Parakeet, and Nemotron segment texts already start
+with their own space, so nothing is added for them.
 This is a *pragmatic* streaming adapter for batch decoders, not a true
 incremental recognizer — the README and findings doc say so plainly.
 """
@@ -452,6 +464,10 @@ class MlxAudioStreamingSession(TranscriptionSession):
         # Count of segments already emitted as `final` (also their next id). A
         # finalized segment's id and text are immutable and its audio is dropped.
         self._finalized_count = 0
+        # Whether a `final` with text has been emitted. The reduced transcript is
+        # the finals' texts concatenated, so a later window's first text must
+        # carry the separator that joins it to them (see `_decode`).
+        self._text_finalized = False
         # The text the application shows for the open `partial` (segment
         # `seg-{_finalized_count}`), or None when no partial is open. A commit that
         # decodes to no text still closes an open partial, and a decode that
@@ -520,8 +536,17 @@ class MlxAudioStreamingSession(TranscriptionSession):
         model = cast(Any, engine.model)
         source = backends.to_mlx_array(np.ascontiguousarray(audio, dtype=np.float32))
         native = model.generate(backends.adapt_audio_source(backend, source), **gen_kwargs)
+        # Every commit is a seam: this window is decoded without the text
+        # finalized before it, so the separator between the two is not in the
+        # decode. A chunked family's backend puts one there, chosen by the
+        # language of the window's first text (ChunkJoin.separator_before); a
+        # family whose segment texts start with their own space needs nothing.
         result = backend.to_result(
-            native, duration=backends.waveform_duration(audio), want_words=want_words
+            native,
+            duration=backends.waveform_duration(audio),
+            want_words=want_words,
+            follows_text=self._text_finalized,
+            resolved_language=self._resolved_language,
         )
         # A window with no speech can come back as the prompt itself (see _guidance).
         if echoes_prompt(
@@ -983,6 +1008,7 @@ class MlxAudioStreamingSession(TranscriptionSession):
             audio_processed_until=_seconds(self._processed),
         )
         self._finalized_count += 1
+        self._text_finalized = self._text_finalized or bool(seg.text)
         self._partial_shown = None
         return event
 
@@ -992,9 +1018,20 @@ class MlxAudioStreamingSession(TranscriptionSession):
         Used for every commit that finalizes audio and drops it: a head commit, a
         boundary commit at the cap, and the final pass (also when the window is
         already empty). A segment with empty text (recognition output with
-        nothing in it) is not content and produces no event. When the audio
-        decodes to no text but a ``partial`` is still open, that partial is
-        closed with an empty ``final`` (an application keeps showing an open
+        nothing in it) is not content and produces no event. A segment whose
+        text is only whitespace is content: it produces a ``final`` and counts
+        as finalized text, so the next window's first text gets a seam
+        separator. Such a segment is an empty chunk that carries mlx-audio's
+        separator. ``ChunkJoin`` puts one before every chunk after the first
+        for Qwen3-ASR and GLM-ASR (``skip_empty=False``), as their ``" ".join``
+        does between chunks, so silence decoded in more than one chunk yields
+        ``" "`` segments (Qwen3-ASR chunks at ``chunk_duration``, GLM-ASR at
+        mlx-audio's own 30 s default). The exception is a window that follows
+        finalized text: its empty chunks before its first text get no
+        separator, so a window of silence there stays empty
+        (:meth:`~std_mlx_audio.backends.ChunkJoin.texts`). When the audio
+        decodes to no text but a ``partial`` is still open, that partial
+        is closed with an empty ``final`` (an application keeps showing an open
         partial's text otherwise). That empty ``final`` and the one empty
         ``partial`` that clears withdrawn text (:meth:`_build_events`) are the
         only empty content events the session emits.
@@ -1029,10 +1066,13 @@ class MlxAudioStreamingSession(TranscriptionSession):
         remaining tail is one ``partial``. A segment with empty text is not
         content and produces no event, and a tail with no text produces no
         ``partial``, with one exception: when the open partial still shows text,
-        one ``partial`` with empty text clears it. When nothing is left to emit,
-        a ``progress`` event carries the cursor. Finalized audio is then dropped
-        from the front of the window (the slide). The ``partial`` carries no
-        stable text (the model may still rewrite the tail).
+        one ``partial`` with empty text clears it. Whitespace-only text is
+        content, in a ``final`` and in the ``partial`` alike: it is an empty
+        chunk that carries mlx-audio's separator (see :meth:`_finalize_all`).
+        When nothing is left to emit, a ``progress`` event carries the cursor.
+        Finalized audio is then dropped from the front of the window (the
+        slide). The ``partial`` carries no stable text (the model may still
+        rewrite the tail).
 
         Args:
             segments: Standard ASR ``Segment`` objects from this decode (window-
