@@ -1537,7 +1537,7 @@ wheels = [
 [[package]]
 name = "standard-asr"
 version = "0.2.0.dev0"
-source = { git = "https://github.com/standard-voice/standard_asr.git?rev=main#57f7f5cabf7c148bb6ea2ee1601f6dc520eaf747" }
+source = { git = "https://github.com/standard-voice/standard_asr.git?rev=main#2a9e638d69e9be41d8daf45310a484140619b635" }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
