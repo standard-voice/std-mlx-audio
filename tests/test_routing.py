@@ -80,23 +80,21 @@ def test_model_family_none_when_unintrospectable() -> None:
 
 def test_verify_model_family_passes_on_match() -> None:
     engine = WhisperTiny()
-    engine._model = _model_of_family("whisper")  # pyright: ignore[reportPrivateUsage]
-    engine._verify_model_family()  # pyright: ignore[reportPrivateUsage]  # no raise
+    engine._verify_model_family(_model_of_family("whisper"))  # pyright: ignore[reportPrivateUsage]
 
 
 def test_verify_model_family_raises_on_mismatch() -> None:
     # A model_path override resolving to a different family must fail loudly, not
     # silently run through the wrong adapter (the cardinal sin).
     engine = WhisperTiny()
-    engine._model = _model_of_family("sensevoice")  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(DiscoveryError, match="sensevoice"):
-        engine._verify_model_family()  # pyright: ignore[reportPrivateUsage]
+        engine._verify_model_family(_model_of_family("sensevoice"))  # pyright: ignore[reportPrivateUsage]
 
 
 def test_verify_model_family_skips_when_unintrospectable() -> None:
     engine = WhisperTiny()
-    engine._model = object()  # pyright: ignore[reportPrivateUsage]  # no module family
-    engine._verify_model_family()  # pyright: ignore[reportPrivateUsage]  # does not block
+    # An object with no module family does not block the load.
+    engine._verify_model_family(object())  # pyright: ignore[reportPrivateUsage]
 
 
 def test_mismatch_surfaces_through_load(fake_loader: Callable[..., FakeLoader]) -> None:
@@ -109,6 +107,25 @@ def test_mismatch_surfaces_through_load(fake_loader: Callable[..., FakeLoader]) 
     )
     with pytest.raises(DiscoveryError, match="voxtral"):
         WhisperTiny().prepare()
+
+
+def test_a_family_mismatch_leaves_no_model_on_the_instance(
+    fake_loader: Callable[..., FakeLoader],
+) -> None:
+    # The checked model is published only after the checks pass. A model left
+    # on the instance would make the next call skip the load and run the wrong
+    # family, which matters once a host keeps one instance for many calls.
+    loader = fake_loader(output=FakeSTTOutput(text="hi"))
+    loader.model.__class__ = type(
+        "Model", (type(loader.model),), {"__module__": "mlx_audio.stt.models.voxtral.voxtral"}
+    )
+    engine = WhisperTiny()
+    with pytest.raises(DiscoveryError, match="voxtral"):
+        engine.prepare()
+    assert engine._model is None  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(DiscoveryError, match="voxtral"):
+        engine.prepare()
+    assert len(loader.load_calls) == 2
 
 
 # --------------------------------------------------------------------------- #
